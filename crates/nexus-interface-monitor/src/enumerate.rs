@@ -19,6 +19,7 @@ use crate::netlink::genl::{
 use crate::netlink::nl80211::{
     NL80211_ATTR_IFINDEX, NL80211_ATTR_IFNAME, NL80211_ATTR_IFTYPE, NL80211_ATTR_WDEV,
     NL80211_ATTR_WIPHY, NL80211_CMD_GET_INTERFACE, NL80211_FAMILY_NAME, NL80211_GENL_VERSION,
+    WiphyCache, build_get_wiphy_dump_request,
 };
 use crate::netlink::parser::{
     AttributeIter, MessageIter, NLM_F_DUMP, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NLMSG_HDRLEN,
@@ -106,11 +107,19 @@ pub fn map_operstate(raw: u8) -> OperState {
 /// hardware and virtual/stacked interfaces, then tag with the
 /// Wi-Fi wiphy info from nl80211 where present.
 ///
+/// When `capabilities` is `None` and `wireless` is `Some`, the
+/// wiphy's PhyCapabilities fall back to a default populated only
+/// with the wiphy index. This matches the pre-Phase-10 behavior and
+/// keeps callers working before the wiphy cache is available (e.g.,
+/// during the classification state machine's late-reclassification
+/// path).
+///
 /// Returns `None` for interfaces Nexus doesn't manage in v0.1 (veth,
 /// bridge, loopback, etc.).
 pub fn classify_link(
     link: &LinkMessage,
     wireless: Option<&Nl80211InterfaceInfo>,
+    capabilities: Option<Arc<PhyCapabilities>>,
 ) -> Option<InterfaceInfo> {
     if link.header.ifi_type != ARPHRD_ETHER {
         return None;
@@ -120,13 +129,26 @@ pub fn classify_link(
     }
 
     let kind = match wireless {
-        Some(w) => InterfaceKind::Wireless {
-            wiphy: w.wiphy,
-            wiphy_name: format!("phy{}", w.wiphy),
-            wdev: w.wdev,
-            iftype: Nl80211IfType(w.iftype),
-            capabilities: Arc::new(PhyCapabilities::default()),
-        },
+        Some(w) => {
+            let caps = capabilities.unwrap_or_else(|| {
+                Arc::new(PhyCapabilities {
+                    wiphy: w.wiphy,
+                    ..PhyCapabilities::default()
+                })
+            });
+            let wiphy_name = if caps.wiphy_name.is_empty() {
+                format!("phy{}", w.wiphy)
+            } else {
+                caps.wiphy_name.clone()
+            };
+            InterfaceKind::Wireless {
+                wiphy: w.wiphy,
+                wiphy_name,
+                wdev: w.wdev,
+                iftype: Nl80211IfType(w.iftype),
+                capabilities: caps,
+            }
+        }
         None => InterfaceKind::Ethernet,
     };
 
@@ -153,16 +175,20 @@ pub fn classify_link(
 // ---------------------------------------------------------------------------
 
 /// Classify every RTM_NEWLINK message in a dump buffer, optionally
-/// tagging with wiphy info from a parallel nl80211 dump.
+/// tagging with wiphy info from a parallel nl80211 dump and its
+/// matching PHY capabilities.
 pub fn classify_dump(
     link_messages: &[LinkMessage],
     wireless_by_ifindex: &HashMap<u32, Nl80211InterfaceInfo>,
+    wiphy_caps: &HashMap<u32, Arc<PhyCapabilities>>,
 ) -> Vec<InterfaceInfo> {
     link_messages
         .iter()
         .filter_map(|link| {
             let ifindex = link.header.index as u32;
-            classify_link(link, wireless_by_ifindex.get(&ifindex))
+            let wireless = wireless_by_ifindex.get(&ifindex);
+            let caps = wireless.and_then(|w| wiphy_caps.get(&w.wiphy).cloned());
+            classify_link(link, wireless, caps)
         })
         .collect()
 }
@@ -316,6 +342,53 @@ pub async fn dump_rtnl_links(socket: &NetlinkSocket) -> Result<RtnlDumpResult, M
     Ok(accumulated)
 }
 
+/// Send an `NL80211_CMD_GET_WIPHY` dump (with split-dump flag) and
+/// merge the per-wiphy attributes into a `HashMap<wiphy, Arc<caps>>`.
+pub async fn dump_nl80211_wiphys(
+    socket: &NetlinkSocket,
+    family_id: u16,
+) -> Result<HashMap<u32, Arc<PhyCapabilities>>, MonitorError> {
+    let seq = socket.next_seq();
+    let request = build_get_wiphy_dump_request(seq, socket.port_id(), family_id);
+    socket.send(&request).await?;
+
+    let mut cache = WiphyCache::new();
+    let mut buf = vec![0u8; DUMP_RECV_BUFFER];
+    'outer: loop {
+        let n = socket.recv(&mut buf).await?;
+        for msg_result in MessageIter::new(&buf[..n]) {
+            let msg = msg_result?;
+            if msg.header.seq != seq {
+                continue;
+            }
+            match msg.header.msg_type {
+                NLMSG_DONE => break 'outer,
+                NLMSG_ERROR => {
+                    let err = parse_nlmsgerr(msg.payload)?;
+                    if err.error != 0 {
+                        tracing::warn!(
+                            errno = err.error,
+                            "nl80211 GET_WIPHY returned an error; capabilities degraded",
+                        );
+                    }
+                    break 'outer;
+                }
+                t if t == family_id => {
+                    let (_genl, attrs) = parse_genl_header(msg.payload)?;
+                    cache.ingest_attrs(attrs)?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(cache
+        .into_map()
+        .into_iter()
+        .map(|(k, v)| (k, Arc::new(v)))
+        .collect())
+}
+
 /// Send an `NL80211_CMD_GET_INTERFACE` dump and parse the
 /// responses. Returns a map keyed by ifindex.
 pub async fn dump_nl80211_interfaces(
@@ -409,7 +482,13 @@ pub async fn cold_boot_enumerate(
         _ => HashMap::new(),
     };
 
-    let mut discovered: Vec<InterfaceInfo> = classify_dump(&dump.dump_links, &wireless_by_ifindex);
+    let wiphy_caps = match (deps.nl80211_rr, deps.nl80211_family) {
+        (Some(rr), Some(family)) => dump_nl80211_wiphys(rr, family.id).await?,
+        _ => HashMap::new(),
+    };
+
+    let mut discovered: Vec<InterfaceInfo> =
+        classify_dump(&dump.dump_links, &wireless_by_ifindex, &wiphy_caps);
 
     // Bluetooth + GNSS via udev. udev failures are logged but don't
     // fail cold boot — the network side can still function.
@@ -474,6 +553,8 @@ pub async fn cold_boot_enumerate(
         discovered,
         pending_newlink: dump.pending_newlink,
         pending_dellink: dump.pending_dellink,
+        wireless_by_ifindex,
+        wiphy_caps,
     })
 }
 
@@ -484,6 +565,12 @@ pub struct ColdBootOutcome {
     pub discovered: Vec<InterfaceInfo>,
     pub pending_newlink: Vec<LinkMessage>,
     pub pending_dellink: Vec<u32>,
+    /// Snapshot of the nl80211 GET_INTERFACE dump, keyed by ifindex.
+    /// The main loop consumes this as the seed for its classification
+    /// tracker.
+    pub wireless_by_ifindex: HashMap<u32, Nl80211InterfaceInfo>,
+    /// Per-wiphy capability snapshot, keyed by wiphy index.
+    pub wiphy_caps: HashMap<u32, Arc<PhyCapabilities>>,
 }
 
 #[cfg(test)]
@@ -581,7 +668,7 @@ mod tests {
         stream.extend_from_slice(&nlmsg_done(42));
 
         let dump = parse_rtnl_dump(&stream, 42).unwrap();
-        let infos = classify_dump(&dump.dump_links, &HashMap::new());
+        let infos = classify_dump(&dump.dump_links, &HashMap::new(), &HashMap::new());
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].ifname, "eth0");
         assert!(matches!(infos[0].kind, InterfaceKind::Ethernet));
@@ -606,18 +693,34 @@ mod tests {
             },
         );
 
-        let infos = classify_dump(&dump.dump_links, &wireless);
+        let mut wiphy_caps: HashMap<u32, Arc<PhyCapabilities>> = HashMap::new();
+        wiphy_caps.insert(
+            0,
+            Arc::new(PhyCapabilities {
+                wiphy: 0,
+                wiphy_name: "phy0".into(),
+                max_num_scan_ssids: 10,
+                supports_roaming: true,
+                ..PhyCapabilities::default()
+            }),
+        );
+
+        let infos = classify_dump(&dump.dump_links, &wireless, &wiphy_caps);
         assert_eq!(infos.len(), 1);
         match &infos[0].kind {
             InterfaceKind::Wireless {
                 wiphy,
+                wiphy_name,
                 wdev,
                 iftype,
-                ..
+                capabilities,
             } => {
                 assert_eq!(*wiphy, 0);
+                assert_eq!(wiphy_name, "phy0");
                 assert_eq!(*wdev, 1);
                 assert_eq!(iftype.0, 2);
+                assert_eq!(capabilities.max_num_scan_ssids, 10);
+                assert!(capabilities.supports_roaming);
             }
             other => panic!("expected Wireless, got {other:?}"),
         }

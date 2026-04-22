@@ -102,12 +102,43 @@ pub struct InterfaceInfo {
 pub struct Nl80211IfType(pub u32);
 
 /// Per-wiphy capability snapshot, merged from split-dump
-/// `NL80211_CMD_GET_WIPHY` responses. The Interface Monitor owns the
-/// parser (DD-001 §5.3) and populates this structure; for now only the
-/// shared type identity is fixed so `InterfaceKind::Wireless` has a
-/// stable shape across crates.
+/// `NL80211_CMD_GET_WIPHY` responses. Fields correspond to the
+/// attributes-of-interest table in DD-001 §5.3.
+///
+/// Attributes with no value are defaulted per the nl80211 semantics:
+/// scalar maxima default to 0, flag attributes default to `false`,
+/// vector attributes default to empty.
 #[derive(Debug, Clone, Default)]
 pub struct PhyCapabilities {
-    #[doc(hidden)]
-    pub __non_exhaustive: (),
+    /// nl80211 wiphy index (NL80211_ATTR_WIPHY). The registry key.
+    pub wiphy: u32,
+    /// Human-readable wiphy name (NL80211_ATTR_WIPHY_NAME), e.g.
+    /// `"phy0"`.
+    pub wiphy_name: String,
+    /// Supported interface types (NL80211_ATTR_SUPPORTED_IFTYPES).
+    /// Values are `NL80211_IFTYPE_*`.
+    pub supported_iftypes: Vec<u32>,
+    /// nl80211 commands this driver supports
+    /// (NL80211_ATTR_SUPPORTED_COMMANDS). Values are `NL80211_CMD_*`.
+    pub supported_commands: Vec<u32>,
+    /// Supported encryption cipher suites
+    /// (NL80211_ATTR_CIPHER_SUITES).
+    pub cipher_suites: Vec<u32>,
+    /// Maximum SSIDs per scan request
+    /// (NL80211_ATTR_MAX_NUM_SCAN_SSIDS).
+    pub max_num_scan_ssids: u32,
+    /// Maximum SSIDs per scheduled scan
+    /// (NL80211_ATTR_MAX_NUM_SCHED_SCAN_SSIDS).
+    pub max_num_sched_scan_ssids: u32,
+    /// Maximum IE length for scheduled scans
+    /// (NL80211_ATTR_MAX_SCHED_SCAN_IE_LEN).
+    pub max_sched_scan_ie_len: u16,
+    /// Bit flags for driver features (NL80211_ATTR_FEATURE_FLAGS).
+    pub feature_flags: u32,
+    /// Extended feature bitmap (NL80211_ATTR_EXT_FEATURES), raw bytes.
+    pub ext_features: Vec<u8>,
+    /// AP UAPSD supported (NL80211_ATTR_SUPPORT_AP_UAPSD flag).
+    pub supports_ap_uapsd: bool,
+    /// Driver-level roaming supported (NL80211_ATTR_ROAM_SUPPORT flag).
+    pub supports_roaming: bool,
 }

@@ -1,9 +1,12 @@
 //! Interface Monitor — network/Wi-Fi/Bluetooth/GNSS discovery and
 //! lifecycle events for the rest of Nexus. See DD-001.
 
+pub mod classify;
 pub mod enumerate;
+pub mod metrics;
 pub mod monitor;
 pub mod netlink;
+pub mod recover;
 pub mod registry;
 pub mod udev;
 
@@ -50,6 +53,7 @@ pub async fn spawn_interface_monitor(
     event_tx: broadcast::Sender<NexusEvent>,
     shutdown: CancellationToken,
 ) -> Result<JoinHandle<Result<()>>> {
+    metrics::register();
     let task = MonitorTask::bootstrap(event_tx).await?;
     Ok(tokio::spawn(task.run(shutdown)))
 }

@@ -5,10 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Real-kernel integration tests that require CAP_NET_ADMIN (ip link
+# add/del dummy interfaces). They live in `tests/` and are all
+# `#[ignore]` — run them explicitly via
+# `cargo test -p nexus-interface-monitor --features integration-linux
+#  --ignored`.
+integration-linux = []
+
 [dependencies]
 nexus-core = { path = "../nexus-core" }
 
 libc = { workspace = true }
+metrics = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
