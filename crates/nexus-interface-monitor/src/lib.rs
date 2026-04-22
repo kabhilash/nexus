@@ -1,3 +1,5 @@
+pub mod netlink;
+
 use nexus_core::{InterfaceInfo, MacAddr, NexusEvent};
 
 pub fn placeholder() {

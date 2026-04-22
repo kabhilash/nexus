@@ -7,3 +7,8 @@ license.workspace = true
 
 [dependencies]
 nexus-core = { path = "../nexus-core" }
+
+libc = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
