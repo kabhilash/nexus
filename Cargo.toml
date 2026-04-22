@@ -8,6 +8,7 @@ members = [
     "crates/nexus-bluetooth",
     "crates/nexus-gnss",
     "crates/nexus-dbus",
+    "crates/nexus-profile-store",
 ]
 
 [workspace.package]
