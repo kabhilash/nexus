@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/nexus-core",
+    "crates/nexus-interface-monitor",
 ]
 
 [workspace.package]
