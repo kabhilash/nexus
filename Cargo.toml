@@ -6,6 +6,7 @@ members = [
     "crates/nexus-ethernet",
     "crates/nexus-wifi",
     "crates/nexus-bluetooth",
+    "crates/nexus-gnss",
 ]
 
 [workspace.package]
