@@ -1,0 +1,16 @@
+/target
+/.direnv
+
+# Editor swap and backup files
+*.swp
+*.swo
+*~
+
+# Editor/IDE dot directories
+/.idea
+/.vscode
+/.vs
+/.fleet
+/.zed
+/.helix
+/.cursor
