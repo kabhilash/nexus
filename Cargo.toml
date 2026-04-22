@@ -9,6 +9,7 @@ members = [
     "crates/nexus-gnss",
     "crates/nexus-dbus",
     "crates/nexus-profile-store",
+    "crates/nexus-auth-eap",
 ]
 
 [workspace.package]
