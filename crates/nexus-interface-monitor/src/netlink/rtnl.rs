@@ -229,7 +229,7 @@ pub fn parse_link_message(payload: &[u8]) -> Result<LinkMessage, ParseError> {
             }
             IFLA_MTU => out.mtu = Some(attr.u32()?),
             IFLA_OPERSTATE => out.operstate = Some(attr.u8()?),
-            IFLA_CARRIER => out.carrier = Some(attr.u32()? != 0),
+            IFLA_CARRIER => out.carrier = Some(attr.u8()? != 0),
             IFLA_LINK => out.link = Some(attr.i32()?),
             IFLA_PHYS_PORT_NAME => out.phys_port_name = Some(attr.cstr()?.to_owned()),
             IFLA_LINKINFO => {
@@ -350,7 +350,7 @@ mod tests {
         );
         encode_attribute(&mut buf, IFLA_MTU, &1500u32.to_ne_bytes());
         encode_attribute(&mut buf, IFLA_OPERSTATE, &[IF_OPER_UP]);
-        encode_attribute(&mut buf, IFLA_CARRIER, &1u32.to_ne_bytes());
+        encode_attribute(&mut buf, IFLA_CARRIER, &[1u8]);
 
         // IFLA_LINKINFO containing IFLA_INFO_KIND="veth\0"
         let mut linkinfo_payload = Vec::new();

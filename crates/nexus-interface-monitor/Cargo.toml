@@ -11,4 +11,10 @@ nexus-core = { path = "../nexus-core" }
 libc = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
+udev = { workspace = true }
+
+[[bin]]
+name = "nexus-monitor-demo"
+path = "src/bin/demo.rs"
