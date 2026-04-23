@@ -10,3 +10,6 @@ chrono = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

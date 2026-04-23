@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// 48-bit MAC-family address. Used for Wi-Fi BSSIDs and Bluetooth
@@ -26,6 +27,39 @@ impl fmt::Display for MacAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
     }
+}
+
+// ---------------------------------------------------------------------------
+// serde
+//
+// MacAddr serializes as its canonical lowercase colon form
+// (`"aa:bb:cc:dd:ee:ff"`). This is the natural TOML/JSON
+// representation for human-readable profile files; the raw bytes
+// form would round-trip as a 6-element sequence which is less
+// obvious and breaks TOML.
+// ---------------------------------------------------------------------------
+
+impl Serialize for MacAddr {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for MacAddr {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let s = String::deserialize(deserializer)?;
+        parse_any_mac(&s).map_err(D::Error::custom)
+    }
+}
+
+/// Parse either `"AA:BB:CC:DD:EE:FF"` or `"aa:bb:cc:dd:ee:ff"`
+/// (case-insensitive). Used by [`MacAddr`]'s serde impl; lives on
+/// `MacAddr` via a free function rather than the [`BluetoothAddrExt`]
+/// trait so callers don't have to import the BlueZ extension just
+/// to deserialize.
+fn parse_any_mac(s: &str) -> Result<MacAddr, ParseMacAddrError> {
+    <MacAddr as BluetoothAddrExt>::from_bluez(s)
 }
 
 /// Error returned by [`BluetoothAddrExt::from_bluez`] and any other
@@ -168,6 +202,21 @@ mod tests {
             MacAddr::from_bluez("AA:BB:CC:DD:EE.FF"),
             Err(ParseMacAddrError::MissingColon(14)),
         );
+    }
+
+    #[test]
+    fn serde_roundtrips_canonical_lowercase_form() {
+        let m = MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, "\"aa:bb:cc:dd:ee:ff\"");
+        let back: MacAddr = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn serde_accepts_uppercase_form() {
+        let back: MacAddr = serde_json::from_str("\"AA:BB:CC:DD:EE:FF\"").unwrap();
+        assert_eq!(back, MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
     }
 
     #[test]

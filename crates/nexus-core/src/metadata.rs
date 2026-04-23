@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Audit-style bookkeeping carried by every persisted profile
 /// (Ethernet, Wi-Fi, GNSS, Bluetooth). Fields are optional because
 /// older profile schemas predate the field.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileMetadata {
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
