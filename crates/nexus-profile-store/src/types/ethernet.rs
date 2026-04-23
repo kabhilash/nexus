@@ -3,7 +3,9 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::{Dot1xEapConfig, Dot1xEapConfigOnDisk, ProfileMetadata};
+use super::{Dot1xEapConfig, Dot1xEapConfigOnDisk, ProfileMetadata, decrypt_eap, encrypt_eap};
+use crate::crypto::{Cipher, CipherError};
+use crate::trait_def::ProfileKind;
 
 /// Per-interface Ethernet settings. Single file per interface on
 /// disk; the filename is the interface name.
@@ -23,9 +25,7 @@ pub struct EthInterfaceSettings {
 }
 
 /// 802.1X wired-auth settings. Contains [`Dot1xEapConfig`] which
-/// in turn holds [`crate::secret::SecretString`] credential fields,
-/// so this type isn't directly serializable — see
-/// [`EthernetProfileOnDisk`].
+/// in turn holds `SecretString` credentials; not directly Serialize.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dot1xSettings {
     pub enabled: bool,
@@ -33,13 +33,9 @@ pub struct Dot1xSettings {
 }
 
 // ---------------------------------------------------------------------------
-// On-disk form.
+// On-disk form
 // ---------------------------------------------------------------------------
 
-/// TOML-shaped representation of [`EthernetProfile`]. Credential
-/// fields (`eap.password`, `eap.client_key_password`) are plaintext
-/// strings during phase 2; phase 3 replaces them with
-/// `EncryptedBlob`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EthernetProfileOnDisk {
     pub id: Ulid,
@@ -57,32 +53,61 @@ pub struct Dot1xSettingsOnDisk {
     pub eap: Dot1xEapConfigOnDisk,
 }
 
-impl From<&EthernetProfile> for EthernetProfileOnDisk {
-    fn from(value: &EthernetProfile) -> Self {
-        Self {
-            id: value.id,
-            schema_version: value.schema_version,
-            metadata: value.metadata.clone(),
-            interface: value.interface.clone(),
-            dot1x: value.dot1x.as_ref().map(|d| Dot1xSettingsOnDisk {
-                enabled: d.enabled,
-                eap: Dot1xEapConfigOnDisk::from(&d.eap),
-            }),
-        }
-    }
+// ---------------------------------------------------------------------------
+// Encrypt / decrypt
+// ---------------------------------------------------------------------------
+
+/// Encrypt every credential in `profile` under `cipher` and
+/// construct the on-disk shape.
+pub fn encrypt_ethernet(
+    profile: &EthernetProfile,
+    cipher: &dyn Cipher,
+) -> Result<EthernetProfileOnDisk, CipherError> {
+    let dot1x = match &profile.dot1x {
+        Some(d) => Some(Dot1xSettingsOnDisk {
+            enabled: d.enabled,
+            eap: encrypt_eap(
+                &d.eap,
+                cipher,
+                ProfileKind::Ethernet,
+                &profile.id,
+                "dot1x.eap",
+            )?,
+        }),
+        None => None,
+    };
+    Ok(EthernetProfileOnDisk {
+        id: profile.id,
+        schema_version: profile.schema_version,
+        metadata: profile.metadata.clone(),
+        interface: profile.interface.clone(),
+        dot1x,
+    })
 }
 
-impl From<EthernetProfileOnDisk> for EthernetProfile {
-    fn from(value: EthernetProfileOnDisk) -> Self {
-        Self {
-            id: value.id,
-            schema_version: value.schema_version,
-            metadata: value.metadata,
-            interface: value.interface,
-            dot1x: value.dot1x.map(|d| Dot1xSettings {
-                enabled: d.enabled,
-                eap: Dot1xEapConfig::from(d.eap),
-            }),
-        }
-    }
+/// Decrypt an on-disk Ethernet profile into the in-memory shape.
+pub fn decrypt_ethernet(
+    on_disk: EthernetProfileOnDisk,
+    cipher: &dyn Cipher,
+) -> Result<EthernetProfile, CipherError> {
+    let dot1x = match on_disk.dot1x {
+        Some(d) => Some(Dot1xSettings {
+            enabled: d.enabled,
+            eap: decrypt_eap(
+                d.eap,
+                cipher,
+                ProfileKind::Ethernet,
+                &on_disk.id,
+                "dot1x.eap",
+            )?,
+        }),
+        None => None,
+    };
+    Ok(EthernetProfile {
+        id: on_disk.id,
+        schema_version: on_disk.schema_version,
+        metadata: on_disk.metadata,
+        interface: on_disk.interface,
+        dot1x,
+    })
 }

@@ -5,20 +5,39 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Enables the TPM-sealed master-key source and pulls in `tss-esapi`.
+tpm = ["dep:tss-esapi"]
+# Enables tests that actually require a TPM 2.0 on the host.
+# Opt-in on top of `tpm`; default CI skips these.
+tpm-integration = ["tpm"]
+
 [dependencies]
 nexus-core = { path = "../nexus-core" }
 
 async-trait = { workspace = true }
+base64 = { workspace = true }
 blake3 = { workspace = true }
+chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
+hkdf = { workspace = true }
 libc = { workspace = true }
+scrypt = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+tss-esapi = { version = "7", optional = true }
 ulid = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[example]]
+name = "roundtrip"
+path = "examples/roundtrip.rs"

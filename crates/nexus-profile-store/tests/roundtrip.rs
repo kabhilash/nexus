@@ -12,8 +12,9 @@ use std::time::Duration;
 use nexus_core::{MacAddr, Ssid};
 use nexus_profile_store::{
     BluetoothProfile, Dot1xEapConfig, Dot1xSettings, EapMethod, EthInterfaceSettings,
-    EthernetProfile, GnssDeviceProfile, ProfileFileStore, ProfileMetadata, ProfileStore,
-    SecretString, SecurityConfig, WifiNetworkSettings, WifiProfile, WpaPsk, ssid_hash,
+    EthernetProfile, GnssDeviceProfile, InMemoryKeySource, ProfileFileStore, ProfileMetadata,
+    ProfileStore, SecretString, SecurityConfig, WifiNetworkSettings, WifiProfile, WpaPsk,
+    ssid_hash,
 };
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -96,7 +97,8 @@ fn sample_bluetooth(id: Ulid) -> BluetoothProfile {
 
 fn fresh_store() -> (TempDir, ProfileFileStore) {
     let dir = TempDir::new().expect("tempdir");
-    let store = ProfileFileStore::open(dir.path()).expect("open store");
+    let source = InMemoryKeySource::new([0x42; 32]);
+    let store = ProfileFileStore::open(dir.path(), &source).expect("open store");
     (dir, store)
 }
 

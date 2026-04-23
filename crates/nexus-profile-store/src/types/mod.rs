@@ -1,11 +1,10 @@
 //! Profile types.
 //!
-//! Each technology has an in-memory form that the backends work
-//! with, and (for credential-bearing kinds) a matching on-disk
-//! form that is Serialize/Deserialize. The dual-struct pattern
-//! keeps [`crate::secret::SecretString`] out of every
-//! `Serialize` impl (DD-007 §5.3). GNSS and Bluetooth profiles do
-//! not currently carry credential fields and use a single struct.
+//! Each technology has an in-memory form (with `SecretString`
+//! credentials) and a matching on-disk form (with `EncryptedBlob`
+//! credentials). The dual-struct pattern keeps `SecretString` out
+//! of every `Serialize` impl (DD-007 §5.3). GNSS and Bluetooth
+//! profiles carry no credential fields, so they use a single struct.
 //!
 //! Cross-technology types (`Dot1xEapConfig`, `SecurityConfig`) live
 //! here rather than in their "home" backend crate because the
@@ -20,21 +19,19 @@ pub mod wifi;
 pub use nexus_core::ProfileMetadata;
 
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
+use crate::crypto::{Cipher, CipherError, EncryptedBlob, associated_data};
 use crate::secret::SecretString;
+use crate::trait_def::ProfileKind;
 
 // ---------------------------------------------------------------------------
 // Dot1x / EAP
-//
-// Shared between Ethernet's `Dot1xSettings` and Wi-Fi's
-// `SecurityConfig::Wpa{2,3}Enterprise`. Full field set is from the
-// DD-007 §3.3 example TOML plus DD-003 §4.3. Per DD-002's repo
-// layout this will eventually live in `nexus-auth-eap` — today it
-// lives here so `nexus-profile-store` compiles standalone.
 // ---------------------------------------------------------------------------
 
 /// EAP identity + credentials used by both wired (802.1X) and
-/// enterprise Wi-Fi. In-memory form with redacted passwords.
+/// enterprise Wi-Fi. Contains `SecretString` fields; NOT Serialize
+/// or Deserialize.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dot1xEapConfig {
     pub eap: EapMethod,
@@ -62,9 +59,8 @@ pub enum EapMethod {
     Fast,
 }
 
-/// On-disk form of [`Dot1xEapConfig`]. Credential fields are plain
-/// strings during phase 2; phase 3 replaces them with
-/// `EncryptedBlob`. See DD-007 §5.3.
+/// On-disk form of [`Dot1xEapConfig`]. Credential fields are
+/// `EncryptedBlob`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dot1xEapConfigOnDisk {
     pub eap: EapMethod,
@@ -78,51 +74,127 @@ pub struct Dot1xEapConfigOnDisk {
     #[serde(default)]
     pub client_key: Option<String>,
     #[serde(default)]
-    pub client_key_password: Option<String>,
+    pub client_key_password: Option<EncryptedBlob>,
     #[serde(default)]
     pub phase2: Option<String>,
     #[serde(default)]
     pub domain_suffix_match: Option<String>,
     #[serde(default)]
-    pub password: Option<String>,
+    pub password: Option<EncryptedBlob>,
 }
 
-impl From<&Dot1xEapConfig> for Dot1xEapConfigOnDisk {
-    fn from(value: &Dot1xEapConfig) -> Self {
-        Self {
-            eap: value.eap,
-            identity: value.identity.clone(),
-            anonymous_identity: value.anonymous_identity.clone(),
-            ca_cert: value.ca_cert.clone(),
-            client_cert: value.client_cert.clone(),
-            client_key: value.client_key.clone(),
-            client_key_password: value
-                .client_key_password
-                .as_ref()
-                .map(|s| s.expose_secret().to_owned()),
-            phase2: value.phase2.clone(),
-            domain_suffix_match: value.domain_suffix_match.clone(),
-            password: value
-                .password
-                .as_ref()
-                .map(|s| s.expose_secret().to_owned()),
-        }
-    }
+// ---------------------------------------------------------------------------
+// Encrypt / decrypt helpers
+// ---------------------------------------------------------------------------
+
+/// Build AAD for one field of one profile (`kind:id:field`).
+pub(crate) fn ad(kind: ProfileKind, id: &Ulid, field: &str) -> Vec<u8> {
+    associated_data(kind, id, field)
 }
 
-impl From<Dot1xEapConfigOnDisk> for Dot1xEapConfig {
-    fn from(value: Dot1xEapConfigOnDisk) -> Self {
-        Self {
-            eap: value.eap,
-            identity: value.identity,
-            anonymous_identity: value.anonymous_identity,
-            ca_cert: value.ca_cert,
-            client_cert: value.client_cert,
-            client_key: value.client_key,
-            client_key_password: value.client_key_password.map(SecretString::new),
-            phase2: value.phase2,
-            domain_suffix_match: value.domain_suffix_match,
-            password: value.password.map(SecretString::new),
-        }
-    }
+/// Encrypt `plaintext` (as UTF-8 bytes from a `SecretString`) using
+/// the per-file cipher + AD constructed from the profile context.
+pub(crate) fn encrypt_field(
+    cipher: &dyn Cipher,
+    kind: ProfileKind,
+    id: &Ulid,
+    field: &str,
+    plaintext: &str,
+) -> Result<EncryptedBlob, CipherError> {
+    cipher.encrypt(&ad(kind, id, field), plaintext.as_bytes())
+}
+
+/// Decrypt one field, expecting UTF-8.
+pub(crate) fn decrypt_field(
+    cipher: &dyn Cipher,
+    kind: ProfileKind,
+    id: &Ulid,
+    field: &str,
+    blob: &EncryptedBlob,
+) -> Result<SecretString, CipherError> {
+    let pt = cipher.decrypt(&ad(kind, id, field), blob)?;
+    let s = String::from_utf8(pt).map_err(|_| CipherError::InvalidUtf8)?;
+    Ok(SecretString::new(s))
+}
+
+pub(crate) fn encrypt_eap(
+    config: &Dot1xEapConfig,
+    cipher: &dyn Cipher,
+    kind: ProfileKind,
+    profile_id: &Ulid,
+    field_prefix: &str,
+) -> Result<Dot1xEapConfigOnDisk, CipherError> {
+    let password = match &config.password {
+        Some(s) => Some(encrypt_field(
+            cipher,
+            kind,
+            profile_id,
+            &format!("{field_prefix}.password"),
+            s.expose_secret(),
+        )?),
+        None => None,
+    };
+    let client_key_password = match &config.client_key_password {
+        Some(s) => Some(encrypt_field(
+            cipher,
+            kind,
+            profile_id,
+            &format!("{field_prefix}.client_key_password"),
+            s.expose_secret(),
+        )?),
+        None => None,
+    };
+    Ok(Dot1xEapConfigOnDisk {
+        eap: config.eap,
+        identity: config.identity.clone(),
+        anonymous_identity: config.anonymous_identity.clone(),
+        ca_cert: config.ca_cert.clone(),
+        client_cert: config.client_cert.clone(),
+        client_key: config.client_key.clone(),
+        client_key_password,
+        phase2: config.phase2.clone(),
+        domain_suffix_match: config.domain_suffix_match.clone(),
+        password,
+    })
+}
+
+pub(crate) fn decrypt_eap(
+    on_disk: Dot1xEapConfigOnDisk,
+    cipher: &dyn Cipher,
+    kind: ProfileKind,
+    profile_id: &Ulid,
+    field_prefix: &str,
+) -> Result<Dot1xEapConfig, CipherError> {
+    let password = match on_disk.password {
+        Some(blob) => Some(decrypt_field(
+            cipher,
+            kind,
+            profile_id,
+            &format!("{field_prefix}.password"),
+            &blob,
+        )?),
+        None => None,
+    };
+    let client_key_password = match on_disk.client_key_password {
+        Some(blob) => Some(decrypt_field(
+            cipher,
+            kind,
+            profile_id,
+            &format!("{field_prefix}.client_key_password"),
+            &blob,
+        )?),
+        None => None,
+    };
+    Ok(Dot1xEapConfig {
+        eap: on_disk.eap,
+        identity: on_disk.identity,
+        anonymous_identity: on_disk.anonymous_identity,
+        ca_cert: on_disk.ca_cert,
+        client_cert: on_disk.client_cert,
+        client_key: on_disk.client_key,
+        client_key_password,
+        phase2: on_disk.phase2,
+        domain_suffix_match: on_disk.domain_suffix_match,
+        password,
+    })
 }
