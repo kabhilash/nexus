@@ -25,14 +25,14 @@
 
 use std::time::Duration;
 
-use nexus_core::{PairingJobId, PairingPromptData, PairingPromptKind};
+use nexus_core::{PairingAnswer, PairingJobId, PairingPromptData, PairingPromptKind};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::backend::BtCommand;
 use crate::errors::{BtError, Result};
 use crate::metrics as m;
-use crate::pairing::{PairingAnswer, prompt_kind_label};
+use crate::pairing::prompt_kind_label;
 use crate::types::AuthorizationDecision;
 
 /// Agent object. Holds a clone of the backend's command sender so

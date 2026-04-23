@@ -38,6 +38,14 @@ pub enum BtError {
     #[error("unknown pairing job: {0:?}")]
     UnknownPairingJob(PairingJobId),
 
+    /// `AnswerPairingPrompt` supplied a variant that doesn't match
+    /// the pending prompt's kind (DD-006 §6.4 per-kind variant
+    /// map) — e.g. boolean for `RequestPin`, or string "yes" for
+    /// `RequestConfirmation`. The pending prompt remains armed so
+    /// the operator may retry with a correct answer.
+    #[error("invalid pairing-answer variant: {0}")]
+    InvalidPromptAnswer(String),
+
     /// The Agent's oneshot receiver was dropped before the operator
     /// answered.
     #[error("pairing job gone before answer arrived")]

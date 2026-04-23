@@ -19,8 +19,9 @@ pub mod ssid;
 pub use address::{BluetoothAddrExt, MacAddr, ParseMacAddrError};
 pub use event::{
     AuthFailureReason, AuthState, BssCapabilities, BssInfo, BtAddressType, BtDeviceInfo,
-    BtFailureReason, BtTransport, DisconnectReason, FixMode, GnssFix, NexusEvent, PairingJobId,
-    PairingPromptData, PairingPromptKind, ProfileKind, SatInfo, SecurityMode, WifiState,
+    BtFailureReason, BtTransport, DisconnectReason, FixMode, GnssFix, NexusEvent, PairingAnswer,
+    PairingJobId, PairingPromptData, PairingPromptKind, ProfileKind, SatInfo, SecurityMode,
+    WifiState,
 };
 pub use interface::{InterfaceInfo, InterfaceKind, Nl80211IfType, OperState, PhyCapabilities};
 pub use metadata::ProfileMetadata;

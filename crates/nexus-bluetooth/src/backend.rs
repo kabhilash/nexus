@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use nexus_core::{
     BluetoothAddrExt, BtDeviceInfo, BtFailureReason, BtTransport, InterfaceKind, MacAddr,
-    NexusEvent, NotificationData, PairingJobId, PairingPromptData, PairingPromptKind,
+    NexusEvent, NotificationData, PairingAnswer, PairingJobId, PairingPromptData,
+    PairingPromptKind,
 };
 use nexus_profile_store::{BluetoothProfile, ProfileMetadata, ProfileStore};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -35,7 +36,7 @@ use crate::bluez::BluezClient;
 use crate::device::{self, DeviceSignal};
 use crate::errors::{BtError, Result};
 use crate::metrics as m;
-use crate::pairing::{self, PairingAnswer, build_prompt_notification, classify_pair_error};
+use crate::pairing::{self, build_prompt_notification, classify_pair_error};
 use crate::types::{
     AuthorizationDecision, BtAdapterEntry, BtDeviceEntry, BtDeviceState, DiscoveryFilter,
     PowerState, initial_device_state,
@@ -185,6 +186,13 @@ impl Default for BluetoothConfig {
 // Backend struct + event loop
 // ---------------------------------------------------------------------------
 
+/// Entry in `pending_prompt_answers`: the oneshot the Agent is
+/// waiting on, paired with the prompt kind the operator must match.
+struct PendingPrompt {
+    kind: PairingPromptKind,
+    sender: oneshot::Sender<PairingAnswer>,
+}
+
 /// In-memory bookkeeping for the backend. Owned by the main task;
 /// accessed only from there.
 pub struct BluetoothBackend {
@@ -199,8 +207,10 @@ pub struct BluetoothBackend {
     /// Pairing-prompt oneshot senders the Agent deposits via
     /// `RegisterPromptOneshot`. Keyed by the pairing job. See
     /// DD-004 §7.2's assumption: at most one outstanding prompt
-    /// per job at any time.
-    pending_prompt_answers: HashMap<PairingJobId, oneshot::Sender<PairingAnswer>>,
+    /// per job at any time. The stored [`PairingPromptKind`] lets
+    /// `AnswerPairingPrompt` validate the operator's answer variant
+    /// against DD-006 §6.4's per-kind map.
+    pending_prompt_answers: HashMap<PairingJobId, PendingPrompt>,
     /// Current power state. Defaults to `Active`.
     power_state: PowerState,
     first_bluez_outage_at: Option<Instant>,
@@ -365,8 +375,8 @@ impl BluetoothBackend {
             }
         }
         for job in pending_jobs {
-            if let Some(tx) = self.pending_prompt_answers.remove(&job) {
-                let _ = tx.send(PairingAnswer::Cancel);
+            if let Some(pending) = self.pending_prompt_answers.remove(&job) {
+                let _ = pending.sender.send(PairingAnswer::Cancel);
             }
         }
     }
@@ -378,8 +388,8 @@ impl BluetoothBackend {
             // Cancel pairings tied to devices on this adapter.
             for dev in entry.devices.values() {
                 if let Some(job) = dev.pairing_job {
-                    if let Some(tx) = self.pending_prompt_answers.remove(&job) {
-                        let _ = tx.send(PairingAnswer::Cancel);
+                    if let Some(pending) = self.pending_prompt_answers.remove(&job) {
+                        let _ = pending.sender.send(PairingAnswer::Cancel);
                     }
                 }
             }
@@ -667,10 +677,7 @@ impl BluetoothBackend {
                 answer,
                 responder,
             } => {
-                let result = match self.pending_prompt_answers.remove(&job_id) {
-                    Some(tx) => tx.send(answer).map_err(|_| BtError::PairingJobGone),
-                    None => Err(BtError::UnknownPairingJob(job_id)),
-                };
+                let result = self.answer_pairing_prompt(job_id, answer);
                 let _ = responder.send(result);
             }
             BtCommand::Connect {
@@ -744,8 +751,8 @@ impl BluetoothBackend {
                     .device_by_path(&device_path)
                     .and_then(|d| d.pairing_job)
                 {
-                    if let Some(tx) = self.pending_prompt_answers.remove(&job_id) {
-                        let _ = tx.send(PairingAnswer::Cancel);
+                    if let Some(pending) = self.pending_prompt_answers.remove(&job_id) {
+                        let _ = pending.sender.send(PairingAnswer::Cancel);
                     }
                 }
                 let result = self.bluez.cancel_pairing(&device_path).await;
@@ -830,6 +837,32 @@ impl BluetoothBackend {
         }
     }
 
+    /// Operator-supplied answer to a pending pairing prompt. Per
+    /// DD-006 §6.4, each `PairingPromptKind` accepts exactly one
+    /// answer-variant family; mismatches return
+    /// `InvalidPromptAnswer` without disturbing the pending prompt
+    /// so the operator can retry.
+    fn answer_pairing_prompt(&mut self, job_id: PairingJobId, answer: PairingAnswer) -> Result<()> {
+        let Some(pending) = self.pending_prompt_answers.get(&job_id) else {
+            return Err(BtError::UnknownPairingJob(job_id));
+        };
+        if let Err(reason) = crate::pairing::validate_answer(pending.kind, &answer) {
+            return Err(BtError::InvalidPromptAnswer(reason));
+        }
+        // Validation passed — consume the pending entry and resolve
+        // the Agent's oneshot. `send` fails only if the Agent has
+        // given up on its receiver (e.g., response timeout elapsed);
+        // surface that as `PairingJobGone`.
+        let pending = self
+            .pending_prompt_answers
+            .remove(&job_id)
+            .expect("entry present; just peeked");
+        pending
+            .sender
+            .send(answer)
+            .map_err(|_| BtError::PairingJobGone)
+    }
+
     fn handle_register_prompt(
         &mut self,
         job_id: PairingJobId,
@@ -855,7 +888,8 @@ impl BluetoothBackend {
             tracing::debug!(?job_id, "prompt for stale job; dropping");
             return;
         }
-        self.pending_prompt_answers.insert(job_id, sender);
+        self.pending_prompt_answers
+            .insert(job_id, PendingPrompt { kind, sender });
         let _ = self.event_tx.send(NexusEvent::BtPairingPrompt {
             job_id,
             kind,

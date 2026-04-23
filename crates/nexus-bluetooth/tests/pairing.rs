@@ -775,6 +775,302 @@ async fn forget_paired_device_removes_profile() {
     let _ = tokio::time::timeout(Duration::from_secs(2), handle.join).await;
 }
 
+/// Per-prompt-kind variant enforcement (DD-006 §6.4). A wrong
+/// variant returns `InvalidPromptAnswer` without consuming the
+/// pending prompt, so the operator can retry with a correct answer
+/// and pairing still succeeds.
+#[tokio::test]
+async fn wrong_variant_rejected_then_retry_succeeds() {
+    let (event_tx, _rx0) = broadcast::channel::<NexusEvent>(128);
+    let mut event_rx = event_tx.subscribe();
+    let (_tmp, store) = start_store().await;
+
+    let mock = Arc::new(MockBluezClient::new(event_tx.clone()));
+    let client: Arc<dyn BluezClient> = mock.clone();
+    mock.connect().await.unwrap();
+    let handle = spawn_bluetooth_backend(
+        client,
+        store.clone(),
+        event_tx.clone(),
+        BluetoothConfig::default(),
+    );
+    let agent = Agent::new(handle.cmd_tx.clone(), 5);
+    install_confirmation_hook(&mock, agent, 246_810);
+
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(bt_interface(
+            10,
+            "hci0",
+            "/org/bluez/hci0",
+        )))
+        .unwrap();
+    mock.publish_adapter("/org/bluez/hci0", true, false).await;
+    let addr = MacAddr([0x77; 6]);
+    mock.publish_device("/org/bluez/hci0", addr, false).await;
+    let device_path = format!("/org/bluez/hci0/{}", addr.to_object_path_component());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (tx, rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(BtCommand::Pair {
+            device_path,
+            responder: tx,
+        })
+        .await
+        .unwrap();
+    let job_id = rx.await.unwrap().unwrap();
+    let _ = await_event(
+        &mut event_rx,
+        |e| {
+            matches!(
+                e,
+                NexusEvent::BtPairingPrompt {
+                    kind: PairingPromptKind::RequestConfirmation,
+                    ..
+                }
+            )
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Wrong variant for RequestConfirmation (expects b, sent Pin(s)).
+    let (tx, rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(BtCommand::AnswerPairingPrompt {
+            job_id,
+            answer: PairingAnswer::Pin("yes".into()),
+            responder: tx,
+        })
+        .await
+        .unwrap();
+    let err = rx.await.unwrap().unwrap_err();
+    match err {
+        nexus_bluetooth::BtError::InvalidPromptAnswer(s) => {
+            assert!(
+                s.contains("request_confirmation") && s.contains("Pin"),
+                "got {s}"
+            );
+        }
+        other => panic!("expected InvalidPromptAnswer, got {other:?}"),
+    }
+
+    // Retry with the correct variant — pending prompt is still
+    // armed, so the Agent's oneshot resolves and pairing completes.
+    let (tx, rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(BtCommand::AnswerPairingPrompt {
+            job_id,
+            answer: PairingAnswer::Accept(true),
+            responder: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+
+    let _ = await_event(
+        &mut event_rx,
+        |e| matches!(e, NexusEvent::BtPairingComplete { success: true, .. }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    handle.shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.join).await;
+}
+
+/// DisplayPasskey is notification-only; `PairingAnswer::Acknowledge`
+/// resolves the Agent's oneshot, BlueZ's DisplayPasskey call returns,
+/// pairing proceeds.
+#[tokio::test]
+async fn display_passkey_acknowledge_releases_agent() {
+    let (event_tx, _rx0) = broadcast::channel::<NexusEvent>(128);
+    let mut event_rx = event_tx.subscribe();
+    let (_tmp, store) = start_store().await;
+
+    let mock = Arc::new(MockBluezClient::new(event_tx.clone()));
+    let client: Arc<dyn BluezClient> = mock.clone();
+    mock.connect().await.unwrap();
+    let handle = spawn_bluetooth_backend(
+        client,
+        store.clone(),
+        event_tx.clone(),
+        BluetoothConfig::default(),
+    );
+    let agent = Agent::new(handle.cmd_tx.clone(), 5);
+    // Install a pair_hook that drives DisplayPasskey on the Agent.
+    mock.on_pair({
+        let agent = agent.clone();
+        move |path| {
+            let agent = agent.clone();
+            async move { agent.display_passkey(&path, 123_456, 0).await }
+        }
+    });
+
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(bt_interface(
+            11,
+            "hci0",
+            "/org/bluez/hci0",
+        )))
+        .unwrap();
+    mock.publish_adapter("/org/bluez/hci0", true, false).await;
+    let addr = MacAddr([0x88; 6]);
+    mock.publish_device("/org/bluez/hci0", addr, false).await;
+    let device_path = format!("/org/bluez/hci0/{}", addr.to_object_path_component());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (tx, rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(BtCommand::Pair {
+            device_path,
+            responder: tx,
+        })
+        .await
+        .unwrap();
+    let job_id = rx.await.unwrap().unwrap();
+    let _ = await_event(
+        &mut event_rx,
+        |e| {
+            matches!(
+                e,
+                NexusEvent::BtPairingPrompt {
+                    kind: PairingPromptKind::DisplayPasskey,
+                    ..
+                }
+            )
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Wrong string value for DisplayPasskey must be rejected.
+    let (tx, rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(BtCommand::AnswerPairingPrompt {
+            job_id,
+            answer: PairingAnswer::Pin("ok".into()),
+            responder: tx,
+        })
+        .await
+        .unwrap();
+    let err = rx.await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, nexus_bluetooth::BtError::InvalidPromptAnswer(_)),
+        "got {err:?}"
+    );
+
+    // Correct acknowledge resolves the agent.
+    let (tx, rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(BtCommand::AnswerPairingPrompt {
+            job_id,
+            answer: PairingAnswer::Acknowledge,
+            responder: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+
+    // BlueZ's Pair() returns, pairing completes successfully.
+    let _ = await_event(
+        &mut event_rx,
+        |e| matches!(e, NexusEvent::BtPairingComplete { success: true, .. }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    handle.shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.join).await;
+}
+
+/// `PairingAnswer::Cancel` is universal — valid for every prompt
+/// kind. Backend transitions to Failed with reason "rejected".
+#[tokio::test]
+async fn cancel_is_universal_across_prompt_kinds() {
+    let (event_tx, _rx0) = broadcast::channel::<NexusEvent>(128);
+    let mut event_rx = event_tx.subscribe();
+    let (_tmp, store) = start_store().await;
+
+    let mock = Arc::new(MockBluezClient::new(event_tx.clone()));
+    let client: Arc<dyn BluezClient> = mock.clone();
+    mock.connect().await.unwrap();
+    let handle = spawn_bluetooth_backend(
+        client,
+        store.clone(),
+        event_tx.clone(),
+        BluetoothConfig::default(),
+    );
+    let agent = Agent::new(handle.cmd_tx.clone(), 5);
+    install_confirmation_hook(&mock, agent, 42);
+
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(bt_interface(
+            12,
+            "hci0",
+            "/org/bluez/hci0",
+        )))
+        .unwrap();
+    mock.publish_adapter("/org/bluez/hci0", true, false).await;
+    let addr = MacAddr([0x99; 6]);
+    mock.publish_device("/org/bluez/hci0", addr, false).await;
+    let device_path = format!("/org/bluez/hci0/{}", addr.to_object_path_component());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (tx, rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(BtCommand::Pair {
+            device_path,
+            responder: tx,
+        })
+        .await
+        .unwrap();
+    let job_id = rx.await.unwrap().unwrap();
+    let _ = await_event(
+        &mut event_rx,
+        |e| matches!(e, NexusEvent::BtPairingPrompt { .. }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Cancel even though the pending prompt kind is RequestConfirmation.
+    let (tx, rx) = oneshot::channel();
+    handle
+        .cmd_tx
+        .send(BtCommand::AnswerPairingPrompt {
+            job_id,
+            answer: PairingAnswer::Cancel,
+            responder: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+
+    let complete = await_event(
+        &mut event_rx,
+        |e| matches!(e, NexusEvent::BtPairingComplete { success: false, .. }),
+        Duration::from_secs(2),
+    )
+    .await;
+    match complete {
+        NexusEvent::BtPairingComplete {
+            reason: Some(nexus_core::BtFailureReason::PairingRejected),
+            ..
+        } => {}
+        other => panic!("expected PairingRejected, got {other:?}"),
+    }
+
+    handle.shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.join).await;
+}
+
 // Silence unused import of PairingJobId; it's referenced through
 // pattern matches above under compile expansion.
 #[allow(dead_code)]

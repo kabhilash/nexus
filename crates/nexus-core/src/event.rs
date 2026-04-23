@@ -441,6 +441,31 @@ pub struct PairingPromptData {
     pub service_uuid: Option<String>,
 }
 
+/// Operator response to a pairing prompt. Flows from the D-Bus
+/// `AnswerPairingPrompt` method into the Bluetooth backend, which
+/// validates the variant against the pending `PairingPromptKind`
+/// (see DD-006 §6.4's per-kind variant map) before resolving the
+/// Agent's pending oneshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingAnswer {
+    /// PIN entered by the operator (`RequestPin`). 4-16 ASCII chars.
+    Pin(String),
+    /// Passkey entered by the operator (`RequestPasskey`).
+    /// 0..=999_999 per the Bluetooth spec.
+    Passkey(u32),
+    /// Yes/no for any confirmation-style prompt (`RequestConfirmation`,
+    /// `RequestAuthorization`, `AuthorizeService`).
+    Accept(bool),
+    /// The operator has seen a notification-only prompt
+    /// (`DisplayPasskey` / `DisplayPin`). Tells the Agent it can
+    /// return to BlueZ now.
+    Acknowledge,
+    /// Operator cancelled — maps to DD-006 §6.4's universal
+    /// `"s":"cancel"` answer. Backend fails the pairing with reason
+    /// "rejected".
+    Cancel,
+}
+
 /// Reason for a Bluetooth pairing/connection failure. See DD-004 §5.1.
 #[derive(Debug, Clone)]
 pub enum BtFailureReason {

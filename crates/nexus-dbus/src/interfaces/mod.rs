@@ -12,7 +12,7 @@ pub mod ethernet;
 pub mod gnss;
 pub mod wifi;
 
-pub use bluetooth::BluetoothIface;
+pub use bluetooth::{BluetoothIface, decode_pairing_answer};
 pub use bluetooth_device::BluetoothDeviceIface;
 pub use common::InterfaceIface;
 pub use ethernet::EthernetIface;

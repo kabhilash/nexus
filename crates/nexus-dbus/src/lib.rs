@@ -28,6 +28,7 @@ pub use authz::{
 };
 pub use backend_ops::{BackendOps, NoopOps, RecordedCall, RecordingOps, RoamingMode, ScanParams};
 pub use errors::{DbusError, Result};
+pub use interfaces::decode_pairing_answer;
 pub use manager::Manager;
 pub use object_manager::ObjectManager;
 pub use paths::{

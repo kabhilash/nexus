@@ -29,7 +29,8 @@ pub use agent::{AGENT_CAPABILITY, AGENT_PATH, Agent, spawn_agent};
 pub use backend::{BluetoothBackend, BluetoothConfig, BtCommand};
 pub use bluez::{BluezClient, MockBluezClient, ZbusBluezClient};
 pub use errors::{BtError, Result};
-pub use pairing::{PairingAnswer, classify_pair_error};
+pub use nexus_core::PairingAnswer;
+pub use pairing::{classify_pair_error, validate_answer};
 pub use types::{
     AuthorizationDecision, BtAdapterEntry, BtAdapterState, BtDeviceEntry, BtDeviceState,
     DiscoveryFilter, DiscoveryTransport, PowerState,
