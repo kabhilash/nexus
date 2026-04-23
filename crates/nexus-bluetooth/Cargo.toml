@@ -5,4 +5,33 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Integration tests that talk to a real system BlueZ. Skipped in
+# default CI; run locally with `cargo test --features integration-bluez`
+# on a machine with a BlueZ daemon and a Bluetooth adapter.
+integration-bluez = []
+
 [dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-profile-store = { path = "../nexus-profile-store" }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures-util = "0.3"
+metrics = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
+zbus = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[[bin]]
+name = "nexus-bluetooth-demo"
+path = "src/bin/demo.rs"
