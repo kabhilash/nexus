@@ -5,4 +5,28 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["wifi-wpa_supplicant"]
+# wpa_supplicant-backed WifiSupplicantBackend (default).
+wifi-wpa_supplicant = ["dep:zbus"]
+# iwd-backed WifiSupplicantBackend; deferred to DD-003 Phase 10.
+wifi-iwd = ["dep:zbus"]
+# Real-kernel integration tests (mac80211_hwsim + hostapd); all
+# `#[ignore]`d in default CI per DD-003 §14.2.
+integration-linux = []
+
 [dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-profile-store = { path = "../nexus-profile-store" }
+
+async-trait = { workspace = true }
+metrics = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+zbus = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
