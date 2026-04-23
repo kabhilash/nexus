@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+PolicyKit policy file for the Nexus connectivity manager. Maps
+each DD-006 §10.1 action to its default authorization rule.
+
+Install location: /usr/share/polkit-1/actions/fi.nexus.policy
+Operator override location: /etc/polkit-1/rules.d/<name>.rules
+(see DD-006 §10.1 / §10.3 for rule examples).
+-->
+<policyconfig>
+
+  <vendor>Nexus</vendor>
+  <vendor_url>https://github.com/anthropics/nexus</vendor_url>
+
+  <action id="fi.nexus.read">
+    <description>Read Nexus state</description>
+    <message>Read of Nexus properties is permitted by default. Override with a PolicyKit rule to restrict to a specific group.</message>
+    <defaults>
+      <allow_any>yes</allow_any>
+      <allow_inactive>yes</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+
+  <action id="fi.nexus.scan">
+    <description>Trigger a Wi-Fi scan</description>
+    <message>Authentication is required to trigger a Wi-Fi scan.</message>
+    <defaults>
+      <allow_any>auth_self_keep</allow_any>
+      <allow_inactive>auth_self_keep</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="fi.nexus.connect">
+    <description>Connect or disconnect using an existing profile</description>
+    <message>Authentication is required to connect or disconnect a network.</message>
+    <defaults>
+      <allow_any>auth_self_keep</allow_any>
+      <allow_inactive>auth_self_keep</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="fi.nexus.profile.add">
+    <description>Add a new Nexus profile</description>
+    <message>Administrator authentication is required to add a profile.</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="fi.nexus.profile.modify">
+    <description>Modify or remove a Nexus profile</description>
+    <message>Administrator authentication is required to modify a profile.</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="fi.nexus.profile.read_credentials">
+    <description>Read decrypted profile credentials</description>
+    <message>Reading decrypted credentials is disabled by default; override only on devices that need it.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>no</allow_active>
+    </defaults>
+  </action>
+
+  <action id="fi.nexus.set_power">
+    <description>Change the global Nexus power state</description>
+    <message>Authentication is required to change the global power state.</message>
+    <defaults>
+      <allow_any>auth_self_keep</allow_any>
+      <allow_inactive>auth_self_keep</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="fi.nexus.admin">
+    <description>Perform Nexus administrative actions (rotate, freeze, diagnose)</description>
+    <message>Administrator authentication is required for administrative actions.</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>

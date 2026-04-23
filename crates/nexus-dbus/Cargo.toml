@@ -5,4 +5,32 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# System-bus integration tests. Skipped in CI; run locally with
+# `cargo test --features integration-dbus -- --ignored` on a host
+# with a running system D-Bus and permission to own `fi.nexus1`.
+integration-dbus = []
+
 [dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-profile-store = { path = "../nexus-profile-store" }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures-util = "0.3"
+thiserror = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
+zbus = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[[bin]]
+name = "nexus-dbus-demo"
+path = "src/bin/demo.rs"
