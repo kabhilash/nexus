@@ -293,6 +293,29 @@ CollectDiagnostics() -> (bundle_fd: h)
     Typical bundle size is 10-100 KB; can be several MB with verbose
     logs enabled.
     Errors: fi.nexus.Error.AuthFailed, fi.nexus.Error.IoError
+
+ReloadConfig() -> (report: a{sv})
+    Re-read /etc/nexus/nexus.toml (or the path passed to nexusd via
+    --config) and apply those settings that are safely re-applicable
+    at runtime. The report dict contains:
+      "applied": as — config sections whose new values took effect
+                      (e.g., ["wifi.scan", "bluetooth.power",
+                      "gnss.emit"])
+      "deferred": as — sections whose changes require a restart to
+                       take effect (e.g., ["dbus.bus_name"] would be
+                       listed here if a bus-name change were
+                       attempted; restart-requiring changes are
+                       ignored at reload time, not refused)
+      "errors": a(ss) — (section, reason) pairs for sections that
+                        failed to reload due to invalid values; the
+                        daemon continues with the previous values
+                        for those sections
+    Safe-to-reload sections include backend timeouts, scan cadences,
+    power-state defaults, metric exposure. Unsafe sections include
+    the D-Bus bus name, the profile-store root path, and the
+    master-key source — changing these requires a daemon restart.
+    Errors: fi.nexus.Error.AuthFailed, fi.nexus.Error.IoError
+            (config file unreadable)
 ```
 
 ### 5.3 Signals
@@ -484,11 +507,26 @@ CancelPairing(device: o) -> ()
 
 AnswerPairingPrompt(job_id: s, answer: v) -> ()
     Respond to a PairingPrompt. answer's variant depends on the prompt
-    kind: "s" for PIN entry (RequestPin), "u" for passkey entry
-    (RequestPasskey), "b" for yes/no confirmations (DisplayPasskey,
-    RequestConfirmation, RequestAuthorization, AuthorizeService).
-    A special "cancel" string variant cancels the prompt outright.
-    Errors: fi.nexus.Error.UnknownPairingJob
+    kind. Valid variant types per prompt kind:
+      - RequestPin          → "s" (PIN string; 4-16 ASCII chars)
+      - RequestPasskey      → "u" (6-digit passkey, 0..999999)
+      - RequestConfirmation → "b" (true = passkeys match, false = don't)
+      - RequestAuthorization → "b" (true = authorize, false = reject)
+      - AuthorizeService    → "b" (true = authorize, false = reject)
+      - DisplayPasskey      → "s" with value "acknowledge"
+      - DisplayPin          → "s" with value "acknowledge"
+    DisplayPasskey and DisplayPin are notification-only (the operator
+    reads the value off Nexus's UI and types it on the peer). The
+    "acknowledge" answer tells the backend the operator has seen the
+    prompt so the backend's Agent method can return to BlueZ. Any
+    string value other than "acknowledge" or "cancel" for these prompt
+    kinds returns fi.nexus.Error.InvalidArgument.
+    A special answer of "s":"cancel" cancels any prompt outright,
+    regardless of kind — the backend treats this as operator rejection
+    and the pairing fails with reason "rejected".
+    Errors: fi.nexus.Error.UnknownPairingJob,
+            fi.nexus.Error.InvalidArgument (wrong variant type for
+            the prompt kind)
 
 Connect(device: o) -> ()
     Connect to a paired device (Classic) or any device (BLE). Transitions
@@ -838,7 +876,7 @@ Each action has a unique identifier and a policy file at `/usr/share/polkit-1/ac
 | `fi.nexus.profile.modify` | `auth_admin_keep` | Update or delete a profile |
 | `fi.nexus.profile.read_credentials` | `no` | Read decrypted credential fields — disabled by default |
 | `fi.nexus.set_power` | `auth_self_keep` | Change power state |
-| `fi.nexus.admin` | `auth_admin_keep` | Rotate master key, freeze for backup, collect diagnostics |
+| `fi.nexus.admin` | `auth_admin_keep` | Rotate master key, freeze for backup, collect diagnostics, reload config |
 
 Defaults can be adjusted by operators via standard PolicyKit rules (`/etc/polkit-1/rules.d/...`). For headless devices, the typical setup grants full access to a single `nexus-admin` group.
 
@@ -1211,7 +1249,7 @@ for path in scan_results:
 
 ### Phase 9 — Admin Operations
 
-`RotateMasterKey`, `FreezeForBackup`, `ReleaseBackupLease`, `CollectDiagnostics`. These gate behind `fi.nexus.admin`.
+`RotateMasterKey`, `FreezeForBackup`, `ReleaseBackupLease`, `CollectDiagnostics`, `ReloadConfig`. These gate behind `fi.nexus.admin`.
 
 **Exit criterion:** Can perform a full rotation from a D-Bus client and verify profiles are re-encrypted per DD-007.
 
