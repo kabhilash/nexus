@@ -614,6 +614,7 @@ dependencies = [
  "chrono",
  "hkdf",
  "libc",
+ "metrics",
  "nexus-core",
  "scrypt",
  "secrecy",

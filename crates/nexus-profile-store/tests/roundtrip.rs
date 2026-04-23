@@ -227,14 +227,20 @@ async fn ssid_hash_filename_is_stable_on_disk() {
 }
 
 #[tokio::test]
-async fn rotate_master_key_returns_not_yet_implemented() {
+async fn rotate_master_key_rewrites_every_profile() {
     let (_dir, store) = fresh_store();
-    let result = store.rotate_master_key().await;
-    assert!(matches!(
-        result,
-        Err(nexus_profile_store::StoreError::NotYetImplemented(_)),
-    ));
-    let _ = Duration::from_secs(0); // silence "unused import"
+    store
+        .put_ethernet(&sample_ethernet(Ulid::new(), "eth0"))
+        .await
+        .unwrap();
+    store
+        .put_wifi(&sample_wifi(Ulid::new(), b"nexus-net"))
+        .await
+        .unwrap();
+
+    let report = store.rotate_master_key().await.unwrap();
+    assert_eq!(report.profiles_rewritten, 2);
+    assert!(report.duration >= Duration::from_nanos(1));
 }
 
 /// Dummy implementation proving the trait compiles against its use
@@ -308,7 +314,10 @@ impl ProfileStore for DummyStore {
     async fn rotate_master_key(
         &self,
     ) -> nexus_profile_store::Result<nexus_profile_store::RotateReport> {
-        Err(nexus_profile_store::StoreError::NotYetImplemented("dummy"))
+        Ok(nexus_profile_store::RotateReport {
+            profiles_rewritten: 0,
+            duration: std::time::Duration::from_secs(0),
+        })
     }
 }
 

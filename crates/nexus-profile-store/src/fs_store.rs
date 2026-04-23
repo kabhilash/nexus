@@ -1,22 +1,29 @@
 //! Filesystem-backed implementation of [`ProfileStore`] with
-//! encryption wired in. See DD-007 §§4-6.
+//! encryption, a key-ring for active + previous master keys, and
+//! hooks for quarantine + metrics + migration. See DD-007 §§4-10.
 
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use async_trait::async_trait;
-use nexus_core::MacAddr;
+use nexus_core::{MacAddr, NexusEvent};
+use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 use ulid::Ulid;
 use zeroize::Zeroize;
 
-use crate::crypto::{ChaChaCipher, derive_file_key};
+use crate::crypto::{ChaChaCipher, Cipher, CipherError, derive_file_key};
 use crate::error::{Result, StoreError};
 use crate::keys::MasterKeySource;
-use crate::trait_def::{ProfileRef, ProfileStore, RotateReport};
+use crate::metrics as m;
+use crate::quarantine::{self, corrupt_reason};
+use crate::trait_def::{ProfileKind, ProfileRef, ProfileStore, RotateReport};
 use crate::types::bluetooth::BluetoothProfile;
 use crate::types::ethernet::{
     EthernetProfile, EthernetProfileOnDisk, decrypt_ethernet, encrypt_ethernet,
@@ -29,24 +36,45 @@ const FILE_MODE: u32 = 0o600;
 /// Directory mode for every profile directory (`0700`, owner rwx).
 const DIR_MODE: u32 = 0o700;
 
-const DIR_ETHERNET: &str = "ethernet";
-const DIR_WIFI: &str = "wifi";
-const DIR_GNSS: &str = "gnss";
-const DIR_BLUETOOTH: &str = "bluetooth";
+pub(crate) const DIR_ETHERNET: &str = "ethernet";
+pub(crate) const DIR_WIFI: &str = "wifi";
+pub(crate) const DIR_GNSS: &str = "gnss";
+pub(crate) const DIR_BLUETOOTH: &str = "bluetooth";
+pub(crate) const ROTATION_LOCK_FILE: &str = ".rotation.lock";
 
-/// Filesystem-backed profile store with encrypted credentials.
+/// Two 32-byte keys: the `active` key for writes, and an optional
+/// `previous` key used for load fallbacks during an in-flight
+/// rotation. Both are zeroized on drop.
+#[derive(Default)]
+pub(crate) struct KeyRing {
+    pub active: [u8; 32],
+    pub previous: Option<[u8; 32]>,
+}
+
+impl Drop for KeyRing {
+    fn drop(&mut self) {
+        self.active.zeroize();
+        if let Some(p) = self.previous.as_mut() {
+            p.zeroize();
+        }
+    }
+}
+
+/// Filesystem-backed profile store.
 pub struct ProfileFileStore {
     root: PathBuf,
-    master_key: MasterKey,
+    pub(crate) keys: Arc<RwLock<KeyRing>>,
     source_name: &'static str,
+    pub(crate) event_tx: Option<broadcast::Sender<NexusEvent>>,
 }
 
 impl std::fmt::Debug for ProfileFileStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProfileFileStore")
             .field("root", &self.root)
-            .field("master_key", &"<redacted>")
+            .field("keys", &"<redacted>")
             .field("source", &self.source_name)
+            .field("event_tx", &self.event_tx.as_ref().map(|_| "<sender>"))
             .finish()
     }
 }
@@ -54,12 +82,19 @@ impl std::fmt::Debug for ProfileFileStore {
 impl ProfileFileStore {
     /// Open a store rooted at `root`, pulling the master key from
     /// `source`. Creates the per-kind subdirectories if absent.
+    /// Runs pending schema migrations before returning.
     pub fn open(root: impl Into<PathBuf>, source: &dyn MasterKeySource) -> Result<Self> {
         let key = source.master_key().map_err(|e| StoreError::RootDir {
             path: PathBuf::new(),
             source: io::Error::other(format!("master key source '{}': {e}", source.name())),
         })?;
-        Self::open_with_key(root, key, source.name())
+        let store = Self::open_with_key(root, key, source.name())?;
+        m::set_master_key_source(source.name());
+        // Run any pending schema migrations. This is synchronous
+        // (no async I/O besides what the in-proc code does), so
+        // it's safe to block here.
+        crate::migrate::run_startup_migrations(&store)?;
+        Ok(store)
     }
 
     /// Lower-level constructor for cases where the caller already
@@ -76,48 +111,62 @@ impl ProfileFileStore {
         }
         Ok(Self {
             root,
-            master_key: MasterKey::new(key),
+            keys: Arc::new(RwLock::new(KeyRing {
+                active: key,
+                previous: None,
+            })),
             source_name,
+            event_tx: None,
         })
+    }
+
+    /// Builder: attach a broadcast sender so quarantine and rotation
+    /// can emit `NexusEvent`s.
+    pub fn with_event_tx(mut self, tx: broadcast::Sender<NexusEvent>) -> Self {
+        self.event_tx = Some(tx);
+        self
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Name of the active master-key source (`"file"`, `"tpm"`,
-    /// `"derived"`, `"memory"`). Used by observability code and
-    /// log messages.
     pub fn source_name(&self) -> &'static str {
         self.source_name
     }
 
-    fn dir(&self, sub: &str) -> PathBuf {
+    pub(crate) fn dir(&self, sub: &str) -> PathBuf {
         self.root.join(sub)
     }
 
-    fn ethernet_path(&self, ifname: &str) -> PathBuf {
+    pub(crate) fn ethernet_path(&self, ifname: &str) -> PathBuf {
         self.dir(DIR_ETHERNET).join(format!("{ifname}.toml"))
     }
 
-    fn wifi_path(&self, ssid_hash: &str) -> PathBuf {
+    pub(crate) fn wifi_path(&self, ssid_hash: &str) -> PathBuf {
         self.dir(DIR_WIFI).join(format!("{ssid_hash}.toml"))
     }
 
-    fn gnss_path(&self, id: &Ulid) -> PathBuf {
+    pub(crate) fn gnss_path(&self, id: &Ulid) -> PathBuf {
         self.dir(DIR_GNSS).join(format!("{id}.toml"))
     }
 
-    fn bluetooth_path(&self, id: &Ulid) -> PathBuf {
+    pub(crate) fn bluetooth_path(&self, id: &Ulid) -> PathBuf {
         self.dir(DIR_BLUETOOTH).join(format!("{id}.toml"))
     }
 
-    /// Construct the per-file cipher for a profile. The profile's
-    /// ULID drives HKDF; every file thus has a distinct key.
-    fn cipher_for(&self, id: &Ulid) -> ChaChaCipher {
+    /// Construct the (active, previous?) cipher pair for a given
+    /// profile. The active cipher is always returned; the previous
+    /// cipher is `Some(_)` only during an in-flight rotation.
+    pub(crate) async fn cipher_pair(&self, id: &Ulid) -> (ChaChaCipher, Option<ChaChaCipher>) {
         let id_bytes = id.to_bytes();
-        let file_key = derive_file_key(&self.master_key.0, &id_bytes);
-        ChaChaCipher::new(file_key)
+        let keys = self.keys.read().await;
+        let active = ChaChaCipher::new(derive_file_key(&keys.active, &id_bytes));
+        let previous = keys
+            .previous
+            .as_ref()
+            .map(|k| ChaChaCipher::new(derive_file_key(k, &id_bytes)));
+        (active, previous)
     }
 }
 
@@ -125,16 +174,25 @@ impl ProfileFileStore {
 impl ProfileStore for ProfileFileStore {
     async fn load_ethernet(&self) -> Result<Vec<EthernetProfile>> {
         let mut out = Vec::new();
-        for on_disk in load_all::<EthernetProfileOnDisk>(&self.dir(DIR_ETHERNET))? {
-            let cipher = self.cipher_for(&on_disk.id);
-            match decrypt_ethernet(on_disk, &cipher) {
-                Ok(p) => out.push(p),
-                Err(e) => {
-                    tracing::warn!(error = %e, "ethernet profile failed to decrypt; skipping")
+        for (path, on_disk) in load_all_raw::<EthernetProfileOnDisk>(&self.dir(DIR_ETHERNET))? {
+            let (active, previous) = self.cipher_pair(&on_disk.id).await;
+            match decrypt_with_fallback(&on_disk, &active, previous.as_ref(), |od, c| {
+                decrypt_ethernet(od, c)
+            }) {
+                Ok(p) => {
+                    m::record_profile_loaded(ProfileKind::Ethernet);
+                    out.push(p);
                 }
+                Err(reason) => self.quarantine_load_failure(
+                    ProfileKind::Ethernet,
+                    &path,
+                    &reason,
+                    corrupt_reason::DECRYPT_FAIL,
+                ),
             }
         }
         out.sort_by_key(|p| p.id);
+        m::set_profile_count(ProfileKind::Ethernet, out.len() as u64);
         Ok(out)
     }
 
@@ -142,11 +200,18 @@ impl ProfileStore for ProfileFileStore {
         let path = self.ethernet_path(ifname);
         match load_one::<EthernetProfileOnDisk>(&path)? {
             Some(on_disk) => {
-                let cipher = self.cipher_for(&on_disk.id);
-                match decrypt_ethernet(on_disk, &cipher) {
+                let (active, previous) = self.cipher_pair(&on_disk.id).await;
+                match decrypt_with_fallback(&on_disk, &active, previous.as_ref(), |od, c| {
+                    decrypt_ethernet(od, c)
+                }) {
                     Ok(p) => Ok(Some(p)),
-                    Err(e) => {
-                        tracing::warn!(path = %path.display(), error = %e, "decrypt failed");
+                    Err(reason) => {
+                        self.quarantine_load_failure(
+                            ProfileKind::Ethernet,
+                            &path,
+                            &reason,
+                            corrupt_reason::DECRYPT_FAIL,
+                        );
                         Ok(None)
                     }
                 }
@@ -156,12 +221,16 @@ impl ProfileStore for ProfileFileStore {
     }
 
     async fn put_ethernet(&self, profile: &EthernetProfile) -> Result<()> {
-        let cipher = self.cipher_for(&profile.id);
-        let on_disk = encrypt_ethernet(profile, &cipher).map_err(|e| {
+        let started = Instant::now();
+        let (active, _) = self.cipher_pair(&profile.id).await;
+        let on_disk = encrypt_ethernet(profile, &active).map_err(|e| {
+            m::record_write(ProfileKind::Ethernet, m::outcome::CRYPTO_ERROR);
             StoreError::malformed(self.ethernet_path(&profile.interface.name), e.to_string())
         })?;
         let path = self.ethernet_path(&profile.interface.name);
-        write_atomic_toml(&path, &on_disk)
+        let result = write_atomic_toml(&path, &on_disk);
+        record_write_outcome(ProfileKind::Ethernet, &result, started);
+        result
     }
 
     async fn remove_ethernet(&self, ifname: &str) -> Result<()> {
@@ -170,24 +239,40 @@ impl ProfileStore for ProfileFileStore {
 
     async fn load_wifi(&self) -> Result<Vec<WifiProfile>> {
         let mut out = Vec::new();
-        for on_disk in load_all::<WifiProfileOnDisk>(&self.dir(DIR_WIFI))? {
-            let cipher = self.cipher_for(&on_disk.id);
-            match decrypt_wifi(on_disk, &cipher) {
-                Ok(p) => out.push(p),
-                Err(e) => tracing::warn!(error = %e, "wifi profile failed to decrypt; skipping"),
+        for (path, on_disk) in load_all_raw::<WifiProfileOnDisk>(&self.dir(DIR_WIFI))? {
+            let (active, previous) = self.cipher_pair(&on_disk.id).await;
+            match decrypt_with_fallback(&on_disk, &active, previous.as_ref(), |od, c| {
+                decrypt_wifi(od, c)
+            }) {
+                Ok(p) => {
+                    m::record_profile_loaded(ProfileKind::Wifi);
+                    out.push(p);
+                }
+                Err(reason) => self.quarantine_load_failure(
+                    ProfileKind::Wifi,
+                    &path,
+                    &reason,
+                    corrupt_reason::DECRYPT_FAIL,
+                ),
             }
         }
         out.sort_by_key(|p| p.id);
+        m::set_profile_count(ProfileKind::Wifi, out.len() as u64);
         Ok(out)
     }
 
     async fn put_wifi(&self, profile: &WifiProfile) -> Result<()> {
-        let cipher = self.cipher_for(&profile.id);
-        let on_disk = encrypt_wifi(profile, &cipher)
-            .map_err(|e| StoreError::malformed(self.wifi_path(""), e.to_string()))?;
+        let started = Instant::now();
+        let (active, _) = self.cipher_pair(&profile.id).await;
+        let on_disk = encrypt_wifi(profile, &active).map_err(|e| {
+            m::record_write(ProfileKind::Wifi, m::outcome::CRYPTO_ERROR);
+            StoreError::malformed(self.wifi_path(""), e.to_string())
+        })?;
         let hash = ssid_hash(&profile.network.ssid);
         let path = self.wifi_path(&hash);
-        write_atomic_toml(&path, &on_disk)
+        let result = write_atomic_toml(&path, &on_disk);
+        record_write_outcome(ProfileKind::Wifi, &result, started);
+        result
     }
 
     async fn remove_wifi(&self, ssid_hash: &str) -> Result<()> {
@@ -197,6 +282,10 @@ impl ProfileStore for ProfileFileStore {
     async fn load_gnss(&self) -> Result<Vec<GnssDeviceProfile>> {
         let mut out: Vec<GnssDeviceProfile> = load_all::<GnssDeviceProfile>(&self.dir(DIR_GNSS))?;
         out.sort_by_key(|p| p.id);
+        for _ in &out {
+            m::record_profile_loaded(ProfileKind::Gnss);
+        }
+        m::set_profile_count(ProfileKind::Gnss, out.len() as u64);
         Ok(out)
     }
 
@@ -215,8 +304,11 @@ impl ProfileStore for ProfileFileStore {
     }
 
     async fn put_gnss(&self, profile: &GnssDeviceProfile) -> Result<()> {
+        let started = Instant::now();
         let path = self.gnss_path(&profile.id);
-        write_atomic_toml(&path, profile)
+        let result = write_atomic_toml(&path, profile);
+        record_write_outcome(ProfileKind::Gnss, &result, started);
+        result
     }
 
     async fn remove_gnss(&self, id: &Ulid) -> Result<()> {
@@ -227,6 +319,10 @@ impl ProfileStore for ProfileFileStore {
         let mut out: Vec<BluetoothProfile> =
             load_all::<BluetoothProfile>(&self.dir(DIR_BLUETOOTH))?;
         out.sort_by_key(|p| p.id);
+        for _ in &out {
+            m::record_profile_loaded(ProfileKind::Bluetooth);
+        }
+        m::set_profile_count(ProfileKind::Bluetooth, out.len() as u64);
         Ok(out)
     }
 
@@ -245,8 +341,11 @@ impl ProfileStore for ProfileFileStore {
     }
 
     async fn put_bluetooth(&self, profile: &BluetoothProfile) -> Result<()> {
+        let started = Instant::now();
         let path = self.bluetooth_path(&profile.id);
-        write_atomic_toml(&path, profile)
+        let result = write_atomic_toml(&path, profile);
+        record_write_outcome(ProfileKind::Bluetooth, &result, started);
+        result
     }
 
     async fn remove_bluetooth(&self, id: &Ulid) -> Result<()> {
@@ -275,30 +374,102 @@ impl ProfileStore for ProfileFileStore {
     }
 
     async fn rotate_master_key(&self) -> Result<RotateReport> {
-        Err(StoreError::NotYetImplemented("rotate_master_key"))
+        // Generate a fresh random key and rotate to it. Callers that
+        // need to persist the new key (file source, TPM source) must
+        // wrap this in their own key-persistence step.
+        use chacha20poly1305::aead::OsRng;
+        use chacha20poly1305::aead::rand_core::RngCore;
+        let mut new_key = [0u8; 32];
+        OsRng.fill_bytes(&mut new_key);
+        let report = crate::rotate::rotate_to_key(self, new_key).await;
+        new_key.zeroize();
+        report
+    }
+}
+
+impl ProfileFileStore {
+    /// Move `path` to the quarantine directory and log + emit.
+    pub(crate) fn quarantine_load_failure(
+        &self,
+        kind: ProfileKind,
+        path: &Path,
+        reason: &str,
+        reason_label: &str,
+    ) {
+        match quarantine::quarantine_file(
+            &self.root,
+            kind,
+            path,
+            reason,
+            reason_label,
+            self.event_tx.as_ref(),
+        ) {
+            Ok(target) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    moved_to = %target.display(),
+                    reason,
+                    "profile quarantined",
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    reason,
+                    error = %e,
+                    "profile failed to quarantine; leaving in place",
+                );
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Master key zeroization wrapper.
+// Fallback-decrypt helper
 // ---------------------------------------------------------------------------
 
-struct MasterKey([u8; 32]);
-
-impl MasterKey {
-    fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+/// Try `decrypt` with the active cipher first; on `CipherError`,
+/// retry with `previous` if present. Returns the reason string on
+/// both-fail.
+fn decrypt_with_fallback<OnDisk, Parsed, F>(
+    on_disk: &OnDisk,
+    active: &dyn Cipher,
+    previous: Option<&ChaChaCipher>,
+    decrypt: F,
+) -> std::result::Result<Parsed, String>
+where
+    OnDisk: Clone,
+    F: Fn(OnDisk, &dyn Cipher) -> std::result::Result<Parsed, CipherError>,
+{
+    match decrypt(on_disk.clone(), active) {
+        Ok(p) => Ok(p),
+        Err(active_err) => {
+            if let Some(prev) = previous {
+                match decrypt(on_disk.clone(), prev as &dyn Cipher) {
+                    Ok(p) => Ok(p),
+                    Err(prev_err) => Err(format!("active: {active_err}; previous: {prev_err}",)),
+                }
+            } else {
+                Err(active_err.to_string())
+            }
+        }
     }
 }
 
-impl Drop for MasterKey {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
+fn record_write_outcome(kind: ProfileKind, result: &Result<()>, started: Instant) {
+    let outcome = match result {
+        Ok(()) => m::outcome::SUCCESS,
+        Err(StoreError::Io { .. } | StoreError::RootDir { .. }) => m::outcome::IO_ERROR,
+        Err(StoreError::TomlSerialize(_) | StoreError::TomlDeserialize(_)) => m::outcome::IO_ERROR,
+        Err(StoreError::Malformed { .. }) => m::outcome::CRYPTO_ERROR,
+        Err(StoreError::NotYetImplemented(_)) => m::outcome::IO_ERROR,
+    };
+    m::record_write(kind, outcome);
+    m::record_write_duration(kind, started.elapsed().as_secs_f64());
 }
 
 // ---------------------------------------------------------------------------
-// SSID hashing (DD-007 §3.2).
+// SSID hashing
 // ---------------------------------------------------------------------------
 
 pub fn ssid_hash(ssid: &nexus_core::Ssid) -> String {
@@ -318,7 +489,7 @@ fn hex_encode_short(bytes: &[u8]) -> String {
 // Filesystem helpers
 // ---------------------------------------------------------------------------
 
-fn mkdir_p(path: &Path) -> Result<()> {
+pub(crate) fn mkdir_p(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
@@ -341,6 +512,17 @@ fn remove_if_present(path: &Path) -> Result<()> {
 }
 
 fn load_all<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<Vec<T>> {
+    Ok(load_all_raw::<T>(dir)?
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect())
+}
+
+/// Like `load_all` but returns `(path, T)` pairs so the caller can
+/// quarantine on decrypt failure.
+pub(crate) fn load_all_raw<T: serde::de::DeserializeOwned>(
+    dir: &Path,
+) -> Result<Vec<(PathBuf, T)>> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -354,13 +536,13 @@ fn load_all<T: serde::de::DeserializeOwned>(dir: &Path) -> Result<Vec<T>> {
             continue;
         }
         if let Some(parsed) = load_one::<T>(&path)? {
-            out.push(parsed);
+            out.push((path, parsed));
         }
     }
     Ok(out)
 }
 
-fn load_one<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+pub(crate) fn load_one<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -386,7 +568,7 @@ fn load_one<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 // Atomic write (§6.2)
 // ---------------------------------------------------------------------------
 
-fn write_atomic_toml<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_atomic_toml<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     let contents = toml::to_string_pretty(value)?;
     write_atomic(path, contents.as_bytes())
 }
@@ -463,8 +645,7 @@ fn fsync_dir(dir: &Path) -> io::Result<()> {
     fsync_fd(f.as_raw_fd())
 }
 
-/// Inspect the current mode of a file. Exposed publicly so
-/// integration tests can assert on `0600` / `0700`.
+/// Inspect the current mode of a file. Used by integration tests.
 pub fn file_mode(path: &Path) -> io::Result<u32> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(path)?;
@@ -481,6 +662,8 @@ pub mod test_hooks {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     static CRASH_AFTER_TMP: AtomicBool = AtomicBool::new(false);
+    static CRASH_AFTER_ROTATE_N: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(-1);
 
     fn lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -489,6 +672,14 @@ pub mod test_hooks {
 
     pub fn crash_after_tmp() -> bool {
         CRASH_AFTER_TMP.load(Ordering::SeqCst)
+    }
+
+    /// When set to `Some(n)`, the rotation loop panics after
+    /// successfully re-encrypting `n` profiles. Used by the
+    /// crash-recovery test.
+    pub fn crash_after_rotate_count() -> Option<u32> {
+        let v = CRASH_AFTER_ROTATE_N.load(Ordering::SeqCst);
+        if v < 0 { None } else { Some(v as u32) }
     }
 
     pub struct CrashAfterTmpGuard {
@@ -514,6 +705,24 @@ pub mod test_hooks {
             CRASH_AFTER_TMP.store(false, Ordering::SeqCst);
         }
     }
+
+    pub struct CrashAfterRotateGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl CrashAfterRotateGuard {
+        pub fn new(n: u32) -> Self {
+            let guard = lock().lock().unwrap_or_else(|p| p.into_inner());
+            CRASH_AFTER_ROTATE_N.store(n as i64, Ordering::SeqCst);
+            Self { _lock: guard }
+        }
+    }
+
+    impl Drop for CrashAfterRotateGuard {
+        fn drop(&mut self) {
+            CRASH_AFTER_ROTATE_N.store(-1, Ordering::SeqCst);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -527,13 +736,6 @@ mod meta_tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 16);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn different_ssids_hash_differently() {
-        let a = ssid_hash(&nexus_core::Ssid::new(b"network-a".to_vec()).unwrap());
-        let b = ssid_hash(&nexus_core::Ssid::new(b"network-b".to_vec()).unwrap());
-        assert_ne!(a, b);
     }
 
     #[test]

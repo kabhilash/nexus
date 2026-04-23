@@ -170,6 +170,13 @@ pub enum NexusEvent {
         key: String,
         reason: String,
     },
+    /// Emitted during a master-key rotation at most every 10
+    /// profiles or every 500 ms. Consumers can mirror the progress
+    /// in operator UI.
+    ProfileStoreRotationProgress {
+        completed: u32,
+        total: u32,
+    },
 
     // --- Any backend to the D-Bus layer ---
     /// Operator-facing notification. Translates to
