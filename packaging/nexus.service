@@ -1,0 +1,78 @@
+[Unit]
+Description=Nexus Connectivity Manager
+Documentation=https://github.com/anthropics/nexus/blob/main/docs/operator-guide.md
+# Nexus talks to PolicyKit and publishes on the system bus, so
+# dbus must be up first.
+After=dbus.service
+Requires=dbus.service
+# IP-layer configuration is delegated to systemd-networkd (ADR-001).
+# Soft dep — the daemon still starts if networkd is absent, but
+# carrier transitions won't result in DHCP.
+After=systemd-networkd.service
+Wants=systemd-networkd.service
+# Bluetooth backend talks to BlueZ over D-Bus. Soft dep so nexus
+# starts fine on devices without Bluetooth.
+After=bluetooth.service
+Wants=bluetooth.service
+# Wi-Fi backend defaults to wpa_supplicant. Soft dep for the same
+# reason — integrators can disable the Wi-Fi subsystem in config
+# without needing wpa_supplicant installed.
+After=wpa_supplicant.service
+Wants=wpa_supplicant.service
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/nexusd --config /etc/nexus/nexus.toml
+Restart=on-failure
+RestartSec=2s
+
+# Run as an unprivileged user. The `nexus-install.sh` script
+# creates this account with no shell and no home.
+User=nexus
+Group=nexus
+
+# Capabilities required by the subsystems we ship:
+#   CAP_NET_ADMIN — rtnetlink / nl80211 / sysfs interface mutation
+#                   (Interface Monitor + Wi-Fi + Ethernet backends).
+#   CAP_NET_RAW   — raw sockets for EAPOL (wired 802.1X path).
+# No other capabilities are needed, so we drop everything else.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+# Tighten the sandbox. These match the systemd "exec" hardening
+# recommendations and are safe because Nexus itself only writes to
+# /var/lib/nexus.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources @privileged
+
+# Profile store + derived master-key file live here. tmpfiles.d
+# (shipped in packaging/tmpfiles.d/nexus.conf) creates the
+# directory with mode 0750 on first boot.
+ReadWritePaths=/var/lib/nexus
+
+# systemd-networkd manages IP; Nexus should never need to talk
+# DNS. Limiting AF keeps the blast radius of a bug contained.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
+
+# Logs go to the journal; no separate file dance.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

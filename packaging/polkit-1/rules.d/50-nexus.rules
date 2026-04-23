@@ -1,0 +1,52 @@
+// PolicyKit JavaScript rules for Nexus. See DD-006 §10.
+//
+// Install: /etc/polkit-1/rules.d/50-nexus.rules
+//
+// This is an *example* — adapt it to the deployment's admin model.
+// The rules file is consulted before the XML defaults in
+// /usr/share/polkit-1/actions/fi.nexus.policy.
+//
+// Two groups drive access in this example:
+//   nexus-admin   — full control, including profile add/modify,
+//                   master-key rotation, diagnostics.
+//   nexus-user    — can scan and connect to existing profiles,
+//                   but cannot create or edit them.
+//
+// Create these groups with `groupadd nexus-admin` and
+// `groupadd nexus-user`, then `usermod -aG nexus-admin alice`.
+
+polkit.addRule(function(action, subject) {
+    // Read is public — mirrors the action's default. Included here
+    // so administrators can tighten it by switching YES → NO.
+    if (action.id == "fi.nexus.read") {
+        return polkit.Result.YES;
+    }
+
+    // Members of nexus-admin can do everything.
+    if (subject.isInGroup("nexus-admin") &&
+        action.id.indexOf("fi.nexus.") === 0) {
+        return polkit.Result.YES;
+    }
+
+    // Members of nexus-user can scan and (dis)connect existing
+    // profiles, but cannot edit them.
+    if (subject.isInGroup("nexus-user")) {
+        if (action.id == "fi.nexus.scan"
+            || action.id == "fi.nexus.connect"
+            || action.id == "fi.nexus.set_power") {
+            return polkit.Result.YES;
+        }
+    }
+
+    // Reading decrypted credentials is off by default. Override
+    // below only if operator tooling needs it and you understand
+    // the security implications.
+    if (action.id == "fi.nexus.profile.read_credentials") {
+        return polkit.Result.NO;
+    }
+
+    // Everything else falls through to the XML defaults, which
+    // prompt for admin password on interactive sessions and
+    // deny on headless ones.
+    return polkit.Result.NOT_HANDLED;
+});
