@@ -355,6 +355,7 @@ The following detailed design documents specify the internal design of individua
 | DD-005 | [GNSS Backend](./dd-005-gnss-backend.md) | Draft | gpsd integration, fix reporting, device management |
 | DD-006 | [D-Bus API](./dd-006-dbus-api.md) | Draft | Object hierarchy, methods, signals, properties |
 | DD-007 | [Profile Store](./dd-007-profile-store.md) | Draft | On-disk format, encryption, atomic updates |
+| DD-008 | [nexusctl Client](./dd-008-nexusctl-client.md) | Draft | Command-line client wrapping the D-Bus API; command tree, output formats, interactive pairing and Wi-Fi auth flows |
 
 Documents will be added incrementally. When reading a detailed design document, start from this architecture document for context.
 
