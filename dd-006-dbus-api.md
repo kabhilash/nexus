@@ -427,8 +427,11 @@ Scan(params: a{sv}) -> ()
                            RoamingMode == "supplicant"). See DD-003 §5.
     Scan completes asynchronously; clients watch ScanCompleted signal.
     Clients receiving ResourceBusy should wait at least 2 seconds before
-    retrying (DD-003 §6.3 minimum attempt interval).
-    Errors: fi.nexus.Error.InvalidArgument, fi.nexus.Error.AuthFailed, fi.nexus.Error.ResourceBusy
+    retrying (DD-003 §6.3 minimum attempt interval). RateLimited uses the
+    `retry_after_ms` hint it carries.
+    Errors: fi.nexus.Error.InvalidArgument, fi.nexus.Error.AuthFailed,
+            fi.nexus.Error.ResourceBusy, fi.nexus.Error.RateLimited,
+            fi.nexus.Error.FeatureDisabled
 
 Connect(profile: o) -> ()
     Connect to the given Wi-Fi profile. The profile path must be under
@@ -935,6 +938,8 @@ All errors use `fi.nexus.Error.*` as the D-Bus error name. Concrete errors:
 | `fi.nexus.Error.InvalidState` | EPERM | Operation not valid in current state (e.g., Roam while disconnected) |
 | `fi.nexus.Error.AuthFailed` | EACCES | PolicyKit denied |
 | `fi.nexus.Error.ResourceBusy` | EBUSY | Scan in progress, rotation in progress, backup lease held |
+| `fi.nexus.Error.RateLimited` | EAGAIN | Per-sender rate limit exceeded (§15). Carries a `retry_after_ms` hint |
+| `fi.nexus.Error.FeatureDisabled` | ENODEV | Backend for this interface is disabled in `nexus.toml` (e.g., `[bluetooth].enabled = false`). The D-Bus objects still exist so clients can discover availability; mutating calls return this error. Property reads of non-sensitive summary state (e.g., `Enabled: false`) remain permitted. |
 | `fi.nexus.Error.Timeout` | ETIMEDOUT | Backend didn't respond within the internal deadline |
 | `fi.nexus.Error.SupplicantUnavailable` | EAGAIN | wpa_supplicant/iwd D-Bus name missing |
 | `fi.nexus.Error.IoError` | EIO | Underlying filesystem, netlink, or D-Bus failure |
@@ -1065,9 +1070,9 @@ Malicious or buggy clients can DoS Nexus by hammering methods. The D-Bus layer a
 | Profile add/modify/remove | 30 / minute |
 | Rotations and backups | 1 / 60 seconds |
 
-Limit exceeded → `fi.nexus.Error.ResourceBusy` with a `retry_after_ms` hint. Limits reset on a rolling window.
+Limit exceeded → `fi.nexus.Error.RateLimited` with a `retry_after_ms` hint. Limits reset on a rolling window. (Prior revisions of this DD reused `ResourceBusy` for rate-limit rejections; that was imprecise — `ResourceBusy` now means genuine backpressure only, e.g., another scan or rotation already in progress.)
 
-**Counting policy.** A method call that returns `ResourceBusy` *because of the rate limit* does NOT consume a slot — otherwise a client that accidentally bursts over the limit would lock itself out further with every retry. A method call that returns `ResourceBusy` for other reasons (scan already in progress, rotation in progress, backup lease held) DOES consume a slot, matching the bookkeeping of any successful call: the client made a legitimate attempt; the system just can't service it right now. Other errors (`InvalidArgument`, `NotFound`, etc.) also consume a slot, because the client's behavior needs throttling regardless of outcome.
+**Counting policy.** A method call that returns `RateLimited` does NOT consume a slot — otherwise a client that accidentally bursts over the limit would lock itself out further with every retry. A method call that returns `ResourceBusy` (scan already in progress, rotation in progress, backup lease held) DOES consume a slot, matching the bookkeeping of any successful call: the client made a legitimate attempt; the system just can't service it right now. Other errors (`InvalidArgument`, `NotFound`, etc.) also consume a slot, because the client's behavior needs throttling regardless of outcome.
 
 **Layering with PolicyKit.** Rate limiting is applied in two stages:
 

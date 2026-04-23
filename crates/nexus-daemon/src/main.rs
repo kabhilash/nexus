@@ -22,7 +22,8 @@ use nexus_bluetooth::{BluetoothConfig, MockBluezClient, ZbusBluezClient, spawn_b
 use nexus_core::NexusEvent;
 use nexus_daemon::{Config, SubsystemName, spawn_bus, spawn_supervised};
 use nexus_dbus::{
-    DbusConfig, NoopOps, PolicyKitChecker, RateLimits, always_allow, spawn_dbus_service,
+    DbusConfig, EnabledFeatures, NoopOps, PolicyKitChecker, RateLimits, always_allow,
+    spawn_dbus_service,
 };
 use nexus_ethernet::{AuthBackendKind, EthernetConfig, RetryPolicy, spawn_ethernet_backend};
 use nexus_gnss::{GnssConfig, GnssDefaults, JsonGpsdClient, MockGpsdClient, spawn_gnss_backend};
@@ -568,6 +569,12 @@ async fn build_dbus_config(config: &Config) -> Result<DbusConfig> {
         // failure mode instead of a fake ack.
         ops: NoopOps::arc(),
         rate_limits,
+        enabled_features: EnabledFeatures {
+            ethernet: config.ethernet.enabled,
+            wifi: config.wifi.enabled,
+            bluetooth: config.bluetooth.enabled,
+            gnss: config.gnss.enabled,
+        },
     })
 }
 

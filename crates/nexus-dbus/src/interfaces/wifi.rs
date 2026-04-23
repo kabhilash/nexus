@@ -59,18 +59,28 @@ impl WifiIface {
         }
     }
 
-    /// Rate-limit check. Returns `Err(ResourceBusy)` with a hint
-    /// when the per-(sender, op-class) window is full.
+    /// Rate-limit check. Returns `Err(RateLimited)` with a
+    /// `retry_after_ms` hint when the per-(sender, op-class)
+    /// window is full.
     fn check_rate(&self, hdr: &Header<'_>, op: OpClass) -> fdo::Result<()> {
         let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
         match self.services.rate_limiter.check(&sender, op) {
             Ok(()) => Ok(()),
-            Err(retry) => Err(fdo::Error::from(DbusError::ResourceBusy(format!(
-                "rate limit exceeded for {} op; retry after {} ms",
-                op.as_str(),
-                retry.as_millis()
-            )))),
+            Err(retry) => Err(fdo::Error::from(DbusError::RateLimited {
+                op: op.as_str(),
+                retry_after_ms: retry.as_millis() as u64,
+            })),
         }
+    }
+
+    /// `FeatureDisabled` gate for Wi-Fi mutating methods. Property
+    /// reads bypass this so clients can still see
+    /// `Powered = false` etc. on a disabled backend.
+    fn check_feature(&self) -> fdo::Result<()> {
+        self.services
+            .enabled
+            .require(crate::services::Feature::Wifi)
+            .map_err(fdo::Error::from)
     }
 }
 
@@ -154,6 +164,7 @@ impl WifiIface {
         #[zbus(header)] hdr: Header<'_>,
         params: HashMap<String, OwnedValue>,
     ) -> fdo::Result<()> {
+        self.check_feature()?;
         self.check_rate(&hdr, OpClass::Scan)?;
         self.require_auth(&hdr, actions::SCAN).await?;
         let parsed = parse_scan_params(&params)
@@ -171,6 +182,7 @@ impl WifiIface {
         #[zbus(header)] hdr: Header<'_>,
         profile: OwnedObjectPath,
     ) -> fdo::Result<()> {
+        self.check_feature()?;
         self.check_rate(&hdr, OpClass::ConnectDisconnect)?;
         self.require_auth(&hdr, actions::CONNECT).await?;
         let path_str = profile.as_str();
@@ -202,6 +214,7 @@ impl WifiIface {
 
     /// `Disconnect() -> ()` — `fi.nexus.connect`.
     async fn disconnect(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+        self.check_feature()?;
         self.check_rate(&hdr, OpClass::ConnectDisconnect)?;
         self.require_auth(&hdr, actions::CONNECT).await?;
         self.services
@@ -214,6 +227,7 @@ impl WifiIface {
     /// `Roam(bssid: ay) -> ()` — `fi.nexus.connect`. Only valid in
     /// `RoamingMode == "nexus"`.
     async fn roam(&self, #[zbus(header)] hdr: Header<'_>, bssid: Vec<u8>) -> fdo::Result<()> {
+        self.check_feature()?;
         self.check_rate(&hdr, OpClass::ConnectDisconnect)?;
         self.require_auth(&hdr, actions::CONNECT).await?;
         if bssid.len() != 6 {
@@ -243,6 +257,15 @@ impl WifiIface {
     /// onto the closest `zbus::Error` variant.
     #[zbus(property)]
     async fn set_powered(&self, on: bool) -> zbus::Result<()> {
+        if !self
+            .services
+            .enabled
+            .is_enabled(crate::services::Feature::Wifi)
+        {
+            return Err(zbus::Error::from(zbus::fdo::Error::from(
+                DbusError::FeatureDisabled("wifi".to_owned()),
+            )));
+        }
         let sender = "*".to_owned();
         if !self
             .services
@@ -265,6 +288,15 @@ impl WifiIface {
     /// `RoamingMode` writeable property — `fi.nexus.connect`.
     #[zbus(property)]
     async fn set_roaming_mode(&self, mode: String) -> zbus::Result<()> {
+        if !self
+            .services
+            .enabled
+            .is_enabled(crate::services::Feature::Wifi)
+        {
+            return Err(zbus::Error::from(zbus::fdo::Error::from(
+                DbusError::FeatureDisabled("wifi".to_owned()),
+            )));
+        }
         let parsed = RoamingMode::parse(&mode).ok_or_else(|| {
             zbus::Error::from(zbus::fdo::Error::InvalidArgs(format!(
                 "unknown roaming mode '{mode}'"

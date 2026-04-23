@@ -31,6 +31,22 @@ pub enum DbusError {
     #[error("resource busy: {0}")]
     ResourceBusy(String),
 
+    /// Rate limiter rejected this call for the `(sender, op-class)`
+    /// window (DD-006 §15). `retry_after_ms` tells the client how
+    /// long to back off before retrying.
+    #[error("rate limited: {op} (retry after {retry_after_ms} ms)")]
+    RateLimited {
+        op: &'static str,
+        retry_after_ms: u64,
+    },
+
+    /// The backend for this interface is disabled in `nexus.toml`
+    /// (e.g. `[bluetooth].enabled = false`). The object still exists
+    /// so clients can see what is and isn't available, but mutating
+    /// methods return this error.
+    #[error("feature disabled: {0}")]
+    FeatureDisabled(String),
+
     #[error("unsupported: {0}")]
     Unsupported(String),
 
@@ -55,6 +71,11 @@ impl From<DbusError> for fdo::Error {
             DbusError::InvalidState(m) => name("fi.nexus.Error.InvalidState", m),
             DbusError::AuthFailed(m) => name("fi.nexus.Error.AuthFailed", m),
             DbusError::ResourceBusy(m) => name("fi.nexus.Error.ResourceBusy", m),
+            DbusError::RateLimited { op, retry_after_ms } => name(
+                "fi.nexus.Error.RateLimited",
+                format!("{op}: retry after {retry_after_ms} ms"),
+            ),
+            DbusError::FeatureDisabled(m) => name("fi.nexus.Error.FeatureDisabled", m),
             DbusError::Unsupported(m) => name("fi.nexus.Error.Unsupported", m),
             DbusError::Io(e) => name("fi.nexus.Error.IoError", e.to_string()),
             DbusError::Zbus(e) => name("fi.nexus.Error.IoError", e.to_string()),

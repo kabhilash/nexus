@@ -35,7 +35,7 @@ use crate::profiles::{
 use crate::properties::COALESCE_WINDOW;
 use crate::rate_limit::{RateLimiter, RateLimits};
 use crate::scan_results::ScanResultIface;
-use crate::services::Services;
+use crate::services::{EnabledFeatures, Services};
 use crate::state::{InterfaceKindData, InterfaceState, State};
 
 /// Configuration for [`spawn_dbus_service`].
@@ -58,6 +58,10 @@ pub struct DbusConfig {
     pub ops: Arc<dyn BackendOps>,
     /// Per-class rate limits.
     pub rate_limits: RateLimits,
+    /// Per-backend enable/disable flags (DD-006 §11.1
+    /// `FeatureDisabled`). Mutating methods on a disabled feature
+    /// return `fi.nexus.Error.FeatureDisabled`.
+    pub enabled_features: EnabledFeatures,
 }
 
 impl std::fmt::Debug for DbusConfig {
@@ -81,6 +85,7 @@ impl Default for DbusConfig {
             auth: crate::authz::always_allow(),
             ops: crate::backend_ops::NoopOps::arc(),
             rate_limits: RateLimits::default(),
+            enabled_features: EnabledFeatures::default(),
         }
     }
 }
@@ -141,6 +146,7 @@ pub async fn spawn_dbus_service(
         Arc::clone(&config.auth),
         Arc::clone(&config.ops),
         rate_limiter,
+        config.enabled_features,
     ));
 
     let (registry_tx, registry_rx) = mpsc::channel::<ServiceCommand>(64);

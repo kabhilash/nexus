@@ -213,6 +213,7 @@ impl Manager {
         #[zbus(header)] hdr: Header<'_>,
         settings: HashMap<String, OwnedValue>,
     ) -> fdo::Result<OwnedObjectPath> {
+        self.check_feature(crate::services::Feature::Wifi)?;
         self.check_rate(&hdr, OpClass::ProfileWrite)?;
         self.require_auth(&hdr, actions::PROFILE_ADD).await?;
         let profile = parse_wifi_settings(&settings)
@@ -268,6 +269,7 @@ impl Manager {
         #[zbus(header)] hdr: Header<'_>,
         settings: HashMap<String, OwnedValue>,
     ) -> fdo::Result<OwnedObjectPath> {
+        self.check_feature(crate::services::Feature::Ethernet)?;
         self.check_rate(&hdr, OpClass::ProfileWrite)?;
         self.require_auth(&hdr, actions::PROFILE_ADD).await?;
         let profile = parse_ethernet_settings(&settings)
@@ -428,7 +430,7 @@ impl Manager {
     ) -> fdo::Result<String> {
         // The 1/min admin rate limit also serves as the
         // serialization mechanism — two RotateMasterKey calls
-        // within the window get `ResourceBusy`.
+        // within the window get `RateLimited`.
         self.check_rate(&hdr, OpClass::Admin)?;
         self.require_auth(&hdr, actions::ADMIN).await?;
         let job_id = Ulid::new().to_string();
@@ -534,18 +536,27 @@ impl Manager {
         }
     }
 
-    /// Per-class rate-limit check. Returns `Err(ResourceBusy)`
-    /// when the per-(sender, op-class) window is full.
+    /// Per-class rate-limit check. Returns `Err(RateLimited)` with
+    /// a `retry_after_ms` hint when the per-(sender, op-class)
+    /// window is full.
     fn check_rate(&self, hdr: &Header<'_>, op: OpClass) -> fdo::Result<()> {
         let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
         match self.services.rate_limiter.check(&sender, op) {
             Ok(()) => Ok(()),
-            Err(retry) => Err(fdo::Error::from(DbusError::ResourceBusy(format!(
-                "rate limit exceeded for {} op; retry after {} ms",
-                op.as_str(),
-                retry.as_millis()
-            )))),
+            Err(retry) => Err(fdo::Error::from(DbusError::RateLimited {
+                op: op.as_str(),
+                retry_after_ms: retry.as_millis() as u64,
+            })),
         }
+    }
+
+    /// `FeatureDisabled` gate for a per-technology Manager op
+    /// (AddWifiProfile / AddEthernetProfile).
+    fn check_feature(&self, feature: crate::services::Feature) -> fdo::Result<()> {
+        self.services
+            .enabled
+            .require(feature)
+            .map_err(fdo::Error::from)
     }
 
     /// Pull the caller's bus name from the message header and run

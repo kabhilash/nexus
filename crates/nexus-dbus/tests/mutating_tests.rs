@@ -101,6 +101,7 @@ async fn spawn(
         auth,
         ops,
         rate_limits: nexus_dbus::RateLimits::default(),
+        enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
     let h = spawn_dbus_service(event_tx.clone(), st, cfg).await.unwrap();
     (h, event_tx)

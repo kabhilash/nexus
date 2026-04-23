@@ -3,7 +3,7 @@
 //! - PropertiesChanged emission for hot properties is coalesced
 //!   to ≤ 2 Hz per property.
 //! - Per-sender rate limiting rejects bursts beyond the configured
-//!   `scan_per_min` limit with `ResourceBusy`.
+//!   `scan_per_min` limit with `RateLimited`.
 //! - `RotateMasterKey`, `FreezeForBackup`, `ReleaseBackupLease`
 //!   admin methods enforce auth + serve their data contracts.
 
@@ -115,6 +115,7 @@ async fn spawn(
         auth: always_allow(),
         ops: NoopOps::arc(),
         rate_limits,
+        enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
     let h = spawn_dbus_service(event_tx.clone(), st, cfg).await.unwrap();
     (h, event_tx)
@@ -302,6 +303,7 @@ async fn rotate_master_key_denied_returns_auth_failed() {
         auth: always_deny(),
         ops: NoopOps::arc(),
         rate_limits: RateLimits::default(),
+        enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
     let handle = spawn_dbus_service(event_tx, st, cfg).await.unwrap();
     let client = bus.connection().await;
@@ -429,7 +431,7 @@ async fn freeze_and_release_lease_round_trip() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn scan_burst_is_throttled_with_resource_busy() {
+async fn scan_burst_is_throttled_with_rate_limited() {
     let bus = Bus::spawn().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let limits = RateLimits {
@@ -446,11 +448,12 @@ async fn scan_burst_is_throttled_with_resource_busy() {
     let empty: HashMap<String, OwnedValue> = HashMap::new();
     // The harness wires `NoopOps`, so a rate-limit-passing call
     // still fails downstream with `Unsupported`. We count
-    // anything that is *not* `ResourceBusy` as a "passed the
+    // anything that is *not* `RateLimited` as a "passed the
     // limiter" outcome — that's exactly what the rate limiter is
     // supposed to gate.
     let mut passed_limiter = 0u32;
     let mut throttled = 0u32;
+    let mut retry_hint_seen = false;
     for _ in 0..20 {
         let result = client
             .call_method(
@@ -465,8 +468,11 @@ async fn scan_burst_is_throttled_with_resource_busy() {
             Ok(_) => passed_limiter += 1,
             Err(e) => {
                 let s = format!("{e:?}");
-                if s.contains("ResourceBusy") {
+                if s.contains("RateLimited") {
                     throttled += 1;
+                    if s.contains("retry after") {
+                        retry_hint_seen = true;
+                    }
                 } else if s.contains("Unsupported") {
                     passed_limiter += 1;
                 } else {
@@ -480,6 +486,10 @@ async fn scan_burst_is_throttled_with_resource_busy() {
         "exactly the limit's worth of scans should pass the limiter"
     );
     assert_eq!(throttled, 15, "remaining bursts should be throttled");
+    assert!(
+        retry_hint_seen,
+        "at least one RateLimited error should carry a retry_after hint"
+    );
     handle.stop().await;
 }
 
@@ -489,6 +499,189 @@ async fn scan_burst_is_throttled_with_resource_busy() {
 fn op_class_strings() {
     assert_eq!(nexus_dbus::OpClass::Scan.as_str(), "scan");
     assert_eq!(nexus_dbus::OpClass::Admin.as_str(), "admin");
+}
+
+// ---------------------------------------------------------------------------
+// FeatureDisabled (DD-006 §11.1)
+// ---------------------------------------------------------------------------
+
+async fn spawn_with_features(
+    bus: &Bus,
+    bus_name: &str,
+    enabled: nexus_dbus::EnabledFeatures,
+) -> (nexus_dbus::DbusServiceHandle, broadcast::Sender<NexusEvent>) {
+    let (event_tx, _rx) = broadcast::channel::<NexusEvent>(1024);
+    let (_tmp, st) = store().await;
+    let cfg = DbusConfig {
+        bus_name: bus_name.to_owned(),
+        address: Some(bus.addr.clone()),
+        use_session_bus: false,
+        version: "0.1.0-test".into(),
+        auth: always_allow(),
+        ops: NoopOps::arc(),
+        rate_limits: RateLimits::default(),
+        enabled_features: enabled,
+    };
+    let h = spawn_dbus_service(event_tx.clone(), st, cfg).await.unwrap();
+    (h, event_tx)
+}
+
+#[tokio::test]
+async fn scan_on_disabled_wifi_returns_feature_disabled() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let disabled_wifi = nexus_dbus::EnabledFeatures {
+        wifi: false,
+        ..nexus_dbus::EnabledFeatures::default()
+    };
+    let (handle, event_tx) = spawn_with_features(&bus, "fi.nexus1.test_fd", disabled_wifi).await;
+    // Register a Wi-Fi interface object so the method dispatcher has
+    // something to route to. FeatureDisabled must fire *before* the
+    // rate limiter or auth check — i.e. even on a fresh, otherwise
+    // valid call.
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let client = bus.connection().await;
+    let empty: HashMap<String, OwnedValue> = HashMap::new();
+    let err = client
+        .call_method(
+            Some("fi.nexus1.test_fd"),
+            "/fi/nexus1/interface/wlan0",
+            Some("fi.nexus.Wifi"),
+            "Scan",
+            &(empty,),
+        )
+        .await
+        .expect_err("scan on disabled wifi");
+    let s = format!("{err:?}");
+    assert!(
+        s.contains("FeatureDisabled") && s.contains("wifi"),
+        "expected FeatureDisabled for wifi, got {s}"
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn property_read_on_disabled_wifi_still_works() {
+    // Property reads don't gate on FeatureDisabled — DD-006 §11.1
+    // explicitly says "property reads of non-sensitive summary
+    // state remain permitted" so clients can discover what is and
+    // isn't available.
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let disabled_wifi = nexus_dbus::EnabledFeatures {
+        wifi: false,
+        ..nexus_dbus::EnabledFeatures::default()
+    };
+    let (handle, event_tx) =
+        spawn_with_features(&bus, "fi.nexus1.test_fdprop", disabled_wifi).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let client = bus.connection().await;
+    let reply = client
+        .call_method(
+            Some("fi.nexus1.test_fdprop"),
+            "/fi/nexus1/interface/wlan0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("fi.nexus.Wifi", "Powered"),
+        )
+        .await
+        .expect("Properties.Get Powered");
+    let v: OwnedValue = reply.body().deserialize().unwrap();
+    let powered: bool = bool::try_from(&v).unwrap();
+    assert!(!powered, "disabled wifi reports Powered = false");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn add_ethernet_profile_on_disabled_ethernet_returns_feature_disabled() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let disabled_eth = nexus_dbus::EnabledFeatures {
+        ethernet: false,
+        ..nexus_dbus::EnabledFeatures::default()
+    };
+    let (handle, _tx) = spawn_with_features(&bus, "fi.nexus1.test_fdeth", disabled_eth).await;
+    let client = bus.connection().await;
+    // An empty settings dict is sufficient — FeatureDisabled fires
+    // before the settings parser runs.
+    let empty: HashMap<String, OwnedValue> = HashMap::new();
+    let err = client
+        .call_method(
+            Some("fi.nexus1.test_fdeth"),
+            "/fi/nexus1",
+            Some("fi.nexus.Manager"),
+            "AddEthernetProfile",
+            &(empty,),
+        )
+        .await
+        .expect_err("add eth profile on disabled feature");
+    let s = format!("{err:?}");
+    assert!(
+        s.contains("FeatureDisabled") && s.contains("ethernet"),
+        "expected FeatureDisabled for ethernet, got {s}"
+    );
+    handle.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Error-name mapping (DD-006 §11.1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn error_name_mapping_matches_dd006() {
+    // Each internal variant must render as its `fi.nexus.Error.*`
+    // well-known name in the outgoing fdo::Error. The prefix is
+    // part of the message; clients that programmatically match
+    // against names (busctl / dbus-monitor output) expect these
+    // exact strings.
+    let cases: &[(nexus_dbus::DbusError, &str)] = &[
+        (
+            nexus_dbus::DbusError::RateLimited {
+                op: "scan",
+                retry_after_ms: 42,
+            },
+            "fi.nexus.Error.RateLimited",
+        ),
+        (
+            nexus_dbus::DbusError::FeatureDisabled("wifi".into()),
+            "fi.nexus.Error.FeatureDisabled",
+        ),
+        (
+            nexus_dbus::DbusError::ResourceBusy("scan in progress".into()),
+            "fi.nexus.Error.ResourceBusy",
+        ),
+    ];
+    for (err, expected_name) in cases {
+        let cloned = match err {
+            nexus_dbus::DbusError::RateLimited { op, retry_after_ms } => {
+                nexus_dbus::DbusError::RateLimited {
+                    op,
+                    retry_after_ms: *retry_after_ms,
+                }
+            }
+            nexus_dbus::DbusError::FeatureDisabled(m) => {
+                nexus_dbus::DbusError::FeatureDisabled(m.clone())
+            }
+            nexus_dbus::DbusError::ResourceBusy(m) => {
+                nexus_dbus::DbusError::ResourceBusy(m.clone())
+            }
+            _ => unreachable!(),
+        };
+        let fdo: zbus::fdo::Error = cloned.into();
+        let rendered = format!("{fdo:?}");
+        assert!(
+            rendered.contains(expected_name),
+            "expected {expected_name} in {rendered}"
+        );
+    }
 }
 
 // Touch a couple of types from `properties.rs` so the `pub use`

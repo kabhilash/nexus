@@ -91,8 +91,9 @@ impl RateLimiter {
 
     /// Check + consume in one shot. On `Ok`, the call is recorded
     /// and counts against the sender's window. On `Err(retry_after)`,
-    /// the call is *not* counted (DD-006 §15 "rate-limit ResourceBusy
-    /// does NOT consume a slot").
+    /// the call is *not* counted (DD-006 §15 "rate-limit rejection
+    /// does NOT consume a slot"). Callers translate `retry_after`
+    /// into `fi.nexus.Error.RateLimited { retry_after_ms }`.
     pub fn check(&self, sender: &str, op: OpClass) -> Result<(), Duration> {
         let now = Instant::now();
         let allowed = self.limits.allowed_per_min(op);

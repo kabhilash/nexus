@@ -38,7 +38,7 @@ pub use properties::{COALESCE_WINDOW, PropertyBatcher};
 pub use rate_limit::{OpClass, RateLimiter, RateLimits};
 pub use scan_results::ScanResultIface;
 pub use service::{DbusConfig, DbusServiceHandle, ServiceCommand, spawn_dbus_service};
-pub use services::Services;
+pub use services::{EnabledFeatures, Feature, Services};
 pub use state::{
     BluetoothAdapterState, BtDeviceState, EthernetState, GnssState, InterfaceKindData,
     InterfaceState, PowerState, State, WifiInterfaceState,

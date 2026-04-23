@@ -100,6 +100,7 @@ async fn spawn_service(bus: &Bus, bus_name: &str) -> nexus_dbus::DbusServiceHand
         auth: nexus_dbus::always_allow(),
         ops: nexus_dbus::NoopOps::arc(),
         rate_limits: nexus_dbus::RateLimits::default(),
+        enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
     spawn_dbus_service(event_tx, store, config).await.unwrap()
 }
@@ -157,6 +158,7 @@ async fn interface_appears_in_managed_objects_after_event() {
         auth: nexus_dbus::always_allow(),
         ops: nexus_dbus::NoopOps::arc(),
         rate_limits: nexus_dbus::RateLimits::default(),
+        enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
     let handle = spawn_dbus_service(event_tx.clone(), store, config)
         .await
@@ -285,6 +287,7 @@ async fn wifi_interface_properties_readable() {
             auth: nexus_dbus::always_allow(),
             ops: nexus_dbus::NoopOps::arc(),
             rate_limits: nexus_dbus::RateLimits::default(),
+            enabled_features: nexus_dbus::EnabledFeatures::default(),
         },
     )
     .await
@@ -349,6 +352,7 @@ async fn bluetooth_interface_properties_readable() {
             auth: nexus_dbus::always_allow(),
             ops: nexus_dbus::NoopOps::arc(),
             rate_limits: nexus_dbus::RateLimits::default(),
+            enabled_features: nexus_dbus::EnabledFeatures::default(),
         },
     )
     .await
@@ -417,6 +421,7 @@ async fn gnss_interface_properties_readable() {
             auth: nexus_dbus::always_allow(),
             ops: nexus_dbus::NoopOps::arc(),
             rate_limits: nexus_dbus::RateLimits::default(),
+            enabled_features: nexus_dbus::EnabledFeatures::default(),
         },
     )
     .await
@@ -518,6 +523,7 @@ async fn wifi_profile_with_credentials_exposes_has_credentials() {
             auth: nexus_dbus::always_allow(),
             ops: nexus_dbus::NoopOps::arc(),
             rate_limits: nexus_dbus::RateLimits::default(),
+            enabled_features: nexus_dbus::EnabledFeatures::default(),
         },
     )
     .await

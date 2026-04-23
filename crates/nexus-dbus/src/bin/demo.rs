@@ -50,6 +50,7 @@ async fn main() {
         auth: nexus_dbus::always_allow(),
         ops: nexus_dbus::NoopOps::arc(),
         rate_limits: nexus_dbus::RateLimits::default(),
+        enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
     let handle = match spawn_dbus_service(event_tx.clone(), store, config).await {
         Ok(h) => h,
