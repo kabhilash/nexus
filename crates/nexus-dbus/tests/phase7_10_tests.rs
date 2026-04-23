@@ -11,12 +11,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use futures_util::StreamExt;
 use nexus_core::{
     BssCapabilities, BssInfo, InterfaceInfo, InterfaceKind, MacAddr, NexusEvent, OperState,
     SecurityMode, Ssid,
 };
-use nexus_dbus::{DbusConfig, NoopOps, RateLimits, always_allow, always_deny, spawn_dbus_service};
+use nexus_dbus::{
+    BackendOps, DbusConfig, DbusError, NoopOps, RateLimits, ReloadReport, always_allow,
+    always_deny, spawn_dbus_service,
+};
 use nexus_profile_store::{InMemoryKeySource, ProfileFileStore, ProfileStore};
 use tempfile::TempDir;
 use tokio::process::Command;
@@ -692,6 +696,239 @@ fn coalesce_window_is_500ms() {
         nexus_dbus::COALESCE_WINDOW,
         std::time::Duration::from_millis(500)
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9 — ReloadConfig (DD-006 §5.2)
+// ---------------------------------------------------------------------------
+
+fn decode_string_array(v: &OwnedValue) -> Vec<String> {
+    let arr: &zbus::zvariant::Array = v.downcast_ref().expect("array");
+    arr.iter()
+        .map(|item| <&str>::try_from(item).expect("string").to_owned())
+        .collect()
+}
+
+fn decode_pair_array(v: &OwnedValue) -> Vec<(String, String)> {
+    let arr: &zbus::zvariant::Array = v.downcast_ref().expect("array");
+    arr.iter()
+        .map(|item| {
+            let s: &zbus::zvariant::Structure = item.downcast_ref().expect("struct");
+            let fields = s.fields();
+            let a = <&str>::try_from(&fields[0])
+                .expect("first string")
+                .to_owned();
+            let b = <&str>::try_from(&fields[1])
+                .expect("second string")
+                .to_owned();
+            (a, b)
+        })
+        .collect()
+}
+
+/// Test-only `BackendOps` that returns a scripted [`ReloadReport`]
+/// (or [`DbusError`]) for `reload_config`. Other methods inherit
+/// the default Unsupported behaviour.
+struct ScriptedReloadOps {
+    outcome: std::sync::Mutex<Result<ReloadReport, DbusError>>,
+    /// How many times `reload_config` was called.
+    calls: std::sync::Mutex<u32>,
+}
+
+impl ScriptedReloadOps {
+    fn ok(report: ReloadReport) -> Arc<Self> {
+        Arc::new(Self {
+            outcome: std::sync::Mutex::new(Ok(report)),
+            calls: std::sync::Mutex::new(0),
+        })
+    }
+    fn err(err: DbusError) -> Arc<Self> {
+        Arc::new(Self {
+            outcome: std::sync::Mutex::new(Err(err)),
+            calls: std::sync::Mutex::new(0),
+        })
+    }
+    fn call_count(&self) -> u32 {
+        *self.calls.lock().unwrap()
+    }
+}
+
+#[async_trait]
+impl BackendOps for ScriptedReloadOps {
+    async fn reload_config(&self) -> nexus_dbus::Result<ReloadReport> {
+        *self.calls.lock().unwrap() += 1;
+        // Clone the configured outcome so the test can call multiple
+        // times and observe the same scripted result.
+        match &*self.outcome.lock().unwrap() {
+            Ok(r) => Ok(r.clone()),
+            Err(e) => Err(match e {
+                DbusError::Io(io) => DbusError::Io(std::io::Error::other(io.to_string())),
+                DbusError::InvalidArgument(m) => DbusError::InvalidArgument(m.clone()),
+                DbusError::AuthFailed(m) => DbusError::AuthFailed(m.clone()),
+                other => DbusError::Unsupported(format!("{other:?}")),
+            }),
+        }
+    }
+}
+
+async fn spawn_with_ops(
+    bus: &Bus,
+    bus_name: &str,
+    auth: Arc<dyn nexus_dbus::AuthChecker>,
+    ops: Arc<dyn BackendOps>,
+) -> nexus_dbus::DbusServiceHandle {
+    let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
+    let (_tmp, st) = store().await;
+    let cfg = DbusConfig {
+        bus_name: bus_name.to_owned(),
+        address: Some(bus.addr.clone()),
+        use_session_bus: false,
+        version: "0.1.0-test".into(),
+        auth,
+        ops,
+        // Bump admin to allow several calls in one test.
+        rate_limits: RateLimits {
+            admin_per_min: 10,
+            ..RateLimits::default()
+        },
+        enabled_features: nexus_dbus::EnabledFeatures::default(),
+    };
+    spawn_dbus_service(event_tx, st, cfg).await.unwrap()
+}
+
+#[tokio::test]
+async fn reload_config_denied_returns_auth_failed() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = ScriptedReloadOps::ok(ReloadReport::default());
+    let handle = spawn_with_ops(
+        &bus,
+        "fi.nexus1.test_reload_deny",
+        always_deny(),
+        ops.clone(),
+    )
+    .await;
+    let client = bus.connection().await;
+    let err = client
+        .call_method(
+            Some("fi.nexus1.test_reload_deny"),
+            "/fi/nexus1",
+            Some("fi.nexus.Manager"),
+            "ReloadConfig",
+            &(),
+        )
+        .await
+        .expect_err("denied");
+    let s = format!("{err:?}");
+    assert!(s.contains("AuthFailed"), "got {s}");
+    // The dispatch must abort before reaching the backend.
+    assert_eq!(ops.call_count(), 0, "ops should not be called when denied");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn reload_config_returns_report_dict() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let report = ReloadReport {
+        applied: vec!["log_level".into()],
+        deferred: vec!["dbus.bus_name".into(), "wifi.signal_poll_interval".into()],
+        errors: vec![("gnss.gpsd_endpoint".into(), "address parse failed".into())],
+    };
+    let ops = ScriptedReloadOps::ok(report);
+    let handle = spawn_with_ops(
+        &bus,
+        "fi.nexus1.test_reload_ok",
+        always_allow(),
+        ops.clone(),
+    )
+    .await;
+    let client = bus.connection().await;
+
+    let reply = client
+        .call_method(
+            Some("fi.nexus1.test_reload_ok"),
+            "/fi/nexus1",
+            Some("fi.nexus.Manager"),
+            "ReloadConfig",
+            &(),
+        )
+        .await
+        .expect("reload");
+    let dict: HashMap<String, OwnedValue> = reply.body().deserialize().unwrap();
+    assert_eq!(ops.call_count(), 1);
+
+    // Each key serialises to its expected variant type. zbus's
+    // `OwnedValue → Vec<...>` direct conversion isn't implemented
+    // for compound types, so we iterate the underlying Array.
+    let applied = decode_string_array(&dict["applied"]);
+    assert_eq!(applied, vec!["log_level".to_string()]);
+
+    let deferred = decode_string_array(&dict["deferred"]);
+    assert_eq!(
+        deferred,
+        vec![
+            "dbus.bus_name".to_string(),
+            "wifi.signal_poll_interval".to_string()
+        ]
+    );
+
+    let errors = decode_pair_array(&dict["errors"]);
+    assert_eq!(
+        errors,
+        vec![(
+            "gnss.gpsd_endpoint".to_string(),
+            "address parse failed".to_string()
+        )]
+    );
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn reload_config_io_error_propagates_as_io() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = ScriptedReloadOps::err(DbusError::Io(std::io::Error::other("config file is gone")));
+    let handle = spawn_with_ops(&bus, "fi.nexus1.test_reload_io", always_allow(), ops).await;
+    let client = bus.connection().await;
+    let err = client
+        .call_method(
+            Some("fi.nexus1.test_reload_io"),
+            "/fi/nexus1",
+            Some("fi.nexus.Manager"),
+            "ReloadConfig",
+            &(),
+        )
+        .await
+        .expect_err("io");
+    let s = format!("{err:?}");
+    assert!(s.contains("IoError"), "got {s}");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn reload_config_invalid_argument_propagates() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = ScriptedReloadOps::err(DbusError::InvalidArgument(
+        "bus_capacity must be > 0".into(),
+    ));
+    let handle = spawn_with_ops(&bus, "fi.nexus1.test_reload_inv", always_allow(), ops).await;
+    let client = bus.connection().await;
+    let err = client
+        .call_method(
+            Some("fi.nexus1.test_reload_inv"),
+            "/fi/nexus1",
+            Some("fi.nexus.Manager"),
+            "ReloadConfig",
+            &(),
+        )
+        .await
+        .expect_err("invalid");
+    let s = format!("{err:?}");
+    assert!(s.contains("InvalidArgument"), "got {s}");
+    handle.stop().await;
 }
 
 // Silence "unused import" for items only used inside cfg blocks.

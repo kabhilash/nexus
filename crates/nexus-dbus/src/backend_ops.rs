@@ -18,6 +18,29 @@ use ulid::Ulid;
 use crate::errors::{DbusError, Result};
 use crate::state::PowerState;
 
+/// Result of a `Manager.ReloadConfig` call. See DD-006 §5.2.
+///
+/// `applied`  — sections whose new values took effect at runtime.
+/// `deferred` — sections that differed from the live config but
+///              require a daemon restart (e.g., `dbus.bus_name`). The
+///              live value is unchanged; the next restart picks up
+///              the new value.
+/// `errors`   — `(section, reason)` pairs for sections that failed
+///              to reload due to invalid values. The live value for
+///              those sections is unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadReport {
+    pub applied: Vec<String>,
+    pub deferred: Vec<String>,
+    pub errors: Vec<(String, String)>,
+}
+
+impl ReloadReport {
+    pub fn is_empty(&self) -> bool {
+        self.applied.is_empty() && self.deferred.is_empty() && self.errors.is_empty()
+    }
+}
+
 /// Wi-Fi scan parameters parsed from the `Scan(params: a{sv})` dict.
 #[derive(Debug, Clone, Default)]
 pub struct ScanParams {
@@ -82,6 +105,15 @@ pub trait BackendOps: Send + Sync {
     // ---- Manager-level (DD-006 §5) ----
     async fn set_power_state(&self, _state: PowerState) -> Result<()> {
         Err(DbusError::Unsupported("set_power_state".into()))
+    }
+
+    /// Re-read `nexus.toml` from disk, diff against the live config,
+    /// apply what's safely reloadable at runtime, and return the
+    /// applied/deferred/errors report. A structural parse error on
+    /// the file propagates as [`DbusError::Io`] (the D-Bus layer
+    /// maps that to `fi.nexus.Error.IoError` per DD-006 §5.2).
+    async fn reload_config(&self) -> Result<ReloadReport> {
+        Err(DbusError::Unsupported("reload_config".into()))
     }
 }
 

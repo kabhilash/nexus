@@ -29,6 +29,7 @@ ulid = { workspace = true }
 zbus = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 
 [[bin]]

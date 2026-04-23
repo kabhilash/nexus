@@ -26,7 +26,9 @@ pub use authz::{
     AlwaysAllowChecker, AlwaysDenyChecker, AuthChecker, AuthDecision, PolicyKitChecker,
     PolicyMapChecker, actions, always_allow, always_deny,
 };
-pub use backend_ops::{BackendOps, NoopOps, RecordedCall, RecordingOps, RoamingMode, ScanParams};
+pub use backend_ops::{
+    BackendOps, NoopOps, RecordedCall, RecordingOps, ReloadReport, RoamingMode, ScanParams,
+};
 pub use errors::{DbusError, Result};
 pub use interfaces::decode_pairing_answer;
 pub use manager::Manager;

@@ -181,3 +181,160 @@ enabled = false
         }
     }
 }
+
+/// End-to-end ReloadConfig: spawn the real `nexusd`, edit the
+/// config file (change `log_level` and `dbus.bus_name`), invoke
+/// `Manager.ReloadConfig` over D-Bus, and assert the report has
+/// `log_level` in `applied` and `dbus.bus_name` in `deferred`. This
+/// exercises the file re-read, the diff, the BackendOps wiring, and
+/// the D-Bus method end-to-end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_config_end_to_end_classifies_changes() {
+    let bin = env!("CARGO_BIN_EXE_nexusd");
+    let tmp = tempfile::tempdir().unwrap();
+    let bus_addr = format!("unix:path={}", tmp.path().join("bus").display());
+    let dbus_socket = tmp.path().join("bus");
+
+    let mut bus = match Command::new("dbus-daemon")
+        .arg("--session")
+        .arg("--nofork")
+        .arg(format!("--address=unix:path={}", dbus_socket.display()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("dbus-daemon unavailable ({e}); skipping reload test");
+            return;
+        }
+    };
+    let socket_ready = Instant::now();
+    while !dbus_socket.exists() {
+        if socket_ready.elapsed() > Duration::from_secs(2) {
+            let _ = bus.kill();
+            eprintln!("bus never came up; skipping reload test");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let cfg_path = tmp.path().join("nexus.toml");
+    let profile_root = tmp.path().join("profiles");
+    std::fs::create_dir_all(&profile_root).unwrap();
+    let initial = format!(
+        r#"
+bus_capacity = 64
+log_level = "warn"
+
+[supervision]
+restart = false
+
+[interface_monitor]
+enabled = true
+
+[profile_store]
+root = "{}"
+key_source = "in_memory"
+in_memory_seed = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[dbus]
+enabled = true
+bus_name = "fi.nexus1.test.reload"
+use_session_bus = false
+address = "{}"
+allow_all_authz = true
+rate_limit_admin_per_min = 30
+
+[ethernet]
+enabled = false
+
+[wifi]
+enabled = false
+
+[bluetooth]
+enabled = false
+
+[gnss]
+enabled = false
+"#,
+        profile_root.display(),
+        bus_addr,
+    );
+    std::fs::write(&cfg_path, &initial).unwrap();
+
+    let mut child = Command::new(bin)
+        .arg("--config")
+        .arg(&cfg_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nexusd");
+    // Give the daemon a moment to come up + own the bus name.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Edit the config: a reloadable change (log_level) and a
+    // startup-only change (dbus.bus_name).
+    let edited = initial
+        .replace("log_level = \"warn\"", "log_level = \"debug\"")
+        .replace(
+            "bus_name = \"fi.nexus1.test.reload\"",
+            "bus_name = \"fi.nexus1.test.reload.future\"",
+        );
+    std::fs::write(&cfg_path, edited).unwrap();
+
+    // Connect to the private bus and invoke ReloadConfig.
+    let conn = match zbus::connection::Builder::address(bus_addr.as_str()) {
+        Ok(b) => match b.build().await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = bus.kill();
+                panic!("connect failed: {e}");
+            }
+        },
+        Err(e) => {
+            let _ = child.kill();
+            let _ = bus.kill();
+            panic!("address parse failed: {e}");
+        }
+    };
+    let reply = conn
+        .call_method(
+            Some("fi.nexus1.test.reload"),
+            "/fi/nexus1",
+            Some("fi.nexus.Manager"),
+            "ReloadConfig",
+            &(),
+        )
+        .await
+        .expect("ReloadConfig call");
+
+    use std::collections::HashMap;
+    use zbus::zvariant::OwnedValue;
+    let dict: HashMap<String, OwnedValue> = reply.body().deserialize().unwrap();
+
+    // Decode "applied" and "deferred" string arrays.
+    let decode_array = |v: &OwnedValue| -> Vec<String> {
+        let arr: &zbus::zvariant::Array = v.downcast_ref().unwrap();
+        arr.iter()
+            .map(|item| <&str>::try_from(item).unwrap().to_owned())
+            .collect()
+    };
+    let applied = decode_array(&dict["applied"]);
+    let deferred = decode_array(&dict["deferred"]);
+    assert!(
+        applied.contains(&"log_level".to_string()),
+        "expected log_level in applied; got {applied:?}"
+    );
+    assert!(
+        deferred.contains(&"dbus.bus_name".to_string()),
+        "expected dbus.bus_name in deferred; got {deferred:?}"
+    );
+
+    // Tear down.
+    let pid = child.id() as i32;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let _ = child.wait();
+    let _ = bus.kill();
+}

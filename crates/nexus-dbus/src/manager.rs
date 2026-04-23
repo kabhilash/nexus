@@ -492,6 +492,38 @@ impl Manager {
         Ok(token)
     }
 
+    /// `ReloadConfig() -> a{sv}`. See DD-006 §5.2.
+    ///
+    /// Re-reads `/etc/nexus/nexus.toml` (or the path passed to
+    /// `nexusd --config`), diffs it against the live config, and
+    /// applies the safely-reloadable sections. The returned dict has
+    /// three keys:
+    ///
+    /// - `applied`  : `as` — sections whose new values took effect.
+    /// - `deferred` : `as` — sections that differ but require a
+    ///                       daemon restart to take effect.
+    /// - `errors`   : `a(ss)` — `(section, reason)` pairs for
+    ///                          sections that failed to reload due to
+    ///                          invalid values; those sections keep
+    ///                          their prior values.
+    ///
+    /// A structural parse error on the config file propagates as
+    /// `fi.nexus.Error.IoError` — no partial apply happens.
+    async fn reload_config(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+    ) -> fdo::Result<HashMap<String, OwnedValue>> {
+        self.check_rate(&hdr, OpClass::Admin)?;
+        self.require_auth(&hdr, actions::ADMIN).await?;
+        let report = self
+            .services
+            .ops
+            .reload_config()
+            .await
+            .map_err(fdo::Error::from)?;
+        Ok(reload_report_to_dict(&report))
+    }
+
     /// `ReleaseBackupLease(lease: s) -> ()`. Compares
     /// byte-for-byte; mismatches return NotFound.
     async fn release_backup_lease(&self, lease: String) -> fdo::Result<()> {
@@ -572,6 +604,30 @@ impl Manager {
             )))),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ReloadConfig → D-Bus dict
+// ---------------------------------------------------------------------------
+
+/// Serialize a [`crate::ReloadReport`] into the DD-006 §5.2 report
+/// dict. Keys are fixed; any failure to encode a sub-array is
+/// logged and swallowed (a partial dict is more useful than a hard
+/// D-Bus error).
+fn reload_report_to_dict(report: &crate::ReloadReport) -> HashMap<String, OwnedValue> {
+    let mut out: HashMap<String, OwnedValue> = HashMap::new();
+    if let Ok(v) = OwnedValue::try_from(Value::new(report.applied.clone())) {
+        out.insert("applied".to_owned(), v);
+    }
+    if let Ok(v) = OwnedValue::try_from(Value::new(report.deferred.clone())) {
+        out.insert("deferred".to_owned(), v);
+    }
+    // `errors` is a(ss). zbus renders Vec<(String, String)> as that
+    // signature automatically.
+    if let Ok(v) = OwnedValue::try_from(Value::new(report.errors.clone())) {
+        out.insert("errors".to_owned(), v);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

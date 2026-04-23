@@ -20,9 +20,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use nexus_bluetooth::{BluetoothConfig, MockBluezClient, ZbusBluezClient, spawn_bluetooth_backend};
 use nexus_core::NexusEvent;
-use nexus_daemon::{Config, SubsystemName, spawn_bus, spawn_supervised};
+use nexus_daemon::{
+    Config, LogLevelSetter, ReloadCoordinator, ReloadOps, SubsystemName, spawn_bus,
+    spawn_supervised,
+};
 use nexus_dbus::{
-    DbusConfig, EnabledFeatures, NoopOps, PolicyKitChecker, RateLimits, always_allow,
+    BackendOps, DbusConfig, EnabledFeatures, NoopOps, PolicyKitChecker, RateLimits, always_allow,
     spawn_dbus_service,
 };
 use nexus_ethernet::{AuthBackendKind, EthernetConfig, RetryPolicy, spawn_ethernet_backend};
@@ -88,7 +91,7 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs> {
 async fn run(args: CliArgs) -> Result<()> {
     let config = Config::load_from_path(&args.config_path)
         .with_context(|| format!("loading config {}", args.config_path.display()))?;
-    init_tracing(&config.log_level);
+    let log_setter = init_tracing(&config.log_level);
     info!(
         path = %args.config_path.display(),
         bus_capacity = config.bus_capacity,
@@ -103,9 +106,29 @@ async fn run(args: CliArgs) -> Result<()> {
     let profile_store =
         build_profile_store(&config, event_tx.clone()).context("opening profile store")?;
 
-    let supervisors = spawn_all(&config, event_tx.clone(), profile_store, shutdown.clone())
-        .await
-        .context("spawning subsystems")?;
+    // Live config snapshot. Wrapped in `Arc<RwLock>` so the
+    // ReloadCoordinator can swap it on a successful `ReloadConfig`
+    // call and future readers see the new value. Today only the
+    // coordinator reads/writes this — backends still receive their
+    // section via spawn-time copies — but it's the seam future
+    // backend reload hooks will wire onto.
+    let live_config: Arc<tokio::sync::RwLock<Config>> =
+        Arc::new(tokio::sync::RwLock::new(config.clone()));
+    let reload_coordinator = Arc::new(ReloadCoordinator::new(
+        args.config_path.clone(),
+        Arc::clone(&live_config),
+        log_setter,
+    ));
+
+    let supervisors = spawn_all(
+        &config,
+        event_tx.clone(),
+        profile_store,
+        shutdown.clone(),
+        Arc::clone(&reload_coordinator),
+    )
+    .await
+    .context("spawning subsystems")?;
 
     info!(
         subsystems = supervisors.len(),
@@ -135,9 +158,31 @@ async fn run(args: CliArgs) -> Result<()> {
     Ok(())
 }
 
-fn init_tracing(level: &str) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+/// Build the global tracing subscriber and return a callback the
+/// reload coordinator uses to swap the active filter.
+///
+/// We layer a `reload::Layer` over `EnvFilter` so the active
+/// directive is mutable at runtime. `RUST_LOG` still wins on first
+/// boot (matches the pre-reload behaviour); subsequent
+/// `Manager.ReloadConfig` calls update the filter via the handle.
+fn init_tracing(level: &str) -> LogLevelSetter {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let initial = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let (filter_layer, handle) = tracing_subscriber::reload::Layer::new(initial);
+    // `try_init` so re-running under a test harness that already
+    // installed its own subscriber doesn't panic.
+    let _ = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer())
+        .try_init();
+    Arc::new(move |new_level: &str| -> std::result::Result<(), String> {
+        let new_filter = EnvFilter::try_new(new_level)
+            .map_err(|e| format!("invalid log_level '{new_level}': {e}"))?;
+        handle
+            .modify(|f| *f = new_filter)
+            .map_err(|e| format!("tracing reload handle dropped: {e}"))
+    })
 }
 
 fn install_signal_handlers(shutdown: CancellationToken) {
@@ -237,6 +282,7 @@ async fn spawn_all(
     event_tx: broadcast::Sender<NexusEvent>,
     profile_store: Arc<dyn ProfileStore>,
     shutdown: CancellationToken,
+    reload_coordinator: Arc<ReloadCoordinator>,
 ) -> Result<Vec<(SubsystemName, tokio::task::JoinHandle<()>)>> {
     let mut out = Vec::new();
 
@@ -421,7 +467,7 @@ async fn spawn_all(
     if config.dbus.enabled {
         let ev = event_tx.clone();
         let store = Arc::clone(&profile_store);
-        let dbus_cfg = build_dbus_config(config).await?;
+        let dbus_cfg = build_dbus_config(config, Arc::clone(&reload_coordinator)).await?;
         out.push((
             SubsystemName::Dbus,
             spawn_supervised(
@@ -534,7 +580,10 @@ fn build_gnss_config(section: &nexus_daemon::GnssSection) -> GnssConfig {
     }
 }
 
-async fn build_dbus_config(config: &Config) -> Result<DbusConfig> {
+async fn build_dbus_config(
+    config: &Config,
+    reload_coordinator: Arc<ReloadCoordinator>,
+) -> Result<DbusConfig> {
     let auth = if config.dbus.allow_all_authz {
         always_allow()
     } else {
@@ -558,16 +607,20 @@ async fn build_dbus_config(config: &Config) -> Result<DbusConfig> {
         profile_write_per_min: config.dbus.rate_limit_profile_write_per_min,
         admin_per_min: config.dbus.rate_limit_admin_per_min,
     };
+    // Until per-technology backends expose real `BackendOps` glue,
+    // most mutating method calls return `Unsupported`. We do however
+    // wire `Manager.ReloadConfig` end-to-end via `ReloadOps`, which
+    // routes that one method into the daemon's `ReloadCoordinator`
+    // and forwards the rest to the inner (Noop for now) impl.
+    let inner_ops: Arc<dyn BackendOps> = NoopOps::arc();
+    let ops: Arc<dyn BackendOps> = ReloadOps::new(reload_coordinator, inner_ops);
     Ok(DbusConfig {
         bus_name: config.dbus.bus_name.clone(),
         use_session_bus: config.dbus.use_session_bus,
         address: config.dbus.address.clone(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         auth,
-        // Until per-technology backends expose a real `BackendOps`
-        // glue, mutating method calls return `Unsupported`. Honest
-        // failure mode instead of a fake ack.
-        ops: NoopOps::arc(),
+        ops,
         rate_limits,
         enabled_features: EnabledFeatures {
             ethernet: config.ethernet.enabled,
