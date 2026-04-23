@@ -5,4 +5,32 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Integration tests against a real gpsd. Off by default; run locally
+# with `cargo test --features integration-gpsd -- --ignored`.
+integration-gpsd = []
+
 [dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-profile-store = { path = "../nexus-profile-store" }
+
+async-trait = { workspace = true }
+chrono = { workspace = true }
+metrics = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[[bin]]
+name = "nexus-gnss-demo"
+path = "src/bin/demo.rs"
