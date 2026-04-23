@@ -5,4 +5,30 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["auth-wpa_supplicant"]
+# Build the wpa_supplicant-backed WiredAuthBackend (default).
+auth-wpa_supplicant = ["dep:zbus"]
+# Build the experimental ead-backed WiredAuthBackend. Gated so
+# integrators targeting minimal footprints can drop the zbus + ead
+# dependencies entirely.
+auth-ead = ["dep:zbus"]
+# Real-kernel integration tests (require CAP_NET_ADMIN, veth,
+# hostapd, FreeRADIUS). All #[ignore]d in default CI.
+integration-linux = []
+
 [dependencies]
+nexus-core = { path = "../nexus-core" }
+nexus-profile-store = { path = "../nexus-profile-store" }
+
+async-trait = { workspace = true }
+metrics = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+zbus = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
