@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# pre-commit hook: run the full test suite inside the nexus-v2-dev devcontainer.
+#
+# Installation (one-time, already done inside the devcontainer):
+#   git config core.hooksPath .githooks
+#
+# The hook is a no-op when the nexus-v2-dev image is absent so that CI
+# environments that run tests differently are not blocked.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+if ! docker image inspect nexus-v2-dev >/dev/null 2>&1; then
+    echo "pre-commit: nexus-v2-dev image not found — skipping in-container tests." >&2
+    echo "  Rebuild the image with:" >&2
+    echo "    docker build -t nexus-v2-dev \"${REPO_ROOT}/.devcontainer/\"" >&2
+    exit 0
+fi
+
+echo "pre-commit: running tests in nexus-v2-dev container..."
+docker run --rm \
+    -v "${REPO_ROOT}:/workspace" \
+    -w /workspace \
+    nexus-v2-dev \
+    cargo test

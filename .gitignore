@@ -1,6 +1,10 @@
 /target
 /.direnv
 
+# Yocto/Poky aarch64 SDK installer (~2.3 GB). COPY'd into the
+# devcontainer image by .devcontainer/Dockerfile; fetched out-of-band.
+/.devcontainer/armv8a-sdk.sh
+
 # Editor swap and backup files
 *.swp
 *.swo

@@ -1,0 +1,36 @@
+{
+    "name": "Nexus v2 DevContainer",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "features": {
+        "ghcr.io/devcontainers/features/rust:1": {
+            "version": "latest",
+            "profile": "default"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "serayuzgur.crates",
+                "vadimcn.vscode-lldb",
+                "ms-vscode.cpptools"
+            ],
+            "settings": {
+                "rust-analyzer.checkOnSave.command": "clippy",
+                "editor.formatOnSave": true
+            }
+        }
+    },
+    "postCreateCommand": "cargo fetch && git config core.hooksPath .githooks",
+    "remoteUser": "vscode",
+    "mounts": [
+        "source=/var/run/dbus,target=/var/run/dbus,type=bind"
+    ],
+    "runArgs": [
+        "--privileged"
+    ]
+}
+
