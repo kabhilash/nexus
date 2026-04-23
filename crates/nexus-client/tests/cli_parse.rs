@@ -1,0 +1,94 @@
+//! clap argument parsing for `nexusctl`. DD-008 §4.1 + §4.2.
+
+use clap::Parser;
+use nexus_client::cli::{Cli, Command, IfaceSub};
+use nexus_client::output::OutputFormat;
+
+fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+    let mut argv = vec!["nexusctl"];
+    argv.extend_from_slice(args);
+    Cli::try_parse_from(argv)
+}
+
+#[test]
+fn no_subcommand_is_allowed_and_status_is_default() {
+    let cli = parse(&[]).expect("no-args invocation");
+    assert!(cli.command.is_none());
+}
+
+#[test]
+fn status_subcommand_parses() {
+    let cli = parse(&["status"]).unwrap();
+    assert!(matches!(cli.command, Some(Command::Status)));
+}
+
+#[test]
+fn iface_list_subcommand_parses() {
+    let cli = parse(&["iface", "list"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Iface {
+            sub: IfaceSub::List
+        })
+    ));
+}
+
+#[test]
+fn unknown_subcommand_is_rejected() {
+    let err = parse(&["bogus"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+}
+
+#[test]
+fn abbreviated_subcommand_resolves() {
+    // DD-008 §4.1 promises any unambiguous prefix works.
+    let cli = parse(&["stat"]).unwrap();
+    assert!(matches!(cli.command, Some(Command::Status)));
+}
+
+#[test]
+fn json_flag_overrides_default_format() {
+    let cli = parse(&["--json", "iface", "list"]).unwrap();
+    assert!(cli.global.json);
+    assert_eq!(cli.global.output_format(), OutputFormat::Json);
+}
+
+#[test]
+fn explicit_format_human_is_default() {
+    let cli = parse(&["--format", "human", "status"]).unwrap();
+    assert_eq!(cli.global.output_format(), OutputFormat::Human);
+}
+
+#[test]
+fn json_and_format_conflict() {
+    // `--json` is shorthand for `--format json`; DD-008 §4.2 says
+    // they're mutually exclusive (clap enforces this).
+    let err = parse(&["--json", "--format", "human", "status"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+}
+
+#[test]
+fn bus_address_global_option_round_trips() {
+    let cli = parse(&["--bus", "unix:path=/tmp/bus", "status"]).unwrap();
+    assert_eq!(cli.global.bus.as_deref(), Some("unix:path=/tmp/bus"));
+}
+
+#[test]
+fn verbose_short_flag_works() {
+    let cli = parse(&["-v", "status"]).unwrap();
+    assert!(cli.global.verbose);
+}
+
+#[test]
+fn version_flag_exits_with_clap_display_error() {
+    let err = parse(&["--version"]).unwrap_err();
+    // clap models --version as a "display version" error so callers
+    // know it's not a real failure.
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+}
+
+#[test]
+fn help_flag_exits_with_clap_display_error() {
+    let err = parse(&["--help"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+}

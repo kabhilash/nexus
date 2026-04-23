@@ -11,6 +11,7 @@ members = [
     "crates/nexus-profile-store",
     "crates/nexus-auth-eap",
     "crates/nexus-daemon",
+    "crates/nexus-client",
 ]
 
 [workspace.package]
