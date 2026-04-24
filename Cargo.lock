@@ -979,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anstream 0.6.21",
  "anyhow",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-wifi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures-util",
