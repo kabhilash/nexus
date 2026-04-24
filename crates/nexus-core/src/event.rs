@@ -84,6 +84,16 @@ pub enum NexusEvent {
     WifiLinkLost {
         ifindex: u32,
     },
+    /// Kernel rfkill state for a Wi-Fi interface. `powered = true`
+    /// ⇔ neither soft nor hard rfkill is asserted. Emitted by the
+    /// `/dev/rfkill` watcher in `nexus-wifi::rfkill` on every
+    /// `RFKILL_OP_ADD` / `RFKILL_OP_CHANGE` event that maps to a
+    /// known wiphy, plus synthetic initial-state events on
+    /// startup.
+    WifiRfkillChanged {
+        ifindex: u32,
+        powered: bool,
+    },
 
     // --- Bluetooth Backend ---
     /// Fires in two cases: (1) an adapter first becomes visible via

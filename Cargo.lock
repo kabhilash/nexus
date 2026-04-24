@@ -1144,6 +1144,7 @@ version = "0.7.3"
 dependencies = [
  "async-trait",
  "futures-util",
+ "libc",
  "metrics",
  "nexus-core",
  "nexus-profile-store",

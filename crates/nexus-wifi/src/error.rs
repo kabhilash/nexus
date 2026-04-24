@@ -32,4 +32,11 @@ pub enum WifiError {
     /// Profile store surfaced a problem.
     #[error("profile-store: {0}")]
     ProfileStore(#[from] nexus_profile_store::StoreError),
+
+    /// `/dev/rfkill` plumbing couldn't satisfy a `SetPowered`
+    /// request. Either the watcher failed to open `/dev/rfkill` at
+    /// startup (non-Linux target, missing device, permission) or a
+    /// subsequent `write(2)` failed.
+    #[error("rfkill on ifindex {ifindex}: {detail}")]
+    Rfkill { ifindex: u32, detail: String },
 }

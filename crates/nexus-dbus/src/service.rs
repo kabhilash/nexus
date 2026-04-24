@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use nexus_core::{InterfaceKind, NexusEvent, OperState};
+use nexus_core::{InterfaceKind, NexusEvent};
 use nexus_profile_store::ProfileStore;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -390,13 +390,11 @@ async fn handle_event(
         NexusEvent::InterfaceDiscovered(info) => {
             let ifname = info.ifname.clone();
             let was_present = state.read().await.interfaces.contains_key(&ifname);
-            let mut entry = InterfaceState::new(info);
-            apply_wifi_powered_from_operstate(&mut entry);
             state
                 .write()
                 .await
                 .interfaces
-                .insert(ifname.clone(), entry);
+                .insert(ifname.clone(), InterfaceState::new(info));
             if !was_present {
                 register_interface(connection, services, &ifname).await?;
             }
@@ -426,7 +424,15 @@ async fn handle_event(
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
                 if let Some(e) = state.write().await.interfaces.get_mut(&ifname) {
                     e.info.operstate = op;
-                    apply_wifi_powered_from_operstate(e);
+                }
+            }
+        }
+        NexusEvent::WifiRfkillChanged { ifindex, powered } => {
+            if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
+                if let Some(e) = state.write().await.interfaces.get_mut(&ifname) {
+                    if let InterfaceKindData::Wifi(c) = &mut e.kind_data {
+                        c.powered = powered;
+                    }
                 }
             }
         }
@@ -931,19 +937,6 @@ fn kind_tag(k: &InterfaceKindData) -> &'static str {
     }
 }
 
-/// DD-006 §6.3 defines `Powered` as "whether rfkill is released
-/// for this interface". A dedicated `/dev/rfkill` watcher is
-/// future work; in the meantime we derive it from the kernel
-/// operstate: `Down` or `NotPresent` ⇒ not powered, anything else
-/// (admin-up, dormant, up) ⇒ powered. In practice every Wi-Fi
-/// driver clears `IFF_UP` when rfkill asserts, so this proxy
-/// tracks rfkill state on every driver we target.
-fn apply_wifi_powered_from_operstate(entry: &mut InterfaceState) {
-    let op = entry.info.operstate;
-    if let InterfaceKindData::Wifi(c) = &mut entry.kind_data {
-        c.powered = !matches!(op, OperState::Down | OperState::NotPresent);
-    }
-}
 
 async fn apply_gnss_event(state: &Arc<RwLock<State>>, event: NexusEvent) {
     match event {

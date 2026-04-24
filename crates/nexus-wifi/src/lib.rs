@@ -28,23 +28,20 @@
 //! | 6 Connect + failure handling | ✅ retry, blacklist, credentials-invalid |
 //! | 7 Roaming                    | ✅ modes off/supplicant/nexus + hysteresis + signal-poll |
 //! | 8 Supplicant crash recovery  | ✅ NameOwnerChanged → re-attach + rescan |
-//! | 9 Power management           | ✅ scan cadence per PowerState; Sleep → pause |
+//! | 9 Power management           | ✅ scan cadence per PowerState; Sleep → pause; `/dev/rfkill` read + write |
 //! | 10 iwd backend               | ⏳ placeholder module; out of scope for v0.x |
-//! | 11 Metrics + integration     | ✅ metric coverage; hwsim harness needs CI kernel |
+//! | 11 Metrics + integration     | ✅ metric coverage; hwsim harness scaffolded behind `integration-linux` |
 //!
-//! # Known residuals (Tier 3+ gap review, post-0.x)
+//! # Known residuals (post-0.x)
 //!
-//! - `WifiBackendOps::wifi_set_powered` is still pass-through to
-//!   `NoopOps`. Power-state control needs rtnl / rfkill plumbing
-//!   that lives outside this crate.
 //! - The iwd backend (`supplicant::iwd`) remains an empty
 //!   placeholder — no production path exercises it today, and the
 //!   wpa_supplicant backend covers every platform we currently
 //!   target.
-//! - Integration testing against mac80211_hwsim + hostapd (DD-003
-//!   §14.2) is gated by the `integration-linux` Cargo feature;
-//!   the harness itself still needs to be written when a
-//!   kernel-module-capable CI runner becomes available.
+//! - Integration tests against mac80211_hwsim + hostapd (DD-003
+//!   §14.2) are gated by the `integration-linux` Cargo feature and
+//!   need root + `hostapd` to run. A privileged CI runner for
+//!   automatic execution is future work.
 
 use std::sync::Arc;
 
@@ -61,6 +58,7 @@ pub mod metrics;
 pub mod power;
 pub mod profile;
 pub mod retry;
+pub mod rfkill;
 pub mod roam;
 pub mod scan;
 pub mod select;
@@ -126,6 +124,16 @@ pub enum WifiCommand {
         mode: types::RoamMode,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Toggle the interface's rfkill soft-block. `on = true` issues
+    /// `RFKILL_OP_CHANGE` with `soft = 0` (radio on); `on = false`
+    /// sets `soft = 1` (radio off). Hard-rfkill (hardware switch)
+    /// can't be controlled from userspace and is reported via the
+    /// read path only.
+    SetPowered {
+        ifname: String,
+        on: bool,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Handle returned by [`spawn_wifi_backend`]. Drop the handle to
@@ -151,7 +159,13 @@ pub fn command_channel() -> (mpsc::Sender<WifiCommand>, mpsc::Receiver<WifiComma
     mpsc::channel(COMMAND_CHANNEL_DEPTH)
 }
 
-/// Spawn the Wi-Fi backend event loop. See DD-003 §§3, 5, 6, 7.
+/// Spawn the Wi-Fi backend event loop. See DD-003 §§3, 5, 6, 7, 13.5.
+///
+/// Best-effort opens `/dev/rfkill` for the read + write paths
+/// behind `fi.nexus.Wifi.Powered`. When that fails — typically in
+/// dev builds on a container without rfkill — the backend still
+/// starts, but `SetPowered` returns `Unsupported` and the Powered
+/// property reads whatever the operstate proxy last set it to.
 pub fn spawn_wifi_backend(
     event_tx: broadcast::Sender<NexusEvent>,
     supplicant_tx: broadcast::Sender<SupplicantEvent>,
@@ -161,7 +175,24 @@ pub fn spawn_wifi_backend(
     commands: mpsc::Receiver<WifiCommand>,
 ) -> WifiBackendHandle {
     metrics::register();
-    let backend = WifiBackend::new(
+    let shutdown = CancellationToken::new();
+
+    // Attempt to bring up the rfkill watcher + writer. Failure is
+    // non-fatal — without it, Powered falls back to the operstate
+    // proxy.
+    let (rfkill_tx, rfkill_rx) = mpsc::channel::<rfkill::RfkillState>(16);
+    let (rfkill_rx, rfkill_writer) = match rfkill::spawn(rfkill_tx, shutdown.clone()) {
+        Ok(watcher) => (Some(rfkill_rx), Some(watcher.writer)),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "rfkill watcher could not start; Powered will fall back to operstate"
+            );
+            (None, None)
+        }
+    };
+
+    let mut backend = WifiBackend::new(
         event_tx,
         supplicant_tx,
         supplicant,
@@ -169,8 +200,10 @@ pub fn spawn_wifi_backend(
         config,
         commands,
     );
+    if let (Some(rx), Some(w)) = (rfkill_rx, rfkill_writer) {
+        backend = backend.with_rfkill(rx, w);
+    }
     let power = backend.power_handle();
-    let shutdown = CancellationToken::new();
     let shutdown_child = shutdown.clone();
     let join = tokio::spawn(async move { backend.run(shutdown_child).await });
     WifiBackendHandle {

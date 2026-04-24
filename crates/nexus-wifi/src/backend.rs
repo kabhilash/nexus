@@ -16,6 +16,7 @@ use crate::metrics as m;
 use crate::power::PowerState;
 use crate::profile::to_network_config;
 use crate::retry::RetryBook;
+use crate::rfkill::{RfkillState, RfkillWriter};
 use crate::roam::{RoamPolicy, pick_roam_target};
 use crate::scan::{BssCache, ScanScheduler};
 use crate::select::select_network;
@@ -79,6 +80,15 @@ pub struct WifiBackend {
     /// interface. Populated on the heartbeat tick so we only poll
     /// per `WifiConfig::signal_poll_interval`, not every tick.
     last_signal_poll: HashMap<u32, Instant>,
+
+    /// `/dev/rfkill` edges from the watcher task (see
+    /// [`crate::rfkill`]). `None` when rfkill couldn't be opened —
+    /// tests bypass it and the daemon logs a warning.
+    rfkill_rx: Option<tokio::sync::mpsc::Receiver<RfkillState>>,
+    /// Write-side handle for the `fi.nexus.Wifi.Powered` setter.
+    /// `None` mirrors the read-side; the `SetPowered` command
+    /// returns `Unsupported` when the writer isn't wired.
+    rfkill_writer: Option<RfkillWriter>,
 }
 
 impl WifiBackend {
@@ -111,7 +121,22 @@ impl WifiBackend {
             config,
             supplicant_up: true,
             last_signal_poll: HashMap::new(),
+            rfkill_rx: None,
+            rfkill_writer: None,
         }
+    }
+
+    /// Attach the `/dev/rfkill` plumbing. Called from
+    /// [`crate::spawn_wifi_backend`] after the rfkill watcher is
+    /// spawned; tests that don't exercise Powered skip this.
+    pub fn with_rfkill(
+        mut self,
+        rx: tokio::sync::mpsc::Receiver<RfkillState>,
+        writer: RfkillWriter,
+    ) -> Self {
+        self.rfkill_rx = Some(rx);
+        self.rfkill_writer = Some(writer);
+        self
     }
 
     /// Handle the caller's `Arc<RwLock<PowerState>>` so external
@@ -191,6 +216,11 @@ impl WifiBackend {
                         self.cmd_rx = rx;
                     }
                 },
+                maybe_rf = recv_rfkill(&mut self.rfkill_rx) => {
+                    if let Some(state) = maybe_rf {
+                        self.on_rfkill(state).await;
+                    }
+                }
                 _ = &mut heartbeat => {
                     heartbeat.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT);
                     self.on_heartbeat().await;
@@ -198,6 +228,34 @@ impl WifiBackend {
             }
             self.refresh_metrics();
         }
+    }
+
+    /// Map an rfkill edge from the watcher to a
+    /// `NexusEvent::WifiRfkillChanged`. Events for wiphys that
+    /// aren't in the interface registry (e.g. a USB dongle that
+    /// the Interface Monitor hasn't enumerated yet) are dropped —
+    /// the next event after the interface lands will reflect
+    /// current state.
+    async fn on_rfkill(&self, state: RfkillState) {
+        let Some(ifindex) = self.ifindex_for_wiphy(&state.wiphy_name) else {
+            tracing::debug!(
+                wiphy = %state.wiphy_name,
+                powered = state.powered,
+                "rfkill edge for unknown wiphy; ignoring"
+            );
+            return;
+        };
+        let _ = self.event_tx.send(NexusEvent::WifiRfkillChanged {
+            ifindex,
+            powered: state.powered,
+        });
+    }
+
+    fn ifindex_for_wiphy(&self, wiphy_name: &str) -> Option<u32> {
+        self.interfaces.iter().find_map(|(ifindex, entry)| match &entry.info.kind {
+            InterfaceKind::Wireless { wiphy_name: w, .. } if w == wiphy_name => Some(*ifindex),
+            _ => None,
+        })
     }
 
     /// Tick handler: for each connected interface, if the signal
@@ -282,7 +340,44 @@ impl WifiBackend {
             } => {
                 let _ = reply.send(self.operator_set_roaming_mode(&ifname, mode).await);
             }
+            crate::WifiCommand::SetPowered { ifname, on, reply } => {
+                let _ = reply.send(self.operator_set_powered(&ifname, on).await);
+            }
         }
+    }
+
+    /// Toggle soft-rfkill for the named interface. Resolves the
+    /// ifname to its wiphy via the local registry, then hands off
+    /// to [`RfkillWriter::set_blocked`]. Returns `NotAttached` if
+    /// the interface isn't registered and `Supplicant` (as a
+    /// catch-all for rfkill plumbing errors) on write failure.
+    async fn operator_set_powered(&mut self, ifname: &str, on: bool) -> Result<()> {
+        let ifindex = self
+            .ifindex_for(ifname)
+            .ok_or(WifiError::NotAttached { ifindex: 0 })?;
+        let wiphy_name = self
+            .interfaces
+            .get(&ifindex)
+            .and_then(|e| match &e.info.kind {
+                InterfaceKind::Wireless { wiphy_name, .. } => Some(wiphy_name.clone()),
+                _ => None,
+            })
+            .ok_or(WifiError::NotAttached { ifindex })?;
+        let writer = self
+            .rfkill_writer
+            .as_ref()
+            .ok_or_else(|| WifiError::Rfkill {
+                ifindex,
+                detail: "rfkill writer not available".to_owned(),
+            })?;
+        writer
+            .set_blocked(&wiphy_name, !on)
+            .await
+            .map_err(|e| WifiError::Rfkill {
+                ifindex,
+                detail: format!("rfkill write: {e}"),
+            })?;
+        Ok(())
     }
 
     /// Operator-initiated `Connect`. Looks up the profile in the
@@ -405,6 +500,10 @@ impl WifiBackend {
             {
                 let ifindex = info.ifindex;
                 let ifname = info.ifname.clone();
+                let wiphy_name = match &info.kind {
+                    InterfaceKind::Wireless { wiphy_name, .. } => Some(wiphy_name.clone()),
+                    _ => None,
+                };
                 if self.supplicant_up {
                     if let Err(e) = self.supplicant.attach(ifindex, &ifname).await {
                         tracing::warn!(ifname, error = %e, "supplicant attach failed");
@@ -414,6 +513,22 @@ impl WifiBackend {
                     .insert(ifindex, WifiInterfaceEntry::new(info));
                 self.schedulers
                     .insert(ifindex, ScanScheduler::with_defaults());
+                // Seed the initial Powered state from sysfs: the
+                // rfkill watcher's synthetic `RFKILL_OP_ADD` events
+                // may have fired before this interface registered
+                // and been dropped as "unknown wiphy" by `on_rfkill`.
+                if let Some(w) = wiphy_name {
+                    match crate::rfkill::read_current_state(&w) {
+                        Ok(powered) => {
+                            let _ = self
+                                .event_tx
+                                .send(NexusEvent::WifiRfkillChanged { ifindex, powered });
+                        }
+                        Err(e) => {
+                            tracing::debug!(wiphy = %w, error = %e, "initial rfkill read failed");
+                        }
+                    }
+                }
                 // Kick off an initial scan per DD-003 §5.1.
                 self.request_scan(ifindex, ScanParams::default()).await?;
             }
@@ -862,6 +977,22 @@ async fn sleep_until_option(deadline: Option<Instant>) {
                 .max(Duration::from_millis(1));
             tokio::time::sleep(d).await;
         }
+        None => pending().await,
+    }
+}
+
+/// `select!`-friendly recv for the optional rfkill receiver. When
+/// the watcher isn't wired the future parks forever (the other
+/// arms continue to fire); when the watcher dropped its sender
+/// we also park rather than loop-spinning on `None`.
+async fn recv_rfkill(
+    rx: &mut Option<tokio::sync::mpsc::Receiver<RfkillState>>,
+) -> Option<RfkillState> {
+    match rx.as_mut() {
+        Some(r) => match r.recv().await {
+            Some(s) => Some(s),
+            None => pending().await,
+        },
         None => pending().await,
     }
 }
