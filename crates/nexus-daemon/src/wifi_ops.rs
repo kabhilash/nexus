@@ -16,16 +16,14 @@
 //! ```
 //!
 //! Live: `wifi_scan`, `wifi_connect`, `wifi_disconnect`, `wifi_roam`,
-//! and `wifi_set_roaming_mode` — each forwards a
-//! [`nexus_wifi::WifiCommand`] to the backend task and awaits its
-//! [`oneshot`] reply.
+//! `wifi_set_roaming_mode`, and `wifi_set_powered` — all but the last
+//! forward a [`nexus_wifi::WifiCommand`] to the backend task and await
+//! its [`oneshot`] reply. `wifi_set_powered` shells out to `ip link
+//! set dev <ifname> up|down` because the write half of rfkill-vs-IFF_UP
+//! is a kernel-layer concern the wifi crate doesn't own.
 //!
-//! Pass-through: `wifi_set_powered` and `set_power_state`. Powering
-//! a Wi-Fi interface on/off needs rtnl link admin or rfkill
-//! control, neither of which the wifi crate wires today (see the
-//! Tier 3 gap review around DD-003 §13). The `inner` pass-through
-//! lets the daemon layer a `NoopOps::arc()` underneath, which
-//! returns `Unsupported` — the right signal for clients.
+//! Pass-through: `set_power_state` and `reload_config` still fall
+//! through to `inner` (typically `NoopOps`).
 
 use std::sync::Arc;
 
@@ -95,6 +93,20 @@ fn convert_roaming_mode(m: RoamingMode) -> wifi_types::RoamMode {
         RoamingMode::Supplicant => wifi_types::RoamMode::Supplicant,
         RoamingMode::Nexus => wifi_types::RoamMode::Nexus,
     }
+}
+
+/// Tighter validator than the kernel's — reject anything outside
+/// the conservative character set Linux guarantees on all drivers
+/// plus leading `-` (which `ip link` would treat as a flag). This
+/// is defense-in-depth; the monitor-sourced ifname is already
+/// trustworthy, but passing untrusted shell-adjacent data through
+/// `std::process::Command::args` is a discipline worth keeping.
+fn is_valid_ifname(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 15
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '@'))
 }
 
 /// Small helper: send a [`WifiCommand`], await its oneshot reply,
@@ -171,13 +183,31 @@ impl BackendOps for WifiBackendOps {
         .await
     }
 
-    // SetPowered stays delegated to `inner` — it needs rtnl link
-    // admin / rfkill plumbing that the wifi crate doesn't expose
-    // today (see the Tier 3 item in the DD-003 gap review). The
-    // daemon's `NoopOps` leaf returns `Unsupported`, which is the
-    // right signal for clients.
+    // `Powered` on a Wi-Fi interface is defined as "rfkill
+    // released" (DD-006 §6.3). A dedicated rfkill char-device
+    // watcher is future work; for now we implement it via rtnetlink
+    // link-admin — `ip link set <ifname> up|down`. On every Wi-Fi
+    // driver we target, rfkill-blocking clears `IFF_UP`, so the
+    // two are in practice equivalent for read and write.
     async fn wifi_set_powered(&self, ifname: &str, on: bool) -> Result<()> {
-        self.inner.wifi_set_powered(ifname, on).await
+        if !is_valid_ifname(ifname) {
+            return Err(DbusError::InvalidArgument(format!(
+                "rejecting suspicious ifname '{ifname}'"
+            )));
+        }
+        let state = if on { "up" } else { "down" };
+        let output = tokio::process::Command::new("ip")
+            .args(["link", "set", "dev", ifname, state])
+            .output()
+            .await
+            .map_err(|e| DbusError::Io(std::io::Error::other(format!("ip link set: {e}"))))?;
+        if !output.status.success() {
+            let msg = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(DbusError::Io(std::io::Error::other(format!(
+                "ip link set {ifname} {state}: {msg}"
+            ))));
+        }
+        Ok(())
     }
 
     async fn set_power_state(&self, state: nexus_dbus::PowerState) -> Result<()> {
@@ -368,13 +398,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_powered_still_delegates_to_inner() {
-        // SetPowered stays on NoopOps until rtnl/rfkill wiring
-        // lands — document that with a test rather than quietly
-        // diverging.
+    async fn set_powered_rejects_malformed_ifname() {
+        // We can't exercise the real `ip link` shell-out in a unit
+        // test (it needs root and the wlan0 device), but we can
+        // make sure the validator trips before we reach it — an
+        // ifname starting with `-` would otherwise be interpreted
+        // as an `ip link` flag.
         let (cmd_tx, _cmd_rx) = mpsc::channel::<WifiCommand>(1);
         let ops = WifiBackendOps::new(cmd_tx, NoopOps::arc());
-        let err = ops.wifi_set_powered("wlan0", true).await.unwrap_err();
-        assert!(matches!(err, DbusError::Unsupported(_)), "{err:?}");
+        let err = ops.wifi_set_powered("-rm-rf", true).await.unwrap_err();
+        assert!(matches!(err, DbusError::InvalidArgument(_)), "{err:?}");
+    }
+
+    #[test]
+    fn ifname_validator_accepts_common_shapes() {
+        for ok in ["wlan0", "wlp3s0", "eth0", "wlan-0", "mon:wlan0"] {
+            assert!(is_valid_ifname(ok), "should accept {ok}");
+        }
+        let too_long = "x".repeat(16);
+        let bads: &[&str] = &["", "-flag", too_long.as_str(), "bad name", "a/b"];
+        for bad in bads {
+            assert!(!is_valid_ifname(bad), "should reject {bad}");
+        }
     }
 }

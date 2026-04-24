@@ -153,6 +153,18 @@ impl WifiIface {
 
     #[zbus(property, name = "Powered")]
     async fn powered(&self) -> bool {
+        // When the Wi-Fi feature is disabled, the daemon isn't
+        // managing the interface; report `false` regardless of
+        // kernel state so clients see a consistent "we don't
+        // treat this interface as powered" signal (matches the
+        // `check_feature` docstring above).
+        if !self
+            .services
+            .enabled
+            .is_enabled(crate::services::Feature::Wifi)
+        {
+            return false;
+        }
         self.with_cache(false, |c| c.powered).await
     }
 
@@ -247,16 +259,18 @@ impl WifiIface {
     }
 
     /// `Powered` writeable property — `fi.nexus.set_power`.
-    /// zbus property setters don't surface a per-call header, so
-    /// the auth check uses an asterisk sentinel sender. PolicyKit
-    /// rules that need strict per-caller authorization should
-    /// prefer method-call mutations (a future Wi-Fi
-    /// `SetPowered(bool)` method) over property writes. The
-    /// setter returns `zbus::Result<()>` (not `fdo::Result<()>`)
+    /// zbus threads the request `Header` through property setters
+    /// as `#[zbus(header)]`, so the PolicyKit check gets the real
+    /// sender's unique bus name (matching every mutating-method
+    /// path on this interface). The setter returns `zbus::Result<()>`
     /// per zbus's property contract — we map `DbusError::AuthFailed`
     /// onto the closest `zbus::Error` variant.
     #[zbus(property)]
-    async fn set_powered(&self, on: bool) -> zbus::Result<()> {
+    async fn set_powered(
+        &self,
+        #[zbus(header)] hdr: Option<Header<'_>>,
+        on: bool,
+    ) -> zbus::Result<()> {
         if !self
             .services
             .enabled
@@ -266,7 +280,10 @@ impl WifiIface {
                 DbusError::FeatureDisabled("wifi".to_owned()),
             )));
         }
-        let sender = "*".to_owned();
+        let sender = hdr
+            .as_ref()
+            .and_then(|h| h.sender().map(|s| s.to_string()))
+            .unwrap_or_default();
         if !self
             .services
             .auth
@@ -287,7 +304,11 @@ impl WifiIface {
 
     /// `RoamingMode` writeable property — `fi.nexus.connect`.
     #[zbus(property)]
-    async fn set_roaming_mode(&self, mode: String) -> zbus::Result<()> {
+    async fn set_roaming_mode(
+        &self,
+        #[zbus(header)] hdr: Option<Header<'_>>,
+        mode: String,
+    ) -> zbus::Result<()> {
         if !self
             .services
             .enabled
@@ -302,7 +323,10 @@ impl WifiIface {
                 "unknown roaming mode '{mode}'"
             )))
         })?;
-        let sender = "*".to_owned();
+        let sender = hdr
+            .as_ref()
+            .and_then(|h| h.sender().map(|s| s.to_string()))
+            .unwrap_or_default();
         if !self
             .services
             .auth
