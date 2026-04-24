@@ -32,6 +32,15 @@ When asked to draft a new detailed design doc, revise an existing one, or review
 - MSRV: latest stable (we move with the ecosystem; this is embedded Linux, not a library for distribution)
 - Panics are for programmer errors only. Runtime failures return `Result`.
 
+### Versioning
+Every behavior-changing commit bumps the affected crate's `version` in that crate's `Cargo.toml`, in the same commit. Follow [SemVer](https://semver.org/): `x.y.z` where `x` is breaking, `y` adds features, `z` fixes bugs.
+- **PATCH** (`0.1.0` → `0.1.1`): bug fixes only. No new public API, no changed wire format, no changed default behaviour. Commit prefix: `fix:`.
+- **MINOR** (`0.1.1` → `0.2.0`): backwards-compatible additions — new public items, new trait methods with default impls, new config fields, new D-Bus members, new CLI subcommands. Commit prefix: `feat:`.
+- **MAJOR** (`0.2.0` → `1.0.0`): removed or renamed public API, changed D-Bus wire format, altered default behaviour that downstream callers rely on. Commit prefix: `feat!:` or add a `BREAKING CHANGE:` footer.
+- Pre-1.0 (where we are today), SemVer treats `0.y` itself as the breaking boundary — `0.1.x` → `0.2.0` is a breaking bump. Still apply PATCH vs MINOR vs MAJOR within that constraint so the intent stays legible.
+- When a commit touches multiple crates, bump each affected crate independently. Don't touch the version of a crate whose code didn't change in the same commit.
+- Doc-only, comment-only, test-only, and internal refactors with no externally-visible effect do not require a bump.
+
 ### Async
 - `tokio` is the runtime. No mixing with other executors.
 - Prefer `tokio::select!` for multiplexing over spawning extra tasks when shared state is involved (see DD-001 §8 for the Interface Monitor's single-task rationale).
