@@ -152,6 +152,32 @@ for g in nexus-admin nexus-user; do
     fi
 done
 
+# Privileged supplementary groups the daemon needs at runtime. These
+# are created by the distro's own packages (wpa_supplicant, bluez),
+# so we don't create them — we only add `nexus` as a member when the
+# group is present. Missing groups on a given distro is fine and
+# means the feature just won't work there (the preflight self-test
+# will flag that separately).
+#
+# - `netdev` (Debian/Ubuntu/Raspberry Pi OS): wpa_supplicant's
+#   system-bus policy allows `CreateInterface` / `RemoveInterface`
+#   only to members of this group. Without it nexusd logs:
+#     "org.freedesktop.DBus.Error.AccessDenied: Rejected send
+#      message, 2 matched rules; ... member=CreateInterface"
+# - `bluetooth` (most distros): BlueZ-managed D-Bus access.
+for g in netdev bluetooth; do
+    if getent group "$g" >/dev/null; then
+        if id -nG "$NEXUS_USER" | tr ' ' '\n' | grep -qx "$g"; then
+            log "$NEXUS_USER is already in $g"
+        else
+            log "adding $NEXUS_USER to $g (required for $g-owned D-Bus services)"
+            maybe usermod -aG "$g" "$NEXUS_USER"
+        fi
+    else
+        log "skipping: group $g not present on this system"
+    fi
+done
+
 # ---- Step 2: binary --------------------------------------------------------
 
 log "installing nexusd → $BINDIR/nexusd"
