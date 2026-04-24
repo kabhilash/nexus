@@ -27,4 +27,20 @@ pub trait Bluetooth {
 
     #[zbus(property, name = "State")]
     fn state(&self) -> zbus::Result<String>;
+
+    /// Property setter for `Powered`. zbus emits a
+    /// `Properties.Set` call under the hood.
+    #[zbus(property, name = "Powered")]
+    fn set_powered(&self, on: bool) -> zbus::Result<()>;
+
+    /// `StartDiscovery(filter: a{sv}) -> ()`.
+    #[zbus(name = "StartDiscovery")]
+    fn start_discovery(
+        &self,
+        filter: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    ) -> zbus::Result<()>;
+
+    /// `StopDiscovery() -> ()`.
+    #[zbus(name = "StopDiscovery")]
+    fn stop_discovery(&self) -> zbus::Result<()>;
 }

@@ -239,9 +239,36 @@ pub enum EthSub {
 pub enum WifiSub {
     List,
     Show {
-        /// Omit to use the single Wi-Fi interface, if exactly one
-        /// is registered; ambiguous otherwise.
         iface: Option<String>,
+    },
+    /// Trigger a scan and print results.
+    Scan {
+        iface: Option<String>,
+    },
+    /// Connect by SSID. When `--psk` is provided and no matching
+    /// profile exists, nexusctl creates one on-the-fly.
+    Connect {
+        ssid: String,
+        #[arg(long)]
+        iface: Option<String>,
+        #[arg(long)]
+        psk: Option<String>,
+        /// Suppress the DD-008 §6.2 credential-leak warning.
+        #[arg(long)]
+        no_warn_psk: bool,
+    },
+    /// Connect using an existing profile, looked up by ULID or label.
+    ConnectProfile {
+        profile: String,
+        #[arg(long)]
+        iface: Option<String>,
+    },
+    Disconnect {
+        iface: Option<String>,
+    },
+    /// Delete a stored Wi-Fi profile (matched by SSID or ULID).
+    Forget {
+        reference: String,
     },
 }
 
@@ -257,6 +284,45 @@ pub enum BtSub {
     Show {
         address: String,
     },
+    /// Power an adapter on or off.
+    Power {
+        hci: String,
+        state: OnOff,
+    },
+    /// Discover devices for a bounded duration.
+    Scan {
+        hci: Option<String>,
+        /// Scan duration in seconds. Defaults to 10.
+        #[arg(long, default_value_t = 10)]
+        duration: u64,
+    },
+    Connect {
+        address: String,
+    },
+    Disconnect {
+        address: String,
+    },
+    Forget {
+        address: String,
+    },
+    /// Set or clear the trusted flag.
+    Trust {
+        address: String,
+        state: OnOff,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum OnOff {
+    On,
+    Off,
+}
+
+impl OnOff {
+    pub fn as_bool(self) -> bool {
+        matches!(self, OnOff::On)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -273,23 +339,119 @@ pub enum ProfileSub {
         kind: Option<ProfileKind>,
     },
     Show {
-        /// ULID or `Label` value.
         reference: String,
     },
     Export {
-        /// ULID or `Label`.
         reference: String,
+    },
+    /// Create a Wi-Fi profile. Either supply `<ssid>` inline along
+    /// with `--psk`, or `--file <path>` / `--file -` for a full TOML.
+    AddWifi {
+        /// SSID (required unless `--file` is given).
+        ssid: Option<String>,
+        #[arg(long)]
+        psk: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        priority: Option<i32>,
+        #[arg(long)]
+        auto_connect: Option<bool>,
+        #[arg(long)]
+        hidden: Option<bool>,
+        #[arg(long)]
+        fast_transition: Option<bool>,
+        /// Security type. Defaults to `wpa2_personal` when `--psk`
+        /// is supplied, `open` when no PSK is given.
+        #[arg(long, default_value = "auto")]
+        security: String,
+        /// Suppress the --psk leak warning.
+        #[arg(long)]
+        no_warn_psk: bool,
+    },
+    /// Create an Ethernet profile.
+    AddEthernet {
+        ifname: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        auto_connect: Option<bool>,
+    },
+    /// Read a TOML profile from stdin (or `--file`).
+    Import {
+        #[arg(long, value_enum)]
+        kind: Option<ProfileKind>,
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+    },
+    /// Remove a stored profile.
+    Remove {
+        reference: String,
+    },
+    /// Update a single top-level field on a profile.
+    Update {
+        reference: String,
+        /// Field name as it appears in the profile's settings dict
+        /// (e.g., `label`, `auto_connect`).
+        #[arg(long)]
+        field: String,
+        /// Literal string value; parsed against the field's
+        /// expected type.
+        #[arg(long)]
+        value: String,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum PowerSub {
-    /// Read the current `PowerState`.
     Get,
+    /// Change the daemon's power state.
+    Set {
+        #[arg(value_enum)]
+        state: PowerStateArg,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum PowerStateArg {
+    Active,
+    Background,
+    Sleep,
+}
+
+impl PowerStateArg {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            PowerStateArg::Active => "active",
+            PowerStateArg::Background => "background",
+            PowerStateArg::Sleep => "sleep",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
 pub enum AdminSub {
-    /// Read `MasterKeySource` + related diagnostics.
     MasterKeyInfo,
+    /// Fire-and-forget rotation — prints the job id for
+    /// `nexusctl watch`.
+    RotateMasterKey,
+    /// Acquire a backup lease (prints the lease token).
+    FreezeBackup,
+    /// Release a previously-acquired lease.
+    ReleaseBackup {
+        lease: String,
+    },
+    /// Request a support bundle. Phase 7.4 stub — streaming the
+    /// bundle fd lands in a later phase.
+    Diagnostics {
+        #[arg(long, value_name = "PATH")]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Re-read nexus.toml and apply reloadable fields.
+    ReloadConfig,
 }

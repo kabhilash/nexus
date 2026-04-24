@@ -44,6 +44,28 @@ pub async fn get(
     crate::output::render(&view, format, ctx, w).map_err(io_err)
 }
 
+pub async fn set(
+    ops: &dyn ManagerOps,
+    state: &str,
+    format: OutputFormat,
+    ctx: &RenderContext,
+    w: &mut dyn Write,
+) -> Result<(), NexusctlError> {
+    ops.set_power_state(state).await?;
+    crate::output::render(
+        &crate::proxy::MutationOutcome {
+            action: "power set".into(),
+            subject: state.to_owned(),
+            id: None,
+            note: None,
+        },
+        format,
+        ctx,
+        w,
+    )
+    .map_err(io_err)
+}
+
 fn io_err(e: std::io::Error) -> NexusctlError {
     if e.kind() == std::io::ErrorKind::BrokenPipe {
         return NexusctlError::Other { raw: String::new() };

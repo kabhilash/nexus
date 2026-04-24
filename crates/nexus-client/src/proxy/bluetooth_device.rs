@@ -56,4 +56,20 @@ pub trait BluetoothDevice {
 
     #[zbus(property, name = "Profile")]
     fn profile(&self) -> zbus::Result<OwnedObjectPath>;
+
+    /// `Connect() -> ()` — shortcut for Bluetooth.Connect(this).
+    #[zbus(name = "Connect")]
+    fn connect(&self) -> zbus::Result<()>;
+
+    /// `Disconnect() -> ()`.
+    #[zbus(name = "Disconnect")]
+    fn disconnect(&self) -> zbus::Result<()>;
+
+    /// `Forget() -> ()`.
+    #[zbus(name = "Forget")]
+    fn forget(&self) -> zbus::Result<()>;
+
+    /// `Trusted` is read/write — property setter.
+    #[zbus(property, name = "Trusted")]
+    fn set_trusted(&self, on: bool) -> zbus::Result<()>;
 }

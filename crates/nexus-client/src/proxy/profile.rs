@@ -25,6 +25,14 @@ pub trait Profile {
 
     #[zbus(property, name = "CredentialsInvalid")]
     fn credentials_invalid(&self) -> zbus::Result<bool>;
+
+    /// `Update(settings: a{sv}) -> ()` — partial update.
+    #[zbus(name = "Update")]
+    fn update(&self, settings: HashMap<String, zbus::zvariant::OwnedValue>) -> zbus::Result<()>;
+
+    /// `Delete() -> ()`.
+    #[zbus(name = "Delete")]
+    fn delete(&self) -> zbus::Result<()>;
 }
 
 /// `fi.nexus.Profile.Wifi`. DD-006 §7.2.

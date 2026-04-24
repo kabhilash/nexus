@@ -479,6 +479,327 @@ impl ManagerOps for ZbusManagerOps {
             source: mgr.master_key_source().await.map_err(from_zbus_error)?,
         })
     }
+
+    // ---- Mutating impls ----
+
+    async fn wifi_scan(
+        &self,
+        ifname: &str,
+    ) -> Result<Vec<crate::proxy::WifiScanResult>, NexusctlError> {
+        let path = resolve_interface_by_ifname(&self.connection, ifname).await?;
+        let wifi = WifiProxy::builder(&self.connection)
+            .path(path.clone())
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        let empty: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+            std::collections::HashMap::new();
+        wifi.scan(empty).await.map_err(from_zbus_error)?;
+        // Phase 4 polls ScanResults for a short window rather than
+        // subscribing to `ScanCompleted` — the signal flow lands in
+        // Phase 7.6 alongside the `watch` machinery. Two second
+        // window with 200 ms poll matches wpa_supplicant's typical
+        // scan latency.
+        let mut last_len = usize::MAX;
+        let mut stable_ticks = 0u8;
+        let mut result_paths = Vec::new();
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            result_paths = wifi.scan_results().await.map_err(from_zbus_error)?;
+            if result_paths.len() == last_len {
+                stable_ticks += 1;
+                if stable_ticks >= 2 {
+                    break;
+                }
+            } else {
+                stable_ticks = 0;
+            }
+            last_len = result_paths.len();
+        }
+        // Decode each scan-result object.
+        let mut out = Vec::with_capacity(result_paths.len());
+        for p in result_paths {
+            let proxy = crate::proxy::scan_result::ScanResultProxy::builder(&self.connection)
+                .path(p)
+                .map_err(from_zbus_error)?
+                .build()
+                .await
+                .map_err(from_zbus_error)?;
+            let bssid = proxy.bssid().await.map_err(from_zbus_error)?;
+            let ssid = proxy.ssid().await.map_err(from_zbus_error)?;
+            out.push(crate::proxy::WifiScanResult {
+                ssid: String::from_utf8_lossy(&ssid).into_owned(),
+                bssid: format_mac(&bssid).unwrap_or_default(),
+                frequency_mhz: proxy.frequency().await.map_err(from_zbus_error)?,
+                signal_dbm: proxy.signal_dbm().await.map_err(from_zbus_error)?,
+                security: proxy.security_offered().await.map_err(from_zbus_error)?,
+                age_ms: proxy.age_ms().await.map_err(from_zbus_error)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn wifi_connect_profile(
+        &self,
+        ifname: &str,
+        profile_path: &str,
+    ) -> Result<(), NexusctlError> {
+        let path = resolve_interface_by_ifname(&self.connection, ifname).await?;
+        let wifi = WifiProxy::builder(&self.connection)
+            .path(path)
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        let p = zbus::zvariant::ObjectPath::try_from(profile_path).map_err(|e| {
+            NexusctlError::InvalidArgument {
+                message: format!("bad profile path `{profile_path}`: {e}"),
+            }
+        })?;
+        wifi.connect(p).await.map_err(from_zbus_error)
+    }
+
+    async fn wifi_disconnect(&self, ifname: &str) -> Result<(), NexusctlError> {
+        let path = resolve_interface_by_ifname(&self.connection, ifname).await?;
+        let wifi = WifiProxy::builder(&self.connection)
+            .path(path)
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        wifi.disconnect().await.map_err(from_zbus_error)
+    }
+
+    async fn find_wifi_profile(&self, ssid: &[u8]) -> Result<String, NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        let path = mgr.find_wifi_profile(ssid).await.map_err(from_zbus_error)?;
+        Ok(path.as_str().to_owned())
+    }
+
+    async fn bt_set_powered(&self, adapter: &str, on: bool) -> Result<(), NexusctlError> {
+        let path = resolve_interface_by_ifname(&self.connection, adapter).await?;
+        let bt = BluetoothProxy::builder(&self.connection)
+            .path(path)
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        bt.set_powered(on).await.map_err(from_zbus_error)
+    }
+
+    async fn bt_scan(
+        &self,
+        adapter: Option<&str>,
+        duration: std::time::Duration,
+    ) -> Result<Vec<BluetoothDeviceSummary>, NexusctlError> {
+        let adapter_path = match adapter {
+            Some(name) => resolve_interface_by_ifname(&self.connection, name).await?,
+            None => {
+                let list = resolve_interfaces_of_kind(&self.connection, "bluetooth").await?;
+                if list.is_empty() {
+                    return Err(NexusctlError::NotFound {
+                        reference: "<any bluetooth adapter>".into(),
+                    });
+                }
+                if list.len() > 1 {
+                    let names: Vec<String> = list.into_iter().map(|(n, _)| n).collect();
+                    return Err(NexusctlError::InvalidArgument {
+                        message: format!(
+                            "multiple bluetooth adapters; specify one: {}",
+                            names.join(", ")
+                        ),
+                    });
+                }
+                list.into_iter().next().unwrap().1
+            }
+        };
+        let bt = BluetoothProxy::builder(&self.connection)
+            .path(adapter_path.clone())
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        let empty: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+            std::collections::HashMap::new();
+        bt.start_discovery(empty).await.map_err(from_zbus_error)?;
+        tokio::time::sleep(duration).await;
+        let stop_result = bt.stop_discovery().await;
+        // List known devices regardless of stop_discovery outcome —
+        // an error from StopDiscovery after a successful session is
+        // usually "nothing to stop" which we can ignore.
+        let ifname = {
+            let iface = InterfaceProxy::builder(&self.connection)
+                .path(adapter_path.clone())
+                .map_err(from_zbus_error)?
+                .build()
+                .await
+                .map_err(from_zbus_error)?;
+            iface.ifname().await.map_err(from_zbus_error)?
+        };
+        let mut out = Vec::new();
+        let devices = bt.known_devices().await.map_err(from_zbus_error)?;
+        for dpath in devices {
+            out.push(read_bluetooth_device_summary(&self.connection, &ifname, dpath).await?);
+        }
+        // Only surface the stop error if we couldn't recover device
+        // data — otherwise report success with the (possibly stale)
+        // list.
+        if out.is_empty() && stop_result.is_err() {
+            let _ = stop_result.map_err(from_zbus_error)?;
+        }
+        Ok(out)
+    }
+
+    async fn bt_connect_device(&self, address: &str) -> Result<(), NexusctlError> {
+        let path = resolve_bluetooth_device_by_address(&self.connection, address).await?;
+        let dev = BluetoothDeviceProxy::builder(&self.connection)
+            .path(path)
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        dev.connect().await.map_err(from_zbus_error)
+    }
+
+    async fn bt_disconnect_device(&self, address: &str) -> Result<(), NexusctlError> {
+        let path = resolve_bluetooth_device_by_address(&self.connection, address).await?;
+        let dev = BluetoothDeviceProxy::builder(&self.connection)
+            .path(path)
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        dev.disconnect().await.map_err(from_zbus_error)
+    }
+
+    async fn bt_forget_device(&self, address: &str) -> Result<(), NexusctlError> {
+        let path = resolve_bluetooth_device_by_address(&self.connection, address).await?;
+        let dev = BluetoothDeviceProxy::builder(&self.connection)
+            .path(path)
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        dev.forget().await.map_err(from_zbus_error)
+    }
+
+    async fn bt_set_trusted(&self, address: &str, on: bool) -> Result<(), NexusctlError> {
+        let path = resolve_bluetooth_device_by_address(&self.connection, address).await?;
+        let dev = BluetoothDeviceProxy::builder(&self.connection)
+            .path(path)
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        dev.set_trusted(on).await.map_err(from_zbus_error)
+    }
+
+    async fn add_wifi_profile(
+        &self,
+        settings: crate::proxy::WifiProfileSettings,
+    ) -> Result<String, NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        let dict = build_wifi_settings_dict(&settings)?;
+        let path = mgr.add_wifi_profile(dict).await.map_err(from_zbus_error)?;
+        Ok(last_path_component(path.as_str()))
+    }
+
+    async fn add_ethernet_profile(
+        &self,
+        settings: crate::proxy::EthernetProfileSettings,
+    ) -> Result<String, NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        let dict = build_ethernet_settings_dict(&settings)?;
+        let path = mgr
+            .add_ethernet_profile(dict)
+            .await
+            .map_err(from_zbus_error)?;
+        Ok(last_path_component(path.as_str()))
+    }
+
+    async fn remove_profile(&self, reference: &str) -> Result<(), NexusctlError> {
+        // Accept a ULID, label, or raw object path.
+        let path = if reference.starts_with("/fi/nexus1/profile/") {
+            zbus::zvariant::OwnedObjectPath::try_from(reference).map_err(|e| {
+                NexusctlError::InvalidArgument {
+                    message: format!("bad path `{reference}`: {e}"),
+                }
+            })?
+        } else {
+            resolve_profile_by_ref(&self.connection, reference).await?
+        };
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        mgr.remove_profile(path.as_ref())
+            .await
+            .map_err(from_zbus_error)
+    }
+
+    async fn update_profile_field(
+        &self,
+        reference: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<(), NexusctlError> {
+        let path = resolve_profile_by_ref(&self.connection, reference).await?;
+        let proxy = ProfileProxy::builder(&self.connection)
+            .path(path)
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        let mut settings: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+            std::collections::HashMap::new();
+        let v = parse_scalar_value(field, value)?;
+        settings.insert(field.to_owned(), v);
+        proxy.update(settings).await.map_err(from_zbus_error)
+    }
+
+    async fn set_power_state(&self, state: &str) -> Result<(), NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        mgr.set_power_state(state).await.map_err(from_zbus_error)
+    }
+
+    async fn rotate_master_key(&self) -> Result<String, NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        mgr.rotate_master_key().await.map_err(from_zbus_error)
+    }
+
+    async fn freeze_for_backup(&self) -> Result<String, NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        mgr.freeze_for_backup().await.map_err(from_zbus_error)
+    }
+
+    async fn release_backup_lease(&self, lease: &str) -> Result<(), NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        mgr.release_backup_lease(lease)
+            .await
+            .map_err(from_zbus_error)
+    }
+
+    async fn reload_config(&self) -> Result<crate::proxy::ReloadConfigReport, NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        let dict = mgr.reload_config().await.map_err(from_zbus_error)?;
+        Ok(decode_reload_report(&dict))
+    }
 }
 
 async fn read_bluetooth_device_summary(
@@ -618,6 +939,143 @@ fn normalise_profile_path(p: &str) -> Option<String> {
 
 fn last_path_component(p: &str) -> String {
     p.rsplit('/').next().unwrap_or("").to_owned()
+}
+
+/// Build an `a{sv}` settings dict for `AddWifiProfile`. Matches the
+/// shape documented in DD-006 §16.2.
+fn build_wifi_settings_dict(
+    settings: &crate::proxy::WifiProfileSettings,
+) -> Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>, NexusctlError> {
+    use zbus::zvariant::{OwnedValue, Value};
+    let mut out: std::collections::HashMap<String, OwnedValue> = std::collections::HashMap::new();
+    let ssid: OwnedValue =
+        OwnedValue::try_from(Value::new(settings.ssid.clone())).map_err(|e| {
+            NexusctlError::InvalidArgument {
+                message: format!("encoding ssid: {e}"),
+            }
+        })?;
+    out.insert("ssid".into(), ssid);
+    if let Some(l) = &settings.label {
+        if let Ok(v) = OwnedValue::try_from(Value::new(l.clone())) {
+            out.insert("label".into(), v);
+        }
+    }
+    if let Some(p) = settings.priority {
+        if let Ok(v) = OwnedValue::try_from(Value::new(p)) {
+            out.insert("priority".into(), v);
+        }
+    }
+    if let Some(b) = settings.auto_connect {
+        if let Ok(v) = OwnedValue::try_from(Value::new(b)) {
+            out.insert("auto_connect".into(), v);
+        }
+    }
+    if let Some(b) = settings.hidden {
+        if let Ok(v) = OwnedValue::try_from(Value::new(b)) {
+            out.insert("hidden".into(), v);
+        }
+    }
+    if let Some(b) = settings.fast_transition {
+        if let Ok(v) = OwnedValue::try_from(Value::new(b)) {
+            out.insert("fast_transition".into(), v);
+        }
+    }
+    // Security sub-dict.
+    let mut security: std::collections::HashMap<String, OwnedValue> =
+        std::collections::HashMap::new();
+    if let Ok(v) = OwnedValue::try_from(Value::new(settings.security_type.clone())) {
+        security.insert("type".into(), v);
+    }
+    if let Some(p) = &settings.passphrase {
+        if let Ok(v) = OwnedValue::try_from(Value::new(p.clone())) {
+            security.insert("passphrase".into(), v);
+        }
+    }
+    if let Ok(sec) = OwnedValue::try_from(Value::new(security)) {
+        out.insert("security".into(), sec);
+    }
+    Ok(out)
+}
+
+fn build_ethernet_settings_dict(
+    settings: &crate::proxy::EthernetProfileSettings,
+) -> Result<std::collections::HashMap<String, zbus::zvariant::OwnedValue>, NexusctlError> {
+    use zbus::zvariant::{OwnedValue, Value};
+    let mut out: std::collections::HashMap<String, OwnedValue> = std::collections::HashMap::new();
+    if let Ok(v) = OwnedValue::try_from(Value::new(settings.ifname.clone())) {
+        out.insert("ifname".into(), v);
+    }
+    if let Some(l) = &settings.label {
+        if let Ok(v) = OwnedValue::try_from(Value::new(l.clone())) {
+            out.insert("label".into(), v);
+        }
+    }
+    if let Some(b) = settings.auto_connect {
+        if let Ok(v) = OwnedValue::try_from(Value::new(b)) {
+            out.insert("auto_connect".into(), v);
+        }
+    }
+    Ok(out)
+}
+
+/// Decode a typed scalar out of a `<field>, <value>` CLI pair.
+/// Bool fields round-trip "true"/"false"; integers try i32; the
+/// fallback is a plain string. This is the minimum nexusctl needs
+/// for `profile update --field label --value "home"` style edits.
+fn parse_scalar_value(field: &str, raw: &str) -> Result<zbus::zvariant::OwnedValue, NexusctlError> {
+    use zbus::zvariant::{OwnedValue, Value};
+    if raw == "true" || raw == "false" {
+        return OwnedValue::try_from(Value::new(raw == "true")).map_err(|e| {
+            NexusctlError::InvalidArgument {
+                message: format!("encoding {field}: {e}"),
+            }
+        });
+    }
+    if let Ok(n) = raw.parse::<i32>() {
+        return OwnedValue::try_from(Value::new(n)).map_err(|e| NexusctlError::InvalidArgument {
+            message: format!("encoding {field}: {e}"),
+        });
+    }
+    OwnedValue::try_from(Value::new(raw.to_owned())).map_err(|e| NexusctlError::InvalidArgument {
+        message: format!("encoding {field}: {e}"),
+    })
+}
+
+/// Decode the `a{sv}` report from `Manager.ReloadConfig`. Same
+/// keys as DD-006 §5.2.
+fn decode_reload_report(
+    dict: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+) -> crate::proxy::ReloadConfigReport {
+    let str_array = |key: &str| -> Vec<String> {
+        dict.get(key)
+            .and_then(|v| <&zbus::zvariant::Array>::try_from(v).ok())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|item| <&str>::try_from(item).ok().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let errors: Vec<(String, String)> = dict
+        .get("errors")
+        .and_then(|v| <&zbus::zvariant::Array>::try_from(v).ok())
+        .map(|a| {
+            a.iter()
+                .filter_map(|item| {
+                    let s: &zbus::zvariant::Structure = item.downcast_ref().ok()?;
+                    let fields = s.fields();
+                    let a = <&str>::try_from(&fields[0]).ok()?.to_owned();
+                    let b = <&str>::try_from(&fields[1]).ok()?.to_owned();
+                    Some((a, b))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    crate::proxy::ReloadConfigReport {
+        applied: str_array("applied"),
+        deferred: str_array("deferred"),
+        errors,
+    }
 }
 
 /// Assemble a minimal TOML document from a `ProfileDetail`.

@@ -22,6 +22,7 @@ pub mod gnss;
 pub mod interface;
 pub mod manager;
 pub mod profile;
+pub mod scan_result;
 pub mod wifi;
 pub mod zbus_ops;
 
@@ -256,6 +257,59 @@ pub struct MasterKeyInfo {
     pub source: String,
 }
 
+/// One row of `nexusctl wifi scan` output.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WifiScanResult {
+    pub ssid: String,
+    pub bssid: String,
+    pub frequency_mhz: u32,
+    pub signal_dbm: i32,
+    pub security: Vec<String>,
+    pub age_ms: u64,
+}
+
+/// DD-008 §5 requires every mutating command to render confirmation
+/// output. Most of them produce a tiny struct like this; the shared
+/// view lets the output layer format consistently across commands.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MutationOutcome {
+    pub action: String,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// `a{sv}` payload for `Manager.AddWifiProfile`. Only the handful of
+/// fields nexusctl exposes today — DD-006 §16.2 has the full dict.
+#[derive(Debug, Clone)]
+pub struct WifiProfileSettings {
+    pub ssid: Vec<u8>,
+    pub security_type: String,
+    pub passphrase: Option<String>,
+    pub label: Option<String>,
+    pub priority: Option<i32>,
+    pub auto_connect: Option<bool>,
+    pub hidden: Option<bool>,
+    pub fast_transition: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EthernetProfileSettings {
+    pub ifname: String,
+    pub label: Option<String>,
+    pub auto_connect: Option<bool>,
+}
+
+/// Response from `Manager.ReloadConfig`. Same shape as DD-006 §5.2.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct ReloadConfigReport {
+    pub applied: Vec<String>,
+    pub deferred: Vec<String>,
+    pub errors: Vec<(String, String)>,
+}
+
 /// Subset filter for `nexusctl bt list`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BluetoothListFilter {
@@ -334,6 +388,173 @@ pub trait ManagerOps: Send + Sync {
     async fn master_key_info(&self) -> Result<MasterKeyInfo, NexusctlError> {
         Err(NexusctlError::Unsupported {
             detail: "master_key_info".into(),
+        })
+    }
+
+    // ---- Mutating: wifi (DD-008 Phase 7.4 non-interactive subset) ----
+
+    /// Issues `Wifi.Scan()` and returns the per-BSS rows now
+    /// visible in `ScanResults`. The scan itself is asynchronous at
+    /// the daemon level; phase-4 polls `ScanResults` for a short
+    /// window after the call returns rather than subscribing to
+    /// `ScanCompleted` — a future commit can tighten this once the
+    /// signal wiring lands end-to-end.
+    async fn wifi_scan(&self, _ifname: &str) -> Result<Vec<WifiScanResult>, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "wifi_scan".into(),
+        })
+    }
+
+    /// Connect by stored profile object path.
+    async fn wifi_connect_profile(
+        &self,
+        _ifname: &str,
+        _profile_path: &str,
+    ) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "wifi_connect_profile".into(),
+        })
+    }
+
+    /// Disconnect the interface's current session.
+    async fn wifi_disconnect(&self, _ifname: &str) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "wifi_disconnect".into(),
+        })
+    }
+
+    /// Find a stored Wi-Fi profile by its SSID bytes. Returns the
+    /// profile's object path, or `NotFound` when no profile matches.
+    async fn find_wifi_profile(&self, _ssid: &[u8]) -> Result<String, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "find_wifi_profile".into(),
+        })
+    }
+
+    // ---- Mutating: bluetooth ----
+
+    async fn bt_set_powered(&self, _adapter: &str, _on: bool) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "bt_set_powered".into(),
+        })
+    }
+
+    /// Runs a bounded-duration discovery session: `StartDiscovery`,
+    /// sleep, `StopDiscovery`. Returns the known-device list after
+    /// the session ends.
+    async fn bt_scan(
+        &self,
+        _adapter: Option<&str>,
+        _duration: std::time::Duration,
+    ) -> Result<Vec<BluetoothDeviceSummary>, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "bt_scan".into(),
+        })
+    }
+
+    async fn bt_connect_device(&self, _address: &str) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "bt_connect_device".into(),
+        })
+    }
+
+    async fn bt_disconnect_device(&self, _address: &str) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "bt_disconnect_device".into(),
+        })
+    }
+
+    async fn bt_forget_device(&self, _address: &str) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "bt_forget_device".into(),
+        })
+    }
+
+    async fn bt_set_trusted(&self, _address: &str, _on: bool) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "bt_set_trusted".into(),
+        })
+    }
+
+    // ---- Mutating: profiles ----
+
+    /// Create a Wi-Fi profile from a settings dict. Returns the new
+    /// profile's ULID as a string — the caller can use it for
+    /// subsequent `connect-profile` / `update` calls.
+    async fn add_wifi_profile(
+        &self,
+        _settings: WifiProfileSettings,
+    ) -> Result<String, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "add_wifi_profile".into(),
+        })
+    }
+
+    async fn add_ethernet_profile(
+        &self,
+        _settings: EthernetProfileSettings,
+    ) -> Result<String, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "add_ethernet_profile".into(),
+        })
+    }
+
+    /// Remove a profile by ULID or label. Same resolution rules as
+    /// `show_profile`.
+    async fn remove_profile(&self, _reference: &str) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "remove_profile".into(),
+        })
+    }
+
+    /// Update a top-level field on a profile. `field` is the key as
+    /// it appears in the profile's `a{sv}` settings dict (e.g.,
+    /// `"auto_connect"`, `"label"`). `value` is the raw string the
+    /// operator supplied — handlers parse it against the expected
+    /// type.
+    async fn update_profile_field(
+        &self,
+        _reference: &str,
+        _field: &str,
+        _value: &str,
+    ) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "update_profile_field".into(),
+        })
+    }
+
+    // ---- Manager-level admin operations ----
+
+    async fn set_power_state(&self, _state: &str) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "set_power_state".into(),
+        })
+    }
+
+    /// Fire-and-forget. Returns the job id; the outcome arrives via
+    /// the `MasterKeyRotated` signal which operators watch with
+    /// `nexusctl watch`.
+    async fn rotate_master_key(&self) -> Result<String, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "rotate_master_key".into(),
+        })
+    }
+
+    async fn freeze_for_backup(&self) -> Result<String, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "freeze_for_backup".into(),
+        })
+    }
+
+    async fn release_backup_lease(&self, _lease: &str) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "release_backup_lease".into(),
+        })
+    }
+
+    async fn reload_config(&self) -> Result<ReloadConfigReport, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "reload_config".into(),
         })
     }
 }

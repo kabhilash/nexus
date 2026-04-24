@@ -37,8 +37,10 @@ async fn main() -> ExitCode {
     };
 
     let mut stdout = std::io::stdout().lock();
-    let result = dispatch(&cli, &ops, &mut stdout).await;
+    let mut stderr_lock = std::io::stderr().lock();
+    let result = dispatch(&cli, &ops, &mut stdout, &mut stderr_lock).await;
     let _ = stdout.flush();
+    drop(stderr_lock);
     finish(result, format)
 }
 

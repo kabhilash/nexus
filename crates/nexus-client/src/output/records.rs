@@ -660,3 +660,178 @@ impl Render for MasterKeyInfo {
         self.render_human(ctx, w)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Vec<WifiScanResult> — `wifi scan`
+// ---------------------------------------------------------------------------
+
+impl Render for Vec<crate::proxy::WifiScanResult> {
+    fn render_human(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        if self.is_empty() {
+            writeln!(w, "no BSSes visible")?;
+            return Ok(());
+        }
+        table_with(
+            &["SSID", "BSSID", "FREQ", "SIGNAL", "SECURITY", "AGE"],
+            |t| {
+                for r in self {
+                    let security = if r.security.is_empty() {
+                        "open".into()
+                    } else {
+                        r.security.join(",")
+                    };
+                    let ssid = if r.ssid.is_empty() {
+                        "<hidden>".into()
+                    } else {
+                        r.ssid.clone()
+                    };
+                    t.add_row(vec![
+                        Cell::new(ssid),
+                        Cell::new(&r.bssid),
+                        Cell::new(format!("{} MHz", r.frequency_mhz)),
+                        Cell::new(format!("{} dBm", r.signal_dbm)),
+                        Cell::new(security),
+                        Cell::new(format!("{} ms", r.age_ms)),
+                    ]);
+                }
+            },
+            w,
+        )
+    }
+
+    fn render_terse(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        for r in self {
+            let pairs: Vec<(&'static str, String)> = vec![
+                ("ssid", r.ssid.clone()),
+                ("bssid", r.bssid.clone()),
+                ("frequency_mhz", r.frequency_mhz.to_string()),
+                ("signal_dbm", r.signal_dbm.to_string()),
+                ("security", r.security.join(",")),
+                ("age_ms", r.age_ms.to_string()),
+            ];
+            terse_pairs(&pairs, ctx, w)?;
+        }
+        Ok(())
+    }
+
+    fn render_json(&self, w: &mut dyn Write) -> io::Result<()> {
+        super::json::write(self, w)
+    }
+
+    fn render_pretty(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        for (i, r) in self.iter().enumerate() {
+            if i > 0 {
+                writeln!(w)?;
+            }
+            let pairs = vec![
+                (
+                    "SSID",
+                    if r.ssid.is_empty() {
+                        "<hidden>".into()
+                    } else {
+                        r.ssid.clone()
+                    },
+                ),
+                ("BSSID", r.bssid.clone()),
+                ("Frequency", format!("{} MHz", r.frequency_mhz)),
+                ("Signal", format!("{} dBm", r.signal_dbm)),
+                (
+                    "Security",
+                    if r.security.is_empty() {
+                        "open".into()
+                    } else {
+                        r.security.join(", ")
+                    },
+                ),
+                ("Age", format!("{} ms", r.age_ms)),
+            ];
+            vertical_block(&pairs, w)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MutationOutcome — confirmation banner for mutating commands
+// ---------------------------------------------------------------------------
+
+impl Render for crate::proxy::MutationOutcome {
+    fn render_human(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        let mut line = format!("{}: {}", self.action, self.subject);
+        if let Some(id) = &self.id {
+            line.push_str(&format!(" (id: {id})"));
+        }
+        writeln!(w, "{line}")?;
+        if let Some(n) = &self.note {
+            writeln!(w, "  {n}")?;
+        }
+        Ok(())
+    }
+    fn render_terse(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        let pairs: Vec<(&'static str, String)> = vec![
+            ("action", self.action.clone()),
+            ("subject", self.subject.clone()),
+            ("id", self.id.clone().unwrap_or_default()),
+        ];
+        terse_pairs(&pairs, ctx, w)
+    }
+    fn render_json(&self, w: &mut dyn Write) -> io::Result<()> {
+        super::json::write(self, w)
+    }
+    fn render_pretty(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        self.render_human(ctx, w)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReloadConfigReport — `admin reload-config`
+// ---------------------------------------------------------------------------
+
+impl Render for crate::proxy::ReloadConfigReport {
+    fn render_human(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        if self.applied.is_empty() && self.deferred.is_empty() && self.errors.is_empty() {
+            writeln!(w, "config unchanged (no fields differed)")?;
+            return Ok(());
+        }
+        if !self.applied.is_empty() {
+            writeln!(w, "Applied:")?;
+            for f in &self.applied {
+                writeln!(w, "  {f}")?;
+            }
+        }
+        if !self.deferred.is_empty() {
+            writeln!(w, "Deferred (restart required):")?;
+            for f in &self.deferred {
+                writeln!(w, "  {f}")?;
+            }
+        }
+        if !self.errors.is_empty() {
+            writeln!(w, "Errors:")?;
+            for (f, r) in &self.errors {
+                writeln!(w, "  {f}: {r}")?;
+            }
+        }
+        Ok(())
+    }
+    fn render_terse(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        let pairs: Vec<(&'static str, String)> = vec![
+            ("applied", self.applied.join(",")),
+            ("deferred", self.deferred.join(",")),
+            (
+                "errors",
+                self.errors
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        ];
+        terse_pairs(&pairs, ctx, w)
+    }
+    fn render_json(&self, w: &mut dyn Write) -> io::Result<()> {
+        super::json::write(self, w)
+    }
+    fn render_pretty(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        self.render_human(ctx, w)
+    }
+}

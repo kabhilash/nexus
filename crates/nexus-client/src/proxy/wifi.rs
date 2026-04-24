@@ -37,4 +37,20 @@ pub trait Wifi {
 
     #[zbus(property, name = "Powered")]
     fn powered(&self) -> zbus::Result<bool>;
+
+    /// `Scan(params: a{sv}) -> ()`. Pass an empty dict for the
+    /// default "active probe every frequency" behaviour.
+    #[zbus(name = "Scan")]
+    fn scan(
+        &self,
+        params: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    ) -> zbus::Result<()>;
+
+    /// `Connect(profile: o) -> ()`.
+    #[zbus(name = "Connect")]
+    fn connect(&self, profile: zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
+
+    /// `Disconnect() -> ()`.
+    #[zbus(name = "Disconnect")]
+    fn disconnect(&self) -> zbus::Result<()>;
 }

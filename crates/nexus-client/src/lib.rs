@@ -27,6 +27,7 @@ pub mod errors_map;
 pub mod output;
 pub mod path_resolve;
 pub mod proxy;
+pub mod psk_warn;
 pub mod state_prefix;
 
 pub use errors::{NexusctlError, exit_code_for};
