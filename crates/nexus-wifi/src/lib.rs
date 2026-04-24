@@ -55,6 +55,45 @@ pub enum WifiCommand {
         params: types::ScanParams,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Operator-initiated connect to a named profile. Looks the
+    /// profile up in the backend's in-memory cache (populated at
+    /// startup from [`ProfileStore::load_wifi`]), translates it
+    /// via [`crate::profile::to_network_config`], and calls
+    /// [`WifiSupplicantBackend::connect`]. Bypasses the automatic
+    /// selection path's rate-limit + blacklist checks — an
+    /// operator-explicit connect isn't in the same class as the
+    /// backend's own retry loop.
+    Connect {
+        ifname: String,
+        profile_id: ulid::Ulid,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Disconnect the current session. Matches DD-006 §6.3
+    /// `Wifi.Disconnect()` semantics: the supplicant tears down
+    /// the association; the network entry is kept so future
+    /// auto-connect attempts don't have to rebuild it.
+    Disconnect {
+        ifname: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Targeted roam to `bssid`. Only meaningful in `roam_mode =
+    /// "nexus"`; in `"off"` / `"supplicant"` modes the supplicant
+    /// is responsible for roam decisions and this call is a no-op
+    /// on its end (but we still route it through for observability).
+    Roam {
+        ifname: String,
+        bssid: nexus_core::MacAddr,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Change the roaming mode on a live interface. Affects the
+    /// backend's own scan scheduling (roam evaluation only runs
+    /// under `Nexus` mode) and — for `Supplicant` — hands the
+    /// decision back to wpa_supplicant.
+    SetRoamingMode {
+        ifname: String,
+        mode: types::RoamMode,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Handle returned by [`spawn_wifi_backend`]. Drop the handle to

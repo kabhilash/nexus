@@ -15,6 +15,12 @@ pub enum WifiError {
     #[error("no profile matches the scan results on ifindex {ifindex}")]
     NoProfileMatch { ifindex: u32 },
 
+    /// An operator Connect or Forget referenced a profile ULID the
+    /// backend doesn't know about. Distinct from `NoProfileMatch`,
+    /// which is an automatic-selection miss against a known set.
+    #[error("profile {id} not found in the backend's profile cache")]
+    ProfileNotFound { id: String },
+
     /// The supplicant daemon returned an error.
     #[error("supplicant '{backend}' error: {source}")]
     Supplicant {

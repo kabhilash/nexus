@@ -15,12 +15,17 @@
 //!                                   └─ Interface1.Scan (wpa_supplicant D-Bus)
 //! ```
 //!
-//! Only the Wi-Fi method leg is live today. Every other method
-//! delegates to the `inner` impl so the caller can layer
-//! [`crate::ReloadOps`] on top and `NoopOps::arc()` at the bottom.
-//! Wiring additional methods (connect, disconnect, roam,
-//! set_powered, set_roaming_mode) will grow this module as the
-//! corresponding [`nexus_wifi::WifiCommand`] variants land.
+//! Live: `wifi_scan`, `wifi_connect`, `wifi_disconnect`, `wifi_roam`,
+//! and `wifi_set_roaming_mode` — each forwards a
+//! [`nexus_wifi::WifiCommand`] to the backend task and awaits its
+//! [`oneshot`] reply.
+//!
+//! Pass-through: `wifi_set_powered` and `set_power_state`. Powering
+//! a Wi-Fi interface on/off needs rtnl link admin or rfkill
+//! control, neither of which the wifi crate wires today (see the
+//! Tier 3 gap review around DD-003 §13). The `inner` pass-through
+//! lets the daemon layer a `NoopOps::arc()` underneath, which
+//! returns `Unsupported` — the right signal for clients.
 
 use std::sync::Arc;
 
@@ -29,6 +34,7 @@ use nexus_core::MacAddr;
 use nexus_dbus::{BackendOps, DbusError, ReloadReport, Result, RoamingMode, ScanParams};
 use nexus_wifi::{WifiCommand, WifiError, types as wifi_types};
 use tokio::sync::{mpsc, oneshot};
+use ulid::Ulid;
 
 /// `BackendOps` impl that forwards Wi-Fi commands over a channel
 /// into the spawned [`nexus_wifi::WifiBackend`].
@@ -70,6 +76,7 @@ fn map_wifi_error(e: WifiError) -> DbusError {
     match e {
         WifiError::NotAttached { .. } => DbusError::NotFound(e.to_string()),
         WifiError::NoProfileMatch { .. } => DbusError::NotFound(e.to_string()),
+        WifiError::ProfileNotFound { .. } => DbusError::NotFound(e.to_string()),
         // Supplicant-layer failures manifest as transient (busy) at
         // the D-Bus surface — the client's typical response is to
         // wait and retry. Prefix the message with "supplicant:" so
@@ -79,49 +86,100 @@ fn map_wifi_error(e: WifiError) -> DbusError {
     }
 }
 
+/// Translate nexus-dbus's `RoamingMode` enum into nexus-wifi's
+/// `RoamMode`. Identical shape; separate crates keep them distinct
+/// so the D-Bus surface can evolve independently.
+fn convert_roaming_mode(m: RoamingMode) -> wifi_types::RoamMode {
+    match m {
+        RoamingMode::Off => wifi_types::RoamMode::Off,
+        RoamingMode::Supplicant => wifi_types::RoamMode::Supplicant,
+        RoamingMode::Nexus => wifi_types::RoamMode::Nexus,
+    }
+}
+
+/// Small helper: send a [`WifiCommand`], await its oneshot reply,
+/// and map the nested errors. Every `wifi_*` method below follows
+/// the same pattern — four nearly-identical blocks would bury the
+/// interesting bit, so factor it out.
+async fn dispatch(
+    commands: &mpsc::Sender<WifiCommand>,
+    make: impl FnOnce(oneshot::Sender<nexus_wifi::Result<()>>) -> WifiCommand,
+) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    commands
+        .send(make(tx))
+        .await
+        .map_err(|_| DbusError::FeatureDisabled("wifi: backend channel closed".into()))?;
+    match rx.await {
+        Ok(r) => r.map_err(map_wifi_error),
+        Err(_) => Err(DbusError::FeatureDisabled(
+            "wifi: backend dropped the reply".into(),
+        )),
+    }
+}
+
 #[async_trait]
 impl BackendOps for WifiBackendOps {
     async fn wifi_scan(&self, ifname: &str, params: ScanParams) -> Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.commands
-            .send(WifiCommand::Scan {
-                ifname: ifname.to_owned(),
-                params: convert_params(params),
-                reply: tx,
-            })
-            .await
-            .map_err(|_| {
-                // Backend task is gone — feature is effectively
-                // disabled until the daemon restarts.
-                DbusError::FeatureDisabled("wifi: backend channel closed".into())
-            })?;
-        match rx.await {
-            Ok(r) => r.map_err(map_wifi_error),
-            Err(_) => Err(DbusError::FeatureDisabled(
-                "wifi: backend dropped the scan reply".into(),
-            )),
-        }
+        let ifname = ifname.to_owned();
+        let params = convert_params(params);
+        dispatch(&self.commands, |tx| WifiCommand::Scan {
+            ifname,
+            params,
+            reply: tx,
+        })
+        .await
     }
 
-    // Everything else delegates downward. As new WifiCommand
-    // variants land (connect, disconnect, roam, set_powered,
-    // set_roaming_mode), each gets its own override here.
-
-    async fn wifi_connect(&self, ifname: &str, profile_id: ulid::Ulid) -> Result<()> {
-        self.inner.wifi_connect(ifname, profile_id).await
+    async fn wifi_connect(&self, ifname: &str, profile_id: Ulid) -> Result<()> {
+        let ifname = ifname.to_owned();
+        dispatch(&self.commands, |tx| WifiCommand::Connect {
+            ifname,
+            profile_id,
+            reply: tx,
+        })
+        .await
     }
+
     async fn wifi_disconnect(&self, ifname: &str) -> Result<()> {
-        self.inner.wifi_disconnect(ifname).await
+        let ifname = ifname.to_owned();
+        dispatch(&self.commands, |tx| WifiCommand::Disconnect {
+            ifname,
+            reply: tx,
+        })
+        .await
     }
+
     async fn wifi_roam(&self, ifname: &str, bssid: MacAddr) -> Result<()> {
-        self.inner.wifi_roam(ifname, bssid).await
+        let ifname = ifname.to_owned();
+        dispatch(&self.commands, |tx| WifiCommand::Roam {
+            ifname,
+            bssid,
+            reply: tx,
+        })
+        .await
     }
+
+    async fn wifi_set_roaming_mode(&self, ifname: &str, mode: RoamingMode) -> Result<()> {
+        let ifname = ifname.to_owned();
+        let mode = convert_roaming_mode(mode);
+        dispatch(&self.commands, |tx| WifiCommand::SetRoamingMode {
+            ifname,
+            mode,
+            reply: tx,
+        })
+        .await
+    }
+
+    // SetPowered stays delegated to `inner` — it needs rtnl link
+    // admin / rfkill plumbing that the wifi crate doesn't expose
+    // today (see the Tier 3 item in the DD-003 gap review). The
+    // daemon's `NoopOps` leaf returns `Unsupported`, which is the
+    // right signal for clients.
     async fn wifi_set_powered(&self, ifname: &str, on: bool) -> Result<()> {
         self.inner.wifi_set_powered(ifname, on).await
     }
-    async fn wifi_set_roaming_mode(&self, ifname: &str, mode: RoamingMode) -> Result<()> {
-        self.inner.wifi_set_roaming_mode(ifname, mode).await
-    }
+
     async fn set_power_state(&self, state: nexus_dbus::PowerState) -> Result<()> {
         self.inner.set_power_state(state).await
     }
@@ -220,5 +278,103 @@ mod tests {
         // reload_config on NoopOps returns Unsupported.
         let err = ops.reload_config().await.unwrap_err();
         assert!(matches!(err, DbusError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn connect_forwards_profile_id_and_waits_for_reply() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WifiCommand>(4);
+        let ops = WifiBackendOps::new(cmd_tx, NoopOps::arc());
+        let id = Ulid::new();
+        tokio::spawn(async move {
+            if let Some(WifiCommand::Connect {
+                ifname,
+                profile_id,
+                reply,
+            }) = cmd_rx.recv().await
+            {
+                assert_eq!(ifname, "wlan0");
+                assert_eq!(profile_id, id);
+                let _ = reply.send(Ok(()));
+            }
+        });
+        assert!(ops.wifi_connect("wlan0", id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_surfaces_profile_not_found_as_not_found() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WifiCommand>(4);
+        let ops = WifiBackendOps::new(cmd_tx, NoopOps::arc());
+        tokio::spawn(async move {
+            if let Some(WifiCommand::Connect { reply, .. }) = cmd_rx.recv().await {
+                let _ = reply.send(Err(WifiError::ProfileNotFound {
+                    id: "01H...".into(),
+                }));
+            }
+        });
+        let err = ops.wifi_connect("wlan0", Ulid::new()).await.unwrap_err();
+        assert!(matches!(err, DbusError::NotFound(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn disconnect_forwards_and_succeeds() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WifiCommand>(4);
+        let ops = WifiBackendOps::new(cmd_tx, NoopOps::arc());
+        tokio::spawn(async move {
+            if let Some(WifiCommand::Disconnect { ifname, reply }) = cmd_rx.recv().await {
+                assert_eq!(ifname, "wlan0");
+                let _ = reply.send(Ok(()));
+            }
+        });
+        assert!(ops.wifi_disconnect("wlan0").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn roam_passes_bssid_through() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WifiCommand>(4);
+        let ops = WifiBackendOps::new(cmd_tx, NoopOps::arc());
+        let bssid = MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01]);
+        tokio::spawn(async move {
+            if let Some(WifiCommand::Roam {
+                ifname,
+                bssid: got,
+                reply,
+            }) = cmd_rx.recv().await
+            {
+                assert_eq!(ifname, "wlan0");
+                assert_eq!(got, bssid);
+                let _ = reply.send(Ok(()));
+            }
+        });
+        assert!(ops.wifi_roam("wlan0", bssid).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn set_roaming_mode_translates_enum() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<WifiCommand>(4);
+        let ops = WifiBackendOps::new(cmd_tx, NoopOps::arc());
+        tokio::spawn(async move {
+            if let Some(WifiCommand::SetRoamingMode { mode, reply, .. }) = cmd_rx.recv().await {
+                // Verify the dbus → wifi translation hit the right
+                // variant.
+                assert!(matches!(mode, wifi_types::RoamMode::Nexus));
+                let _ = reply.send(Ok(()));
+            }
+        });
+        assert!(
+            ops.wifi_set_roaming_mode("wlan0", RoamingMode::Nexus)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_powered_still_delegates_to_inner() {
+        // SetPowered stays on NoopOps until rtnl/rfkill wiring
+        // lands — document that with a test rather than quietly
+        // diverging.
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<WifiCommand>(1);
+        let ops = WifiBackendOps::new(cmd_tx, NoopOps::arc());
+        let err = ops.wifi_set_powered("wlan0", true).await.unwrap_err();
+        assert!(matches!(err, DbusError::Unsupported(_)), "{err:?}");
     }
 }

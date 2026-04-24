@@ -191,7 +191,130 @@ impl WifiBackend {
                 };
                 let _ = reply.send(result);
             }
+            crate::WifiCommand::Connect {
+                ifname,
+                profile_id,
+                reply,
+            } => {
+                let _ = reply.send(self.operator_connect(&ifname, profile_id).await);
+            }
+            crate::WifiCommand::Disconnect { ifname, reply } => {
+                let _ = reply.send(self.operator_disconnect(&ifname).await);
+            }
+            crate::WifiCommand::Roam {
+                ifname,
+                bssid,
+                reply,
+            } => {
+                let _ = reply.send(self.operator_roam(&ifname, bssid).await);
+            }
+            crate::WifiCommand::SetRoamingMode {
+                ifname,
+                mode,
+                reply,
+            } => {
+                let _ = reply.send(self.operator_set_roaming_mode(&ifname, mode).await);
+            }
         }
+    }
+
+    /// Operator-initiated `Connect`. Looks up the profile in the
+    /// backend's in-memory cache, forgets any prior active handle
+    /// on the interface, and drives the supplicant's connect flow.
+    /// Does not consult the `retry` book — an explicit operator
+    /// action isn't subject to the automatic-selection rate limit.
+    async fn operator_connect(&mut self, ifname: &str, profile_id: ulid::Ulid) -> Result<()> {
+        let ifindex = self
+            .ifindex_for(ifname)
+            .ok_or(WifiError::NotAttached { ifindex: 0 })?;
+        let profile = self
+            .profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .cloned()
+            .ok_or_else(|| WifiError::ProfileNotFound {
+                id: profile_id.to_string(),
+            })?;
+
+        // Forget the previous handle *only if* it's for a different
+        // profile. Same-profile re-connects (e.g. the operator
+        // deliberately re-issuing Connect) keep the handle so the
+        // supplicant can fast-path the association.
+        if let Some((prev_profile, prev_handle)) = self.active_handle.remove(&ifindex) {
+            if prev_profile != profile.id {
+                let _ = self.supplicant.forget_network(ifindex, prev_handle).await;
+            } else {
+                self.active_handle
+                    .insert(ifindex, (prev_profile, prev_handle));
+            }
+        }
+
+        // Mark state `Connecting` immediately so the D-Bus property
+        // reflects intent before the handshake completes. BSSID is
+        // unknown at this point (the supplicant picks); zero it and
+        // let `State = completed` resolve the final triple.
+        if let Some(entry) = self.interfaces.get_mut(&ifindex) {
+            entry.state = WifiState::Connecting {
+                bssid: nexus_core::MacAddr([0; 6]),
+                ssid: profile.network.ssid.clone(),
+            };
+            self.emit_state(ifindex);
+        }
+
+        let net = to_network_config(&profile);
+        let handle = self.supplicant.connect(ifindex, &net).await?;
+        self.active_handle.insert(ifindex, (profile.id, handle));
+        m::record_connect(
+            ifname,
+            security_tag(&profile.network.security),
+            m::connect_outcome::SUCCESS,
+        );
+        Ok(())
+    }
+
+    /// Operator-initiated `Disconnect`. The supplicant tears down
+    /// the association; the in-memory active handle is cleared so a
+    /// subsequent auto-select cycle can compete fresh.
+    async fn operator_disconnect(&mut self, ifname: &str) -> Result<()> {
+        let ifindex = self
+            .ifindex_for(ifname)
+            .ok_or(WifiError::NotAttached { ifindex: 0 })?;
+        self.supplicant.disconnect(ifindex).await?;
+        self.active_handle.remove(&ifindex);
+        Ok(())
+    }
+
+    /// Operator-initiated `Roam` to a specific BSSID. Hands off to
+    /// the supplicant regardless of roam_mode — wpa_supplicant
+    /// rejects the call on its own side when the interface's roam
+    /// config says no, and surfacing that as a plain error is more
+    /// useful than us silently no-op'ing here.
+    async fn operator_roam(&mut self, ifname: &str, bssid: nexus_core::MacAddr) -> Result<()> {
+        let ifindex = self
+            .ifindex_for(ifname)
+            .ok_or(WifiError::NotAttached { ifindex: 0 })?;
+        self.supplicant
+            .roam(ifindex, crate::types::RoamTarget::Bss(bssid))
+            .await
+    }
+
+    /// Change the live roam mode. In-memory only — nothing to push
+    /// to the supplicant (wpa_supplicant's `BgScan` knob is
+    /// orthogonal; DD-003 §7.1 defers that to §9 wiring). The
+    /// ifname is validated but otherwise unused — roam mode is a
+    /// backend-wide config today, not per-interface.
+    async fn operator_set_roaming_mode(
+        &mut self,
+        ifname: &str,
+        mode: crate::types::RoamMode,
+    ) -> Result<()> {
+        // Validate the ifname so the caller gets `NotAttached`
+        // rather than a silent config mutation for a bogus iface.
+        let _ifindex = self
+            .ifindex_for(ifname)
+            .ok_or(WifiError::NotAttached { ifindex: 0 })?;
+        self.config.roam_mode = mode;
+        Ok(())
     }
 
     /// Look up the ifindex for a given ifname. O(interfaces) but
