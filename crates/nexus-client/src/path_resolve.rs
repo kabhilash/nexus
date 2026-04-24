@@ -35,7 +35,7 @@ use crate::proxy::bluetooth_device::BluetoothDeviceProxy;
 use crate::proxy::gnss::GnssProxy;
 use crate::proxy::interface::InterfaceProxy;
 use crate::proxy::manager::ManagerProxy;
-use crate::proxy::profile::ProfileProxy;
+use crate::proxy::profile::{ProfileProxy, WifiProfileProxy};
 
 /// A resolution error shapes into one of two [`NexusctlError`]
 /// variants depending on the cause. Kept as its own enum so the
@@ -185,10 +185,19 @@ pub async fn resolve_gnss_by_device(
     .into())
 }
 
-/// Resolve a profile by `<ulid>` or by `Label`. Tries the ULID path
-/// first (`/fi/nexus1/profile/{wifi,ethernet}/<ref>`); on miss,
-/// walks `Manager.WifiProfiles` + `Manager.EthernetProfiles` and
-/// matches `Label`.
+/// Resolve a profile by `<ulid>`, `<label>`, or (for Wi-Fi profiles
+/// only) `<ssid>`. Resolution happens in three passes so higher-
+/// precision forms shadow ambiguous ones:
+///
+/// 1. **ULID** — exact match against the last path component of any
+///    `Manager.WifiProfiles` / `EthernetProfiles` entry.
+/// 2. **Label** — exact match against each profile's `Label`
+///    property. Ambiguity across profiles returns
+///    [`ResolveError::Ambiguous`].
+/// 3. **Wi-Fi SSID** — exact match against each Wi-Fi profile's
+///    decoded `SSID` (bytes → UTF-8 lossy). Ethernet profiles
+///    don't enter this pass. Ambiguity (two profiles for the same
+///    SSID) → [`ResolveError::Ambiguous`] as before.
 pub async fn resolve_profile_by_ref(
     conn: &Connection,
     reference: &str,
@@ -207,7 +216,7 @@ pub async fn resolve_profile_by_ref(
     }
 
     // Try label match.
-    let mut matches: Vec<OwnedObjectPath> = Vec::new();
+    let mut label_matches: Vec<OwnedObjectPath> = Vec::new();
     for p in wifi_paths.iter().chain(eth_paths.iter()) {
         let proxy = ProfileProxy::builder(conn)
             .path(p.clone())
@@ -217,14 +226,46 @@ pub async fn resolve_profile_by_ref(
             .map_err(from_zbus_error)?;
         let label = proxy.label().await.map_err(from_zbus_error)?;
         if label == reference {
-            matches.push(p.clone());
+            label_matches.push(p.clone());
         }
     }
-    match matches.len() {
-        0 => Err(ResolveError::NotFound {
-            reference: reference.to_owned(),
+    if !label_matches.is_empty() {
+        return single_match_or_ambiguous(reference, label_matches);
+    }
+
+    // Try SSID match — Wi-Fi profiles only. Reading `SSID` needs
+    // the per-kind `fi.nexus.Profile.Wifi` interface.
+    let mut ssid_matches: Vec<OwnedObjectPath> = Vec::new();
+    for p in wifi_paths.iter() {
+        let proxy = WifiProfileProxy::builder(conn)
+            .path(p.clone())
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        let bytes = proxy.ssid().await.map_err(from_zbus_error)?;
+        if String::from_utf8_lossy(&bytes) == reference {
+            ssid_matches.push(p.clone());
         }
-        .into()),
+    }
+    if !ssid_matches.is_empty() {
+        return single_match_or_ambiguous(reference, ssid_matches);
+    }
+
+    Err(ResolveError::NotFound {
+        reference: reference.to_owned(),
+    }
+    .into())
+}
+
+/// Small helper shared by the label + SSID passes: exactly one
+/// match is the happy path; two or more is `Ambiguous`.
+fn single_match_or_ambiguous(
+    reference: &str,
+    matches: Vec<OwnedObjectPath>,
+) -> Result<OwnedObjectPath, NexusctlError> {
+    match matches.len() {
+        0 => unreachable!("caller guards"),
         1 => Ok(matches.into_iter().next().unwrap()),
         _ => {
             let names = matches.into_iter().map(|p| p.as_str().to_owned()).collect();

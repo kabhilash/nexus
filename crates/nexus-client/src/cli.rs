@@ -398,7 +398,10 @@ pub enum WifiSub {
         #[arg(long)]
         no_warn_psk: bool,
     },
-    /// Connect using an existing profile, looked up by ULID or label.
+    /// Connect using an existing profile, looked up by ULID,
+    /// label, or SSID. Resolution prefers ULID → label → SSID in
+    /// that order; ambiguous matches (two profiles for the same
+    /// label or SSID) surface as a usage error.
     ConnectProfile {
         profile: String,
         #[arg(long)]
