@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use nexus_core::NexusEvent;
 use nexus_profile_store::ProfileStore;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +40,23 @@ pub use error::{Result, WifiError};
 pub use power::PowerState;
 pub use supplicant::{SupplicantEvent, WifiSupplicantBackend};
 
+/// Operator-driven command routed from the D-Bus layer into the
+/// backend's event loop. Each variant carries a oneshot reply so
+/// callers can distinguish "dispatched OK" from per-ifname errors
+/// like [`WifiError::NotAttached`]. Kept public so the daemon crate
+/// can construct a [`mpsc::Sender<WifiCommand>`] that bridges
+/// [`nexus_dbus::BackendOps`] into the backend.
+pub enum WifiCommand {
+    /// Trigger a scan on `ifname`. Maps 1:1 to
+    /// [`WifiSupplicantBackend::scan`]; results arrive later via
+    /// `NexusEvent::WifiScanComplete`.
+    Scan {
+        ifname: String,
+        params: types::ScanParams,
+        reply: oneshot::Sender<Result<()>>,
+    },
+}
+
 /// Handle returned by [`spawn_wifi_backend`]. Drop the handle to
 /// stop the backend — the [`CancellationToken`] it holds is clone
 /// of the one passed to `run`.
@@ -49,6 +66,20 @@ pub struct WifiBackendHandle {
     pub power: Arc<RwLock<PowerState>>,
 }
 
+/// Default depth for callers that use [`command_channel`]. Chosen
+/// so a burst of D-Bus requests can queue without backpressure,
+/// but a stuck backend eventually surfaces as `channel full` rather
+/// than silent OOM.
+pub const COMMAND_CHANNEL_DEPTH: usize = 32;
+
+/// Convenience constructor for the command channel. Callers that
+/// need to keep the sender alive outside the supervised wifi task
+/// (the daemon's D-Bus layer does) create the channel here and
+/// pass the receiver into [`spawn_wifi_backend`].
+pub fn command_channel() -> (mpsc::Sender<WifiCommand>, mpsc::Receiver<WifiCommand>) {
+    mpsc::channel(COMMAND_CHANNEL_DEPTH)
+}
+
 /// Spawn the Wi-Fi backend event loop. See DD-003 §§3, 5, 6, 7.
 pub fn spawn_wifi_backend(
     event_tx: broadcast::Sender<NexusEvent>,
@@ -56,9 +87,17 @@ pub fn spawn_wifi_backend(
     supplicant: Box<dyn WifiSupplicantBackend>,
     profile_store: Arc<dyn ProfileStore>,
     config: WifiConfig,
+    commands: mpsc::Receiver<WifiCommand>,
 ) -> WifiBackendHandle {
     metrics::register();
-    let backend = WifiBackend::new(event_tx, supplicant_tx, supplicant, profile_store, config);
+    let backend = WifiBackend::new(
+        event_tx,
+        supplicant_tx,
+        supplicant,
+        profile_store,
+        config,
+        commands,
+    );
     let power = backend.power_handle();
     let shutdown = CancellationToken::new();
     let shutdown_child = shutdown.clone();

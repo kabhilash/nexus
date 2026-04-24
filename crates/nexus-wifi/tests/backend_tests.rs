@@ -60,12 +60,14 @@ impl Harness {
 
         let mock = MockSupplicant::new(sup_tx.clone());
         let supplicant_handle = mock.handle();
+        let (_cmd_tx, cmd_rx) = nexus_wifi::command_channel();
         let backend = spawn_wifi_backend(
             event_tx.clone(),
             sup_tx.clone(),
             Box::new(mock),
             store,
             config,
+            cmd_rx,
         );
 
         Self {

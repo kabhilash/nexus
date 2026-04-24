@@ -21,8 +21,8 @@ use anyhow::{Context, Result, anyhow};
 use nexus_bluetooth::{BluetoothConfig, MockBluezClient, ZbusBluezClient, spawn_bluetooth_backend};
 use nexus_core::NexusEvent;
 use nexus_daemon::{
-    Config, LogLevelSetter, ReloadCoordinator, ReloadOps, SubsystemName, preflight, spawn_bus,
-    spawn_supervised,
+    Config, LogLevelSetter, ReloadCoordinator, ReloadOps, SubsystemName, WifiBackendOps, preflight,
+    spawn_bus, spawn_supervised,
 };
 use nexus_dbus::{
     BackendOps, DbusConfig, EnabledFeatures, NoopOps, PolicyKitChecker, RateLimits, always_allow,
@@ -441,12 +441,24 @@ async fn spawn_all(
         info!("ethernet disabled — skipping");
     }
 
+    // Create the wifi command channel at the daemon level so the
+    // D-Bus `BackendOps` layer (spawned below in the `dbus` arm) can
+    // hold a clone of the sender while the supervised wifi task
+    // owns the receiver. `Option` so the dbus arm can tell whether
+    // wifi is live and swap in `WifiBackendOps` accordingly.
+    let mut wifi_cmd_tx: Option<tokio::sync::mpsc::Sender<nexus_wifi::WifiCommand>> = None;
     if config.wifi.enabled {
         let ev = event_tx.clone();
         let store = Arc::clone(&profile_store);
         let wifi_cfg = build_wifi_config(&config.wifi)?;
         let backend_kind = config.wifi.backend.clone();
         let supplicant_cap = config.wifi.supplicant_event_capacity;
+        let (cmd_tx, cmd_rx) = nexus_wifi::command_channel();
+        wifi_cmd_tx = Some(cmd_tx);
+        // `cmd_rx` is !Clone — wrap in an Option so the FnMut
+        // closure can `take()` it on first call. The supervisor
+        // only invokes the closure once per lifecycle start.
+        let cmd_rx = Arc::new(tokio::sync::Mutex::new(Some(cmd_rx)));
         out.push((
             SubsystemName::Wifi,
             spawn_supervised(
@@ -458,12 +470,19 @@ async fn spawn_all(
                     let ev = ev.clone();
                     let store = Arc::clone(&store);
                     let backend_kind = backend_kind.clone();
+                    let cmd_rx = Arc::clone(&cmd_rx);
                     async move {
                         let (sup_tx, _sup_rx) = broadcast::channel(supplicant_cap);
                         let supplicant: Box<dyn WifiSupplicantBackend> =
                             build_supplicant(&backend_kind, sup_tx.clone()).await?;
-                        let handle =
-                            nexus_wifi::spawn_wifi_backend(ev, sup_tx, supplicant, store, wifi_cfg);
+                        let cmd_rx = cmd_rx
+                            .lock()
+                            .await
+                            .take()
+                            .ok_or_else(|| anyhow!("wifi cmd_rx already consumed"))?;
+                        let handle = nexus_wifi::spawn_wifi_backend(
+                            ev, sup_tx, supplicant, store, wifi_cfg, cmd_rx,
+                        );
                         let mut join = handle.join;
                         let inner = handle.shutdown;
                         let res = tokio::select! {
@@ -568,7 +587,8 @@ async fn spawn_all(
     if config.dbus.enabled {
         let ev = event_tx.clone();
         let store = Arc::clone(&profile_store);
-        let dbus_cfg = build_dbus_config(config, Arc::clone(&reload_coordinator)).await?;
+        let dbus_cfg =
+            build_dbus_config(config, Arc::clone(&reload_coordinator), wifi_cmd_tx.clone()).await?;
         out.push((
             SubsystemName::Dbus,
             spawn_supervised(
@@ -684,6 +704,7 @@ fn build_gnss_config(section: &nexus_daemon::GnssSection) -> GnssConfig {
 async fn build_dbus_config(
     config: &Config,
     reload_coordinator: Arc<ReloadCoordinator>,
+    wifi_commands: Option<tokio::sync::mpsc::Sender<nexus_wifi::WifiCommand>>,
 ) -> Result<DbusConfig> {
     let auth = if config.dbus.allow_all_authz {
         always_allow()
@@ -708,13 +729,19 @@ async fn build_dbus_config(
         profile_write_per_min: config.dbus.rate_limit_profile_write_per_min,
         admin_per_min: config.dbus.rate_limit_admin_per_min,
     };
-    // Until per-technology backends expose real `BackendOps` glue,
-    // most mutating method calls return `Unsupported`. We do however
-    // wire `Manager.ReloadConfig` end-to-end via `ReloadOps`, which
-    // routes that one method into the daemon's `ReloadCoordinator`
-    // and forwards the rest to the inner (Noop for now) impl.
-    let inner_ops: Arc<dyn BackendOps> = NoopOps::arc();
-    let ops: Arc<dyn BackendOps> = ReloadOps::new(reload_coordinator, inner_ops);
+    // BackendOps layering, bottom → top:
+    //   NoopOps              — every method returns Unsupported by default.
+    //   WifiBackendOps       — overrides wifi_scan; only present when the
+    //                          wifi subsystem is enabled.
+    //   ReloadOps            — always on top; routes Manager.ReloadConfig
+    //                          into the daemon's ReloadCoordinator and
+    //                          passes every other method through.
+    let noop: Arc<dyn BackendOps> = NoopOps::arc();
+    let mid: Arc<dyn BackendOps> = match wifi_commands {
+        Some(tx) => WifiBackendOps::new(tx, noop),
+        None => noop,
+    };
+    let ops: Arc<dyn BackendOps> = ReloadOps::new(reload_coordinator, mid);
     Ok(DbusConfig {
         bus_name: config.dbus.bus_name.clone(),
         use_session_bus: config.dbus.use_session_bus,

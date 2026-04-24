@@ -48,6 +48,10 @@ pub struct WifiBackend {
     event_tx: broadcast::Sender<NexusEvent>,
     event_rx: broadcast::Receiver<NexusEvent>,
     supplicant_rx: broadcast::Receiver<SupplicantEvent>,
+    /// Operator-driven commands from the D-Bus layer (see
+    /// [`crate::WifiCommand`]). Drained on the same `select!` loop
+    /// as event traffic.
+    cmd_rx: tokio::sync::mpsc::Receiver<crate::WifiCommand>,
 
     supplicant: Box<dyn WifiSupplicantBackend>,
     profile_store: Arc<dyn ProfileStore>,
@@ -73,6 +77,7 @@ impl WifiBackend {
         supplicant: Box<dyn WifiSupplicantBackend>,
         profile_store: Arc<dyn ProfileStore>,
         config: WifiConfig,
+        cmd_rx: tokio::sync::mpsc::Receiver<crate::WifiCommand>,
     ) -> Self {
         let event_rx = event_tx.subscribe();
         let supplicant_rx = supplicant_tx.subscribe();
@@ -82,6 +87,7 @@ impl WifiBackend {
             event_tx,
             event_rx,
             supplicant_rx,
+            cmd_rx,
             supplicant,
             profile_store,
             profiles: Vec::new(),
@@ -149,9 +155,53 @@ impl WifiBackend {
                         tracing::warn!(error = %e, "scheduled scan error");
                     }
                 }
+                maybe_cmd = self.cmd_rx.recv() => match maybe_cmd {
+                    Some(cmd) => {
+                        self.on_command(cmd).await;
+                    }
+                    // All command senders dropped. That's not a
+                    // lifecycle signal — the backend stays up until
+                    // `shutdown` fires. Break the select! arm from
+                    // retrying the same `None` forever by swapping
+                    // in a sentinel channel that never yields.
+                    None => {
+                        let (_, rx) = tokio::sync::mpsc::channel(1);
+                        self.cmd_rx = rx;
+                    }
+                }
             }
             self.refresh_metrics();
         }
+    }
+
+    /// Dispatch a [`WifiCommand`] from the D-Bus layer.
+    /// The reply `oneshot::Sender` is `_`-consumed when the receiver
+    /// has already been dropped — that happens when the client
+    /// cancelled mid-flight and we just carry on.
+    async fn on_command(&mut self, cmd: crate::WifiCommand) {
+        match cmd {
+            crate::WifiCommand::Scan {
+                ifname,
+                params,
+                reply,
+            } => {
+                let result = match self.ifindex_for(&ifname) {
+                    Some(ifindex) => self.request_scan(ifindex, params).await,
+                    None => Err(WifiError::NotAttached { ifindex: 0 }),
+                };
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    /// Look up the ifindex for a given ifname. O(interfaces) but
+    /// the set is tiny (at most a handful of radios on any real
+    /// platform).
+    fn ifindex_for(&self, ifname: &str) -> Option<u32> {
+        self.interfaces
+            .iter()
+            .find(|(_, e)| e.info.ifname == ifname)
+            .map(|(i, _)| *i)
     }
 
     // -----------------------------------------------------------------

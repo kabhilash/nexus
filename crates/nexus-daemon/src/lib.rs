@@ -18,6 +18,7 @@ pub mod config;
 pub mod preflight;
 pub mod reload;
 pub mod supervision;
+pub mod wifi_ops;
 
 pub use bus::spawn_bus;
 pub use config::{
@@ -26,3 +27,4 @@ pub use config::{
 };
 pub use reload::{LogLevelSetter, ReloadCoordinator, ReloadError, ReloadOps, diff_config};
 pub use supervision::{SubsystemName, SupervisionError, spawn_supervised};
+pub use wifi_ops::WifiBackendOps;
