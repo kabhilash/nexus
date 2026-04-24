@@ -30,6 +30,7 @@ pub mod path_resolve;
 pub mod proxy;
 pub mod psk_warn;
 pub mod state_prefix;
+pub mod watch;
 
 pub use errors::{NexusctlError, exit_code_for};
 pub use errors_map::{from_zbus_error, translate_method_error};

@@ -787,6 +787,65 @@ impl Render for crate::proxy::MutationOutcome {
 // ReloadConfigReport — `admin reload-config`
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// WatchEvent — one line per event, NDJSON-friendly
+// ---------------------------------------------------------------------------
+
+impl Render for crate::watch::WatchEvent {
+    fn render_human(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        // One aligned line per event: `<time>  <kind>  k=v k=v …`.
+        // Auto-alignment across events isn't strictly the spec
+        // (DD-008 §7.4 mentions "columns auto-align across events")
+        // but shell consumers prefer predictable per-line output;
+        // a fancier multi-event aligner can land later.
+        let body: Vec<String> = self
+            .fields
+            .iter()
+            .map(|(k, v)| format!("{k}={}", v.as_display()))
+            .collect();
+        writeln!(w, "{}  {}  {}", self.time, self.kind, body.join(" "))
+    }
+    fn render_terse(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        // Terse is each field stringified, separator-joined. The
+        // `--fields` filter picks columns; default is time, kind,
+        // then every flat field in insertion-order (alphabetical
+        // since we use BTreeMap).
+        let mut all: Vec<(&'static str, String)> = Vec::new();
+        // We need 'static str keys; intern via Box::leak on each
+        // distinct key for `--fields` parity. To avoid that per-
+        // event leak, just stream with owned strings and bypass
+        // `terse_pairs` for WatchEvent.
+        all.push(("time", self.time.clone()));
+        all.push(("kind", self.kind.clone()));
+        let _ = ctx;
+        // Flat fields follow. Emit values directly.
+        let mut out = String::new();
+        out.push_str(&self.time);
+        out.push_str(&ctx.separator);
+        out.push_str(&self.kind);
+        for (k, v) in &self.fields {
+            out.push_str(&ctx.separator);
+            out.push_str(k);
+            out.push('=');
+            out.push_str(&v.as_display());
+        }
+        writeln!(w, "{out}")
+    }
+    fn render_json(&self, w: &mut dyn Write) -> io::Result<()> {
+        // DD-008 §7.4 NDJSON: one compact JSON object per line
+        // (not pretty-printed like other commands — streams are
+        // the scripting path).
+        serde_json::to_writer(&mut *w, self).map_err(io::Error::other)?;
+        writeln!(w)
+    }
+    fn render_pretty(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        // DD-008 §7.4 says pretty is not supported for watch
+        // (pretty is a single-record format). The command handler
+        // logs a stderr warning once and re-routes here to human.
+        self.render_human(ctx, w)
+    }
+}
+
 impl Render for crate::proxy::ReloadConfigReport {
     fn render_human(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
         if self.applied.is_empty() && self.deferred.is_empty() && self.errors.is_empty() {

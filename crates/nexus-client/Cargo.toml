@@ -30,6 +30,7 @@ async-trait = { workspace = true }
 clap = { version = "4", features = ["derive", "wrap_help"] }
 comfy-table = "7"
 dialoguer = { version = "0.11", default-features = false, features = ["password"] }
+globset = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

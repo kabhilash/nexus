@@ -16,4 +16,5 @@ pub mod power;
 pub mod profile;
 pub mod profile_mutating;
 pub mod status;
+pub mod watch;
 pub mod wifi;

@@ -217,6 +217,23 @@ pub enum Command {
         #[command(subcommand)]
         sub: AdminSub,
     },
+    /// Subscribe to D-Bus signals. DD-008 §7.4.
+    Watch {
+        #[command(subcommand)]
+        sub: Option<WatchSub>,
+        /// `field=glob`. Repeat for AND semantics.
+        #[arg(long = "filter", value_name = "FILTER", global = true)]
+        filter: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone)]
+pub enum WatchSub {
+    Events,
+    Iface,
+    Wifi,
+    Bt,
+    Gnss,
 }
 
 #[derive(Debug, Subcommand)]

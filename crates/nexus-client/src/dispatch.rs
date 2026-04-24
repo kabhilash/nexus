@@ -3,7 +3,8 @@
 use std::io::Write;
 
 use crate::cli::{
-    AdminSub, BtSub, Cli, Command, EthSub, GnssSub, IfaceSub, PowerSub, ProfileSub, WifiSub,
+    AdminSub, BtSub, Cli, Command, EthSub, GnssSub, IfaceSub, PowerSub, ProfileSub, WatchSub,
+    WifiSub,
 };
 use crate::commands;
 use crate::errors::NexusctlError;
@@ -19,7 +20,8 @@ pub fn command_is_mutating(command: &Option<Command>) -> bool {
         | Some(Command::Status)
         | Some(Command::Iface { .. })
         | Some(Command::Eth { .. })
-        | Some(Command::Gnss { .. }) => false,
+        | Some(Command::Gnss { .. })
+        | Some(Command::Watch { .. }) => false,
         Some(Command::Wifi { sub }) => matches!(
             sub,
             WifiSub::Scan { .. }
@@ -283,6 +285,32 @@ pub async fn dispatch(
                 commands::power::set(ops, state.as_wire(), format, &ctx, stdout).await
             }
         },
+
+        Some(Command::Watch { sub, filter }) => {
+            let subset = match sub {
+                None | Some(WatchSub::Events) => crate::watch::WatchSubset::Events,
+                Some(WatchSub::Iface) => crate::watch::WatchSubset::Iface,
+                Some(WatchSub::Wifi) => crate::watch::WatchSubset::Wifi,
+                Some(WatchSub::Bt) => crate::watch::WatchSubset::Bt,
+                Some(WatchSub::Gnss) => crate::watch::WatchSubset::Gnss,
+            };
+            let filters = filter
+                .iter()
+                .map(|s| crate::watch::Filter::parse(s))
+                .collect::<Result<Vec<_>, _>>()?;
+            let stream = ops.watch_stream(subset).await?;
+            commands::watch::run(
+                stream,
+                subset,
+                filters,
+                format,
+                &ctx,
+                stdout,
+                stderr,
+                tokio::signal::ctrl_c(),
+            )
+            .await
+        }
 
         Some(Command::Admin { sub }) => match sub {
             AdminSub::MasterKeyInfo => {

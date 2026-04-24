@@ -47,6 +47,54 @@ fn iface_list_accepts_kind_filter() {
 }
 
 #[test]
+fn watch_without_subcommand_parses() {
+    use nexus_client::cli::WatchSub;
+    let cli = parse(&["watch"]).unwrap();
+    match cli.command {
+        Some(Command::Watch { sub, filter }) => {
+            assert!(sub.is_none());
+            assert!(filter.is_empty());
+            // Quiet unused-import lint.
+            let _: Option<WatchSub> = None;
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn watch_subsets_parse() {
+    use nexus_client::cli::WatchSub;
+    for (arg, want) in [
+        ("events", WatchSub::Events),
+        ("iface", WatchSub::Iface),
+        ("wifi", WatchSub::Wifi),
+        ("bt", WatchSub::Bt),
+        ("gnss", WatchSub::Gnss),
+    ] {
+        let cli = parse(&["watch", arg]).unwrap();
+        let actual = match cli.command {
+            Some(Command::Watch { sub: Some(s), .. }) => s,
+            other => panic!("got {other:?}"),
+        };
+        assert!(
+            std::mem::discriminant(&actual) == std::mem::discriminant(&want),
+            "arg {arg} produced wrong variant"
+        );
+    }
+}
+
+#[test]
+fn watch_filter_flag_is_repeatable() {
+    let cli = parse(&["watch", "--filter", "iface=eth0", "--filter", "kind=link-*"]).unwrap();
+    match cli.command {
+        Some(Command::Watch { filter, .. }) => {
+            assert_eq!(filter, vec!["iface=eth0", "kind=link-*"]);
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
 fn no_polkit_agent_flag_is_global() {
     let cli = parse(&["--no-polkit-agent", "bt", "pair", "AA:BB:CC:DD:EE:01"]).unwrap();
     assert!(cli.global.no_polkit_agent);

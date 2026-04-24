@@ -558,6 +558,22 @@ pub trait ManagerOps: Send + Sync {
         })
     }
 
+    // ---- Watch (DD-008 §7.4) ----
+
+    /// Subscribe to signals matching the requested subset and
+    /// return an async stream of synthesised [`WatchEvent`]s.
+    /// Production zbus signal-stream wiring is deferred (same
+    /// stubbing pattern as `start_pairing`); tests inject a
+    /// scripted `MockWatchStream`.
+    async fn watch_stream(
+        &self,
+        _subset: crate::watch::WatchSubset,
+    ) -> Result<Box<dyn crate::watch::WatchStream>, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "watch_stream: awaiting real zbus signal subscription wiring".into(),
+        })
+    }
+
     // ---- Interactive: pairing (DD-008 §6.1) ----
 
     /// Kick off a pairing session. Returns the event stream, the
