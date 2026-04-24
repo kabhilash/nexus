@@ -31,6 +31,12 @@ pub struct WifiConfig {
     pub disconnect_cool_down: Duration,
 }
 
+/// Interval of the backend's `select!`-loop heartbeat. Tight enough
+/// that power-state transitions during otherwise-quiet periods
+/// (Sleep → Active) observe the new cadence within ~1 s, loose
+/// enough that the idle-daemon wakeup rate is negligible.
+const HEARTBEAT: Duration = Duration::from_secs(1);
+
 impl Default for WifiConfig {
     fn default() -> Self {
         Self {
@@ -68,6 +74,11 @@ pub struct WifiBackend {
     power: Arc<RwLock<PowerState>>,
     config: WifiConfig,
     supplicant_up: bool,
+
+    /// Timestamp of the last successful `SignalPoll` for each
+    /// interface. Populated on the heartbeat tick so we only poll
+    /// per `WifiConfig::signal_poll_interval`, not every tick.
+    last_signal_poll: HashMap<u32, Instant>,
 }
 
 impl WifiBackend {
@@ -99,6 +110,7 @@ impl WifiBackend {
             power: Arc::new(RwLock::new(PowerState::default())),
             config,
             supplicant_up: true,
+            last_signal_poll: HashMap::new(),
         }
     }
 
@@ -112,11 +124,21 @@ impl WifiBackend {
     /// Drive the loop. Returns on `shutdown` cancellation or when
     /// the event bus closes.
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
-        // Load profiles once at startup. The D-Bus
-        // ProfileChanged event would drive reloads in production;
-        // the mock harness pre-seeds via `put_wifi` before the
-        // backend spins up.
+        // Load profiles once at startup. Subsequent put/remove calls
+        // emit `NexusEvent::ProfileChanged`, which `on_nexus_event`
+        // handles with a refresh.
         self.profiles = self.profile_store.load_wifi().await?;
+
+        // 1 s heartbeat. Two jobs:
+        //   - Run signal polls on connected interfaces whose
+        //     per-interface `signal_poll_interval` deadline has
+        //     arrived (DD-003 §7.2).
+        //   - Guarantee the select! loop wakes even when the scan
+        //     scheduler is suspended (e.g. PowerState::Sleep), so
+        //     a subsequent power-state change picks up the new
+        //     cadence on the very next iteration.
+        let heartbeat = tokio::time::sleep(HEARTBEAT);
+        tokio::pin!(heartbeat);
 
         loop {
             let power = *self.power.read().await;
@@ -168,9 +190,54 @@ impl WifiBackend {
                         let (_, rx) = tokio::sync::mpsc::channel(1);
                         self.cmd_rx = rx;
                     }
-                }
+                },
+                _ = &mut heartbeat => {
+                    heartbeat.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT);
+                    self.on_heartbeat().await;
+                },
             }
             self.refresh_metrics();
+        }
+    }
+
+    /// Tick handler: for each connected interface, if the signal
+    /// poll is due, call the supplicant and emit a
+    /// [`NexusEvent::WifiSignalPoll`]. The dbus layer consumes
+    /// those to refresh the `SignalDbm` / `Frequency` properties.
+    async fn on_heartbeat(&mut self) {
+        let now = Instant::now();
+        let interval = self.config.signal_poll_interval;
+        // Collect first; mutating self across the await would
+        // require a split borrow.
+        let due: Vec<u32> = self
+            .interfaces
+            .iter()
+            .filter_map(|(ifindex, entry)| {
+                if !matches!(entry.state, WifiState::Connected { .. }) {
+                    return None;
+                }
+                let last = self.last_signal_poll.get(ifindex).copied();
+                match last {
+                    None => Some(*ifindex),
+                    Some(t) if now.duration_since(t) >= interval => Some(*ifindex),
+                    _ => None,
+                }
+            })
+            .collect();
+        for ifindex in due {
+            match self.supplicant.signal_info(ifindex).await {
+                Ok(info) => {
+                    self.last_signal_poll.insert(ifindex, now);
+                    let _ = self.event_tx.send(NexusEvent::WifiSignalPoll {
+                        ifindex,
+                        rssi: info.rssi_dbm,
+                        frequency: info.frequency,
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!(ifindex, error = %e, "signal_info failed");
+                }
+            }
         }
     }
 
@@ -356,10 +423,28 @@ impl WifiBackend {
                 self.schedulers.remove(&ifindex);
                 self.cache.clear(ifindex);
                 self.active_handle.remove(&ifindex);
+                self.last_signal_poll.remove(&ifindex);
                 if self.supplicant_up {
                     let _ = self.supplicant.detach(ifindex).await;
                 }
             }
+            // Profile added / removed / updated in the store — the
+            // profile store broadcasts this on every successful
+            // `put_wifi` / `remove_wifi`. Reload our in-memory cache
+            // so `operator_connect` and the automatic selector see
+            // the latest set without a daemon restart.
+            NexusEvent::ProfileChanged {
+                kind: nexus_core::ProfileKind::Wifi,
+                ..
+            } => match self.profile_store.load_wifi().await {
+                Ok(new_profiles) => {
+                    tracing::debug!(count = new_profiles.len(), "wifi profile cache reloaded");
+                    self.profiles = new_profiles;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "wifi profile reload failed");
+                }
+            },
             _ => {}
         }
         Ok(())
@@ -518,9 +603,20 @@ impl WifiBackend {
                 if was_connected {
                     self.emit_link_lost(ifindex, reason_label(&reason));
                 }
+                // Look up the security tag from the profile that
+                // was active at connect time — if we still have a
+                // handle on it. Falls back to "unknown" only on a
+                // truly-orphan disconnect (no prior connect, or
+                // profile was removed mid-session).
+                let security = self
+                    .active_handle
+                    .get(&ifindex)
+                    .and_then(|(id, _)| self.profiles.iter().find(|p| p.id == *id))
+                    .map(|p| security_tag(&p.network.security))
+                    .unwrap_or("unknown");
                 m::record_connect(
                     &ifname,
-                    "unknown",
+                    security,
                     match reason {
                         DisconnectHint::BadCredentials => m::connect_outcome::CREDENTIALS_INVALID,
                         DisconnectHint::AssociationTimeout => m::connect_outcome::ASSOC_TIMEOUT,

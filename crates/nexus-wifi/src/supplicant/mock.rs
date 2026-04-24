@@ -335,6 +335,7 @@ mod tests {
             bssid_preferred: None,
             bssid_blacklist: vec![],
             scan_freqs: vec![],
+            fast_transition: false,
         }
     }
 

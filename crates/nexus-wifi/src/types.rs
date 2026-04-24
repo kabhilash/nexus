@@ -63,6 +63,13 @@ pub struct NetworkConfig {
     pub bssid_preferred: Option<MacAddr>,
     pub bssid_blacklist: Vec<MacAddr>,
     pub scan_freqs: Vec<u32>,
+    /// 802.11r Fast Transition. When the profile requests FT and
+    /// the supplicant / AP both support it, roams skip the full
+    /// handshake. Propagated into wpa_supplicant's `key_mgmt` as
+    /// `FT-PSK` / `FT-SAE` / `FT-EAP` in addition to the base
+    /// variant; the supplicant auto-selects at runtime based on
+    /// advertised RSN capabilities (DD-003 §7.4).
+    pub fast_transition: bool,
 }
 
 /// Opaque supplicant-side network identifier. DD-003 §4.1 requires

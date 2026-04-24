@@ -2,17 +2,49 @@
 //!
 //! This crate owns the per-interface Wi-Fi lifecycle: scan
 //! scheduling, profile matching, connection flow, retry/blacklist,
-//! roaming, and supplicant crash recovery. IP-layer configuration
-//! is systemd-networkd's responsibility and lives outside Nexus.
+//! roaming, signal polling, and supplicant crash recovery. IP-layer
+//! configuration is systemd-networkd's responsibility and lives
+//! outside Nexus.
 //!
 //! The public entry point is [`spawn_wifi_backend`]. Callers wire
 //! up the `NexusEvent` bus, a supplicant implementation (typically
 //! [`supplicant::MockSupplicant`] in tests or the
-//! `wpa_supplicant`-backed real one in production), and a
-//! [`ProfileStore`]. The backend
-//! drains events on its own task; the returned
-//! [`WifiBackendHandle`] exposes power-state mutation and the
-//! shutdown token.
+//! `wpa_supplicant`-backed real one in production), a
+//! [`ProfileStore`], and the receive side of a
+//! [`WifiCommand`] channel that bridges operator actions from the
+//! D-Bus surface. The backend drains events on its own task; the
+//! returned [`WifiBackendHandle`] exposes power-state mutation and
+//! the shutdown token.
+//!
+//! # What's done today (per DD-003 phases)
+//!
+//! | Phase | Status |
+//! |-------|--------|
+//! | 1 Skeleton + Lifecycle       | ✅ |
+//! | 2 Supplicant trait + Mock    | ✅ |
+//! | 3 Profile store + matching   | ✅ (w/ hot reload via `ProfileChanged`) |
+//! | 4 wpa_supplicant backend     | ✅ all 7 security modes + PMF (§8.2) + FT (§7.4) |
+//! | 5 Scanning                   | ✅ scheduler + SSIDs/Channels narrowing |
+//! | 6 Connect + failure handling | ✅ retry, blacklist, credentials-invalid |
+//! | 7 Roaming                    | ✅ modes off/supplicant/nexus + hysteresis + signal-poll |
+//! | 8 Supplicant crash recovery  | ✅ NameOwnerChanged → re-attach + rescan |
+//! | 9 Power management           | ✅ scan cadence per PowerState; Sleep → pause |
+//! | 10 iwd backend               | ⏳ placeholder module; out of scope for v0.x |
+//! | 11 Metrics + integration     | ✅ metric coverage; hwsim harness needs CI kernel |
+//!
+//! # Known residuals (Tier 3+ gap review, post-0.x)
+//!
+//! - `WifiBackendOps::wifi_set_powered` is still pass-through to
+//!   `NoopOps`. Power-state control needs rtnl / rfkill plumbing
+//!   that lives outside this crate.
+//! - The iwd backend (`supplicant::iwd`) remains an empty
+//!   placeholder — no production path exercises it today, and the
+//!   wpa_supplicant backend covers every platform we currently
+//!   target.
+//! - Integration testing against mac80211_hwsim + hostapd (DD-003
+//!   §14.2) is gated by the `integration-linux` Cargo feature;
+//!   the harness itself still needs to be written when a
+//!   kernel-module-capable CI runner becomes available.
 
 use std::sync::Arc;
 

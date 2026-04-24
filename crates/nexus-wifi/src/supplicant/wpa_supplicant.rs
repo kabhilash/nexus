@@ -160,7 +160,11 @@ trait Bss {
 pub(crate) struct OwnedNetworkArgs {
     pub ssid: Vec<u8>,
     pub scan_ssid: Option<u32>,
-    pub key_mgmt: &'static str,
+    /// Space-separated list of key-management strings. Starts life
+    /// as one of the DD-003 §8.1 base modes (`WPA-PSK`, `SAE`, …);
+    /// [`apply_fast_transition`] prepends the matching `FT-*`
+    /// variants when the profile has `fast_transition = true`.
+    pub key_mgmt: String,
     pub psk: Option<String>,
     pub sae_password: Option<String>,
     pub eap: Option<&'static str>,
@@ -191,21 +195,21 @@ pub(crate) fn build_wpa_network_args(
     let mut out = OwnedNetworkArgs {
         ssid: config.ssid.as_bytes().to_vec(),
         scan_ssid: if config.hidden { Some(1) } else { None },
-        key_mgmt: "NONE",
+        key_mgmt: "NONE".to_owned(),
         priority: config.priority,
         ..Default::default()
     };
     match &config.security {
         SecurityConfig::Open => {
-            out.key_mgmt = "NONE";
+            out.key_mgmt = "NONE".to_owned();
             out.ieee80211w = 0;
         }
         SecurityConfig::Owe => {
-            out.key_mgmt = "OWE";
+            out.key_mgmt = "OWE".to_owned();
             out.ieee80211w = 2;
         }
         SecurityConfig::Wpa2Personal { psk } => {
-            out.key_mgmt = "WPA-PSK";
+            out.key_mgmt = "WPA-PSK".to_owned();
             out.psk = Some(match psk {
                 WpaPsk::Passphrase(p) => p.expose_secret().to_owned(),
                 // wpa_supplicant accepts a 64-char hex string as a
@@ -215,7 +219,7 @@ pub(crate) fn build_wpa_network_args(
             out.ieee80211w = 1;
         }
         SecurityConfig::Wpa3Personal { passphrase } => {
-            out.key_mgmt = "SAE";
+            out.key_mgmt = "SAE".to_owned();
             out.sae_password = Some(passphrase.expose_secret().to_owned());
             out.ieee80211w = 2;
         }
@@ -223,21 +227,25 @@ pub(crate) fn build_wpa_network_args(
             // Transition mode: offer both key-managements. A single
             // passphrase covers both flavours.
             let p = passphrase.expose_secret().to_owned();
-            out.key_mgmt = "WPA-PSK SAE";
+            out.key_mgmt = "WPA-PSK SAE".to_owned();
             out.psk = Some(p.clone());
             out.sae_password = Some(p);
             out.ieee80211w = 2;
         }
         SecurityConfig::Wpa2Enterprise(eap) => {
-            out.key_mgmt = "WPA-EAP";
+            out.key_mgmt = "WPA-EAP".to_owned();
             apply_eap(&mut out, eap);
             out.ieee80211w = 1;
         }
         SecurityConfig::Wpa3Enterprise(eap) => {
-            out.key_mgmt = "WPA-EAP-SHA256";
+            out.key_mgmt = "WPA-EAP-SHA256".to_owned();
             apply_eap(&mut out, eap);
             out.ieee80211w = 2;
         }
+    }
+
+    if config.fast_transition {
+        apply_fast_transition(&mut out);
     }
 
     if let Some(bssid) = &config.bssid_preferred {
@@ -254,6 +262,29 @@ pub(crate) fn build_wpa_network_args(
         );
     }
     Ok(out)
+}
+
+/// Prepend 802.11r Fast Transition variants to the key_mgmt list
+/// based on the base mode. wpa_supplicant parses the space-
+/// separated string and picks whichever variant matches the AP's
+/// advertised RSN caps at association time — so "FT-PSK WPA-PSK"
+/// gives us fast-roam when the AP supports it and plain PSK when
+/// it doesn't. DD-003 §7.4.
+///
+/// Open / OWE have no FT flavour and are left alone; a profile
+/// setting `fast_transition = true` on those modes is a no-op.
+fn apply_fast_transition(out: &mut OwnedNetworkArgs) {
+    let ft_prefix = match out.key_mgmt.as_str() {
+        // Transition-mode PSK+SAE gets both FT variants.
+        "WPA-PSK SAE" => "FT-PSK FT-SAE",
+        "WPA-PSK" => "FT-PSK",
+        "SAE" => "FT-SAE",
+        "WPA-EAP" | "WPA-EAP-SHA256" => "FT-EAP",
+        // Open, OWE, or any future mode without a defined FT
+        // counterpart — leave the list untouched.
+        _ => return,
+    };
+    out.key_mgmt = format!("{ft_prefix} {}", out.key_mgmt);
 }
 
 /// Flatten EAP credentials into the owned-args struct. Every field
@@ -315,7 +346,7 @@ fn wpa_network_dict<'a>(args: &'a OwnedNetworkArgs) -> HashMap<&'a str, Value<'a
     if let Some(s) = args.scan_ssid {
         m.insert("scan_ssid", Value::from(s));
     }
-    m.insert("key_mgmt", Value::from(args.key_mgmt));
+    m.insert("key_mgmt", Value::from(args.key_mgmt.as_str()));
     if let Some(p) = &args.psk {
         m.insert("psk", Value::from(p.as_str()));
     }
@@ -569,13 +600,29 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
             .build()
             .await
             .map_err(zbus_err)?;
-        // Required: `Type`. Optional: `SSIDs` (aay), `Channels` (a(uu)).
-        // We pass only Type for now — broadcast active/passive scan.
-        // Per-SSID and per-channel narrowing lands with the connect
-        // flow where targeted probes pay off.
+        // Required: `Type`. Optional: `SSIDs` (aay), `Channels`
+        // (a(uu), pairs of `(frequency_hz, width_mhz)` — we send the
+        // width as 0 to mean "let the driver pick", which matches
+        // how nmcli's directed scans behave).
         let type_str = if params.active { "active" } else { "passive" };
+        // Hold ownership of everything Value<'_> borrows from for
+        // the duration of the call.
+        let ssids_owned: Vec<Vec<u8>> =
+            params.ssids.iter().map(|s| s.as_bytes().to_vec()).collect();
+        let channels_owned: Vec<(u32, u32)> =
+            params.frequencies.iter().map(|f| (*f, 0u32)).collect();
         let mut args: HashMap<&str, Value<'_>> = HashMap::new();
         args.insert("Type", Value::from(type_str));
+        if !ssids_owned.is_empty() {
+            // aay — each SSID is itself an array of bytes.
+            let arr = zbus::zvariant::Array::from(&ssids_owned[..]);
+            args.insert("SSIDs", Value::Array(arr));
+        }
+        if !channels_owned.is_empty() {
+            // a(uu) — one (freq, width) tuple per requested channel.
+            let arr = zbus::zvariant::Array::from(&channels_owned[..]);
+            args.insert("Channels", Value::Array(arr));
+        }
         iface.scan(args).await.map_err(zbus_err)?;
         Ok(())
     }
@@ -771,7 +818,19 @@ fn spawn_scan_watcher(
                 return;
             }
         };
-        while let Some(_sig) = stream.next().await {
+        while let Some(sig) = stream.next().await {
+            // `ScanDone(success=false)` means the scan was started
+            // but no new results were written to the BSS cache —
+            // driver busy, radar-induced NOP, concurrent scan
+            // conflict, etc. We still forward `ScanComplete` so
+            // the scheduler's post-scan hook runs, but log the
+            // failure at debug so repeated driver problems are
+            // visible in steady-state traces.
+            if let Ok(args) = sig.args() {
+                if !args.success {
+                    tracing::debug!(ifindex, "wpa_supplicant: ScanDone success=false");
+                }
+            }
             let _ = event_tx.send(SupplicantEvent::ScanComplete { ifindex });
         }
     })
@@ -1169,6 +1228,7 @@ mod tests {
             bssid_preferred: None,
             bssid_blacklist: Vec::new(),
             scan_freqs: Vec::new(),
+            fast_transition: false,
         }
     }
 
@@ -1301,6 +1361,74 @@ mod tests {
         let a = build_wpa_network_args(&c).unwrap();
         assert_eq!(a.key_mgmt, "WPA-EAP-SHA256");
         assert_eq!(a.ieee80211w, 2);
+    }
+
+    #[test]
+    fn builder_fast_transition_prepends_ft_psk() {
+        use nexus_profile_store::{SecurityConfig, WpaPsk};
+        let mut c = mk_network_config(
+            b"home",
+            SecurityConfig::Wpa2Personal {
+                psk: WpaPsk::Passphrase(crate::secretstring("pw")),
+            },
+        );
+        c.fast_transition = true;
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "FT-PSK WPA-PSK");
+    }
+
+    #[test]
+    fn builder_fast_transition_prepends_ft_sae() {
+        use nexus_profile_store::SecurityConfig;
+        let mut c = mk_network_config(
+            b"home3",
+            SecurityConfig::Wpa3Personal {
+                passphrase: crate::secretstring("pw"),
+            },
+        );
+        c.fast_transition = true;
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "FT-SAE SAE");
+    }
+
+    #[test]
+    fn builder_fast_transition_prepends_ft_eap_for_both_enterprise_flavours() {
+        use nexus_profile_store::SecurityConfig;
+        let mut c = mk_network_config(b"corp2", SecurityConfig::Wpa2Enterprise(mk_eap()));
+        c.fast_transition = true;
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "FT-EAP WPA-EAP");
+
+        let mut c3 = mk_network_config(b"corp3", SecurityConfig::Wpa3Enterprise(mk_eap()));
+        c3.fast_transition = true;
+        let a3 = build_wpa_network_args(&c3).unwrap();
+        assert_eq!(a3.key_mgmt, "FT-EAP WPA-EAP-SHA256");
+    }
+
+    #[test]
+    fn builder_fast_transition_on_open_and_owe_is_noop() {
+        use nexus_profile_store::SecurityConfig;
+        let mut open = mk_network_config(b"open", SecurityConfig::Open);
+        open.fast_transition = true;
+        assert_eq!(build_wpa_network_args(&open).unwrap().key_mgmt, "NONE");
+
+        let mut owe = mk_network_config(b"owe", SecurityConfig::Owe);
+        owe.fast_transition = true;
+        assert_eq!(build_wpa_network_args(&owe).unwrap().key_mgmt, "OWE");
+    }
+
+    #[test]
+    fn builder_transition_mode_with_ft_adds_both_ft_variants() {
+        use nexus_profile_store::SecurityConfig;
+        let mut c = mk_network_config(
+            b"mixed",
+            SecurityConfig::Wpa2Wpa3Personal {
+                passphrase: crate::secretstring("shared"),
+            },
+        );
+        c.fast_transition = true;
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "FT-PSK FT-SAE WPA-PSK SAE");
     }
 
     #[test]

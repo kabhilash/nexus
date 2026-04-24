@@ -35,6 +35,7 @@ pub fn to_network_config(profile: &WifiProfile) -> NetworkConfig {
         bssid_preferred: profile.network.bssid_preferred,
         bssid_blacklist: profile.network.bssid_blacklist.clone(),
         scan_freqs: profile.network.scan_freqs.clone(),
+        fast_transition: profile.network.fast_transition,
     }
 }
 

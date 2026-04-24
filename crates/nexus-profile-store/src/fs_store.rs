@@ -127,6 +127,20 @@ impl ProfileFileStore {
         self
     }
 
+    /// Fire a [`NexusEvent::ProfileChanged`] on successful put/remove
+    /// so consumers (notably the Wi-Fi and Ethernet backends, which
+    /// cache profile sets in memory) know to refresh. Silently
+    /// no-ops when no bus was attached — tests that don't care don't
+    /// need to plumb through a broadcast channel.
+    fn emit_profile_changed(&self, kind: ProfileKind, key: &str) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(NexusEvent::ProfileChanged {
+                kind,
+                key: key.to_owned(),
+            });
+        }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -230,11 +244,18 @@ impl ProfileStore for ProfileFileStore {
         let path = self.ethernet_path(&profile.interface.name);
         let result = write_atomic_toml(&path, &on_disk);
         record_write_outcome(ProfileKind::Ethernet, &result, started);
+        if result.is_ok() {
+            self.emit_profile_changed(ProfileKind::Ethernet, &profile.interface.name);
+        }
         result
     }
 
     async fn remove_ethernet(&self, ifname: &str) -> Result<()> {
-        remove_if_present(&self.ethernet_path(ifname))
+        let result = remove_if_present(&self.ethernet_path(ifname));
+        if result.is_ok() {
+            self.emit_profile_changed(ProfileKind::Ethernet, ifname);
+        }
+        result
     }
 
     async fn load_wifi(&self) -> Result<Vec<WifiProfile>> {
@@ -272,11 +293,18 @@ impl ProfileStore for ProfileFileStore {
         let path = self.wifi_path(&hash);
         let result = write_atomic_toml(&path, &on_disk);
         record_write_outcome(ProfileKind::Wifi, &result, started);
+        if result.is_ok() {
+            self.emit_profile_changed(ProfileKind::Wifi, &hash);
+        }
         result
     }
 
     async fn remove_wifi(&self, ssid_hash: &str) -> Result<()> {
-        remove_if_present(&self.wifi_path(ssid_hash))
+        let result = remove_if_present(&self.wifi_path(ssid_hash));
+        if result.is_ok() {
+            self.emit_profile_changed(ProfileKind::Wifi, ssid_hash);
+        }
+        result
     }
 
     async fn load_gnss(&self) -> Result<Vec<GnssDeviceProfile>> {
