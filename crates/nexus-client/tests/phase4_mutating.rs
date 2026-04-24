@@ -355,7 +355,16 @@ async fn wifi_connect_with_new_profile_creates_and_connects() {
 }
 
 #[tokio::test]
-async fn wifi_connect_without_psk_and_no_profile_is_not_found() {
+async fn wifi_connect_without_psk_and_no_profile_escalates_to_not_interactive() {
+    // Phase 5: the no-PSK, no-existing-profile path now drops into
+    // the DD-008 §6.2 interactive passphrase flow. Under `cargo
+    // test` stdin is not a TTY, so `resolve_psk` fails with
+    // `NotInteractive` (exit 5) — the correct behaviour for a
+    // script that hasn't supplied `--psk` / `NEXUSCTL_PSK`.
+    // Ensure NEXUSCTL_PSK isn't set from a previous test.
+    unsafe {
+        std::env::remove_var("NEXUSCTL_PSK");
+    }
     let mut rec = Recorder::default();
     rec.wifi_list = vec![iface_row("wlan0", "wifi")];
     let rec = Arc::new(rec);
@@ -374,7 +383,49 @@ async fn wifi_connect_without_psk_and_no_profile_is_not_found() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, NexusctlError::NotFound { .. }));
+    assert!(
+        matches!(err, NexusctlError::NotInteractive { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 5);
+}
+
+#[tokio::test]
+async fn wifi_connect_without_psk_uses_nexusctl_psk_env() {
+    // With NEXUSCTL_PSK in the env, the interactive prompt is
+    // skipped and the passphrase flow returns the env value.
+    unsafe {
+        std::env::set_var("NEXUSCTL_PSK", "env-secret");
+    }
+    let mut rec = Recorder::default();
+    rec.wifi_list = vec![iface_row("wlan0", "wifi")];
+    let rec = Arc::new(rec);
+    let mut stderr = Vec::new();
+    let mut stdout = Vec::new();
+    let res = commands::wifi::connect(
+        rec.as_ref(),
+        "home",
+        None,
+        None,
+        true,
+        &mut stderr,
+        OutputFormat::Human,
+        &RenderContext::default(),
+        &mut stdout,
+    )
+    .await;
+    unsafe {
+        std::env::remove_var("NEXUSCTL_PSK");
+    }
+    res.unwrap();
+    // find_wifi_profile (miss) → add_wifi_profile → wifi_connect_profile.
+    let calls = rec.calls();
+    assert!(calls.iter().any(|c| matches!(c, Call::AddWifi(_))));
+    assert!(
+        calls
+            .iter()
+            .any(|c| matches!(c, Call::WifiConnectProfile { .. }))
+    );
 }
 
 #[tokio::test]

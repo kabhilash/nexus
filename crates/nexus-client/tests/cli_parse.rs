@@ -47,6 +47,21 @@ fn iface_list_accepts_kind_filter() {
 }
 
 #[test]
+fn bt_pair_parses_with_default_timeout() {
+    use nexus_client::cli::BtSub;
+    let cli = parse(&["bt", "pair", "AA:BB:CC:DD:EE:01"]).unwrap();
+    match cli.command {
+        Some(Command::Bt {
+            sub: BtSub::Pair { address, timeout },
+        }) => {
+            assert_eq!(address, "AA:BB:CC:DD:EE:01");
+            assert_eq!(timeout, 90);
+        }
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
 fn bt_list_paired_connected_conflict() {
     assert_eq!(
         parse(&["bt", "list", "--paired", "--connected"])

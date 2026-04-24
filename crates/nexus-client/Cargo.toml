@@ -9,6 +9,13 @@ license.workspace = true
 # packageable independently of the backend crates. Nothing in this
 # manifest depends on `nexus-*` workspace crates.
 
+[features]
+default = []
+# Opt-in for integration tests that drive `MockPrompt` and the
+# `MockEventSource` from outside the crate. Production builds leave
+# the mocks out of the link.
+interactive-flows-testing = []
+
 [[bin]]
 name = "nexusctl"
 path = "src/main.rs"
@@ -22,6 +29,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 clap = { version = "4", features = ["derive", "wrap_help"] }
 comfy-table = "7"
+dialoguer = { version = "0.11", default-features = false, features = ["password"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

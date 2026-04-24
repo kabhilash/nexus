@@ -310,6 +310,14 @@ pub enum BtSub {
         address: String,
         state: OnOff,
     },
+    /// Interactive pairing. DD-008 §6.1.
+    Pair {
+        address: String,
+        /// Override `bluetooth.agent_response_timeout_s` for this
+        /// invocation.
+        #[arg(long, default_value_t = 90)]
+        timeout: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

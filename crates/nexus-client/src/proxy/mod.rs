@@ -557,4 +557,26 @@ pub trait ManagerOps: Send + Sync {
             detail: "reload_config".into(),
         })
     }
+
+    // ---- Interactive: pairing (DD-008 §6.1) ----
+
+    /// Kick off a pairing session. Returns the event stream, the
+    /// answer-sink, and the job id. The production zbus impl is
+    /// stubbed until Phase 7.6 lands signal subscription;
+    /// Phase 5's `bt pair` command runs against test stubs today
+    /// and fails with `Unsupported` against a real daemon.
+    async fn start_pairing(&self, _address: &str) -> Result<PairingSession, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "start_pairing: awaiting Phase 7.6 signal subscription".into(),
+        })
+    }
+}
+
+/// Bundle returned by [`ManagerOps::start_pairing`]. The
+/// `commands::bt_mutating::pair` handler plugs these three pieces
+/// into a [`crate::interactive::pairing::PairingFlow`].
+pub struct PairingSession {
+    pub events: Box<dyn crate::interactive::pairing::PairingEventSource>,
+    pub sink: std::sync::Arc<dyn crate::interactive::pairing::AnswerSink>,
+    pub job_id: String,
 }

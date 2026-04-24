@@ -130,6 +130,74 @@ pub async fn trust(
     .map_err(io_err)
 }
 
+/// Interactive pairing. DD-008 §6.1.
+///
+/// Thin glue around [`crate::interactive::pairing::PairingFlow`]:
+/// the handler asks the ops layer for a [`crate::proxy::PairingSession`],
+/// constructs a `TerminalPrompt`, runs the flow, and renders the
+/// outcome.
+pub async fn pair<P>(
+    ops: &dyn crate::proxy::ManagerOps,
+    address: &str,
+    timeout: std::time::Duration,
+    prompt: P,
+    format: OutputFormat,
+    ctx: &RenderContext,
+    w: &mut dyn Write,
+) -> Result<(), NexusctlError>
+where
+    P: crate::interactive::pairing::Prompt + 'static,
+{
+    let session = ops.start_pairing(address).await?;
+    let config = crate::interactive::pairing::PairingFlowConfig {
+        overall_timeout: timeout,
+        cancel_grace: std::time::Duration::from_secs(2),
+    };
+    let flow =
+        crate::interactive::pairing::PairingFlow::new(prompt, session.events, session.sink, config);
+    let outcome = flow.run().await;
+    let outcome_str = match &outcome {
+        crate::interactive::pairing::PairingOutcome::Paired => "paired",
+        crate::interactive::pairing::PairingOutcome::Rejected { .. } => "rejected",
+        crate::interactive::pairing::PairingOutcome::Cancelled => "cancelled",
+        crate::interactive::pairing::PairingOutcome::TimedOut => "timed_out",
+        crate::interactive::pairing::PairingOutcome::Failed { .. } => "failed",
+    };
+    render(
+        &MutationOutcome {
+            action: "bt pair".into(),
+            subject: address.to_owned(),
+            id: Some(session.job_id),
+            note: Some(outcome_str.into()),
+        },
+        format,
+        ctx,
+        w,
+    )
+    .map_err(io_err)?;
+    // Translate non-success outcomes into the DD-008 §4.3 exit
+    // codes by returning a NexusctlError whose exit_code matches.
+    match outcome {
+        crate::interactive::pairing::PairingOutcome::Paired => Ok(()),
+        crate::interactive::pairing::PairingOutcome::Cancelled => {
+            Err(NexusctlError::Other {
+                // Sentinel empty message → main prints nothing, exit 130.
+                // We hand-roll the 130 by matching on the outcome at
+                // the binary edge (see main.rs).
+                raw: "__CANCELLED__".into(),
+            })
+        }
+        crate::interactive::pairing::PairingOutcome::TimedOut => Err(NexusctlError::Timeout {
+            operation: format!("pair {address}"),
+            duration_s: Some(timeout.as_secs()),
+        }),
+        crate::interactive::pairing::PairingOutcome::Rejected { reason }
+        | crate::interactive::pairing::PairingOutcome::Failed { reason } => {
+            Err(NexusctlError::Other { raw: reason })
+        }
+    }
+}
+
 fn io_err(e: std::io::Error) -> NexusctlError {
     if e.kind() == std::io::ErrorKind::BrokenPipe {
         return NexusctlError::Other { raw: String::new() };

@@ -24,6 +24,7 @@ pub mod commands;
 pub mod dispatch;
 pub mod errors;
 pub mod errors_map;
+pub mod interactive;
 pub mod output;
 pub mod path_resolve;
 pub mod proxy;

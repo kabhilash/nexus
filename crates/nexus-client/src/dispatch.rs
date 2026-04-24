@@ -120,6 +120,18 @@ pub async fn dispatch(
                 commands::bt_mutating::trust(ops, address, state.as_bool(), format, &ctx, stdout)
                     .await
             }
+            BtSub::Pair { address, timeout } => {
+                commands::bt_mutating::pair(
+                    ops,
+                    address,
+                    std::time::Duration::from_secs(*timeout),
+                    crate::interactive::terminal_prompt::TerminalPrompt::new(),
+                    format,
+                    &ctx,
+                    stdout,
+                )
+                .await
+            }
         },
 
         Some(Command::Gnss { sub }) => match sub {

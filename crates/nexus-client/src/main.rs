@@ -56,6 +56,16 @@ fn finish(result: Result<(), NexusctlError>, format: OutputFormat) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
+            // `__CANCELLED__` is the sentinel the pairing flow
+            // uses to ask for exit 130 (standard SIGINT code) with
+            // no extra stderr noise. DD-008 §6.4 spells this code
+            // out; the pairing handler writes the "pairing
+            // cancelled" line via its own prompt impl.
+            if let NexusctlError::Other { raw } = &err {
+                if raw == "__CANCELLED__" {
+                    return ExitCode::from(130u8);
+                }
+            }
             report_error(&err, format);
             ExitCode::from(err.exit_code() as u8)
         }

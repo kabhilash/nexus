@@ -69,16 +69,16 @@ pub async fn connect(
     let profile_path = match ops.find_wifi_profile(ssid.as_bytes()).await {
         Ok(p) => p,
         Err(NexusctlError::NotFound { .. }) => {
-            // Create one on the fly if we have a PSK.
-            let Some(psk_val) = psk else {
-                return Err(NexusctlError::NotFound {
-                    reference: format!("no profile for SSID `{ssid}`; pass --psk to create one"),
-                });
-            };
+            // No stored profile — resolve a PSK: `--psk`, then
+            // `NEXUSCTL_PSK`, then an interactive TTY prompt. The
+            // interactive fallback lives in
+            // `crate::interactive::passphrase`; it returns
+            // `NotInteractive` (exit 5) when stdin isn't a TTY.
+            let resolved = crate::interactive::passphrase::resolve_psk(psk).await?;
             let settings = WifiProfileSettings {
                 ssid: ssid.as_bytes().to_vec(),
                 security_type: "wpa2_personal".into(),
-                passphrase: Some(psk_val.to_owned()),
+                passphrase: Some(resolved),
                 label: None,
                 priority: None,
                 auto_connect: Some(true),
