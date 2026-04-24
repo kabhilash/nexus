@@ -1,6 +1,8 @@
 //! wpa_supplicant-backed [`WifiSupplicantBackend`]. See DD-003 §9.
 //!
-//! What's wired today (runs against a live `fi.w1.wpa_supplicant1`):
+//! Every [`WifiSupplicantBackend`] method runs against a live
+//! `fi.w1.wpa_supplicant1` today — no method returns a `not wired`
+//! stub any more:
 //!
 //! - Construction opens a system-bus connection and spawns a
 //!   `NameOwnerChanged` watcher so daemon appearance / disappearance
@@ -20,12 +22,21 @@
 //!   [`BssInfo`] for every BSS whose SSID is non-empty (hidden APs
 //!   report empty SSID in probe responses and are filtered out —
 //!   connecting to them is a profile-driven flow, not a scan one).
-//!
-//! The per-network mutating methods (`connect`, `disconnect`,
-//! `roam`, `signal_info`) still return [`WifiError::Supplicant`] —
-//! they need the security-mode dict builder per DD-003 §9.4 and the
-//! hwsim harness from §14.2 to cover the handshake states. They stay
-//! stubs until that harness lands.
+//! - [`connect`] translates the profile's `SecurityConfig` into
+//!   wpa_supplicant network-dict arguments (see
+//!   [`build_wpa_network_args`] and DD-003 §9.4), calls
+//!   `AddNetwork` + `SelectNetwork`, and returns the new network's
+//!   object path as the opaque [`NetworkHandle`]. Covers every
+//!   variant from DD-003 §8.1 — Open, OWE, WPA2-Personal
+//!   (passphrase + raw PMK), WPA3-Personal, WPA2/WPA3 transition,
+//!   WPA2-Enterprise, WPA3-Enterprise — plus PMF gating per §8.2.
+//! - [`disconnect`] / [`forget_network`] / [`roam`] / [`signal_info`]
+//!   all talk to the matching `Interface1` method. `roam` accepts
+//!   both auto (→ `Reassociate`) and targeted-BSSID (→ `Roam`).
+//! - The state watcher resolves `completed` via `CurrentBSS` reads
+//!   into [`SupplicantState::Connected { bssid, ssid, frequency }`].
+//! - Disconnect reason codes map to the coarse
+//!   [`DisconnectHint`](super::DisconnectHint) per DD-003 §9.6.
 
 use std::collections::HashMap;
 
@@ -64,12 +75,46 @@ trait WpaSupplicant {
 )]
 trait WpaInterface {
     fn scan(&self, args: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
+    fn add_network(&self, args: HashMap<&str, Value<'_>>) -> zbus::Result<OwnedObjectPath>;
+    fn select_network(&self, network: &OwnedObjectPath) -> zbus::Result<()>;
+    fn remove_network(&self, network: &OwnedObjectPath) -> zbus::Result<()>;
+    fn disconnect(&self) -> zbus::Result<()>;
+    fn reassociate(&self) -> zbus::Result<()>;
+    /// `Roam(address: s)`. Targeted roam; the argument is a BSSID
+    /// formatted as `aa:bb:cc:dd:ee:ff`. Only honored when
+    /// wpa_supplicant's config sets `p2p_no_group_iface` off or
+    /// when the device supports directed roaming — failures come
+    /// back as a `MethodError`.
+    fn roam(&self, address: &str) -> zbus::Result<()>;
+    /// `SignalPoll() -> a{sv}`. Returns a dict with keys
+    /// `rssi` (i32), `linkspeed` (i32, Mbps), `noise` (i32, dBm),
+    /// `frequency` (u32, MHz). Not every driver populates every
+    /// field.
+    fn signal_poll(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
 
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
 
     #[zbus(property, name = "BSSs")]
     fn bsss(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+
+    /// The BSS the interface is currently associated with. When
+    /// `State` is anything other than `completed` / `associated` /
+    /// `4way_handshake` / `group_handshake`, this returns `/`
+    /// (the root path) — callers should treat that as "no BSS."
+    #[zbus(property, name = "CurrentBSS")]
+    fn current_bss(&self) -> zbus::Result<OwnedObjectPath>;
+
+    /// Path of the network the interface most recently attempted
+    /// to associate with. Used by the state watcher to resolve the
+    /// `NetworkHandle` when `State` reaches `completed`.
+    #[zbus(property)]
+    fn current_network(&self) -> zbus::Result<OwnedObjectPath>;
+
+    /// The 802.11 reason code from the last disconnect. Positive
+    /// values are AP-initiated, negative are supplicant-initiated.
+    #[zbus(property)]
+    fn disconnect_reason(&self) -> zbus::Result<i32>;
 
     #[zbus(signal)]
     fn scan_done(&self, success: bool) -> zbus::Result<()>;
@@ -102,6 +147,220 @@ trait Bss {
 
     #[zbus(property, name = "RSN")]
     fn rsn(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
+}
+
+// ---- network-dict builder (DD-003 §9.4) ---------------------------------
+
+/// Concrete owned values that go into the wpa_supplicant network
+/// dict. We build these ahead of time so the `Value<'_>` fed into
+/// `AddNetwork` can borrow from owned storage that outlives the call
+/// — zbus's `Value` is a short-lived borrow over bytes, so the
+/// stable storage has to sit somewhere.
+#[derive(Debug, Default)]
+pub(crate) struct OwnedNetworkArgs {
+    pub ssid: Vec<u8>,
+    pub scan_ssid: Option<u32>,
+    pub key_mgmt: &'static str,
+    pub psk: Option<String>,
+    pub sae_password: Option<String>,
+    pub eap: Option<&'static str>,
+    pub identity: Option<String>,
+    pub anonymous_identity: Option<String>,
+    pub ca_cert: Option<String>,
+    pub client_cert: Option<String>,
+    pub private_key: Option<String>,
+    pub private_key_passwd: Option<String>,
+    pub password: Option<String>,
+    pub phase2: Option<String>,
+    pub domain_suffix_match: Option<String>,
+    pub ieee80211w: u32,
+    pub bssid: Option<String>,
+    pub bssid_blacklist: Option<String>,
+    pub priority: i32,
+}
+
+/// Translate a [`NetworkConfig`] into wpa_supplicant network-block
+/// arguments per DD-003 §9.4 / §8.1 / §8.2. Pure — every IO call
+/// sits in [`wpa_network_dict`], which builds the Value map used
+/// by [`AddNetwork`]. Split out so tests can exercise every
+/// security variant without a D-Bus connection.
+pub(crate) fn build_wpa_network_args(
+    config: &crate::types::NetworkConfig,
+) -> Result<OwnedNetworkArgs> {
+    use nexus_profile_store::{SecurityConfig, WpaPsk};
+    let mut out = OwnedNetworkArgs {
+        ssid: config.ssid.as_bytes().to_vec(),
+        scan_ssid: if config.hidden { Some(1) } else { None },
+        key_mgmt: "NONE",
+        priority: config.priority,
+        ..Default::default()
+    };
+    match &config.security {
+        SecurityConfig::Open => {
+            out.key_mgmt = "NONE";
+            out.ieee80211w = 0;
+        }
+        SecurityConfig::Owe => {
+            out.key_mgmt = "OWE";
+            out.ieee80211w = 2;
+        }
+        SecurityConfig::Wpa2Personal { psk } => {
+            out.key_mgmt = "WPA-PSK";
+            out.psk = Some(match psk {
+                WpaPsk::Passphrase(p) => p.expose_secret().to_owned(),
+                // wpa_supplicant accepts a 64-char hex string as a
+                // pre-computed PMK, in lieu of the passphrase.
+                WpaPsk::RawPsk(bytes) => hex_encode_psk(bytes),
+            });
+            out.ieee80211w = 1;
+        }
+        SecurityConfig::Wpa3Personal { passphrase } => {
+            out.key_mgmt = "SAE";
+            out.sae_password = Some(passphrase.expose_secret().to_owned());
+            out.ieee80211w = 2;
+        }
+        SecurityConfig::Wpa2Wpa3Personal { passphrase } => {
+            // Transition mode: offer both key-managements. A single
+            // passphrase covers both flavours.
+            let p = passphrase.expose_secret().to_owned();
+            out.key_mgmt = "WPA-PSK SAE";
+            out.psk = Some(p.clone());
+            out.sae_password = Some(p);
+            out.ieee80211w = 2;
+        }
+        SecurityConfig::Wpa2Enterprise(eap) => {
+            out.key_mgmt = "WPA-EAP";
+            apply_eap(&mut out, eap);
+            out.ieee80211w = 1;
+        }
+        SecurityConfig::Wpa3Enterprise(eap) => {
+            out.key_mgmt = "WPA-EAP-SHA256";
+            apply_eap(&mut out, eap);
+            out.ieee80211w = 2;
+        }
+    }
+
+    if let Some(bssid) = &config.bssid_preferred {
+        out.bssid = Some(format!("{bssid}"));
+    }
+    if !config.bssid_blacklist.is_empty() {
+        out.bssid_blacklist = Some(
+            config
+                .bssid_blacklist
+                .iter()
+                .map(|m| format!("{m}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    Ok(out)
+}
+
+/// Flatten EAP credentials into the owned-args struct. Every field
+/// is `Option` because the profile-store type itself makes them
+/// all optional (a TLS config without `password` is legal, a PEAP
+/// config without a CA cert isn't recommended but isn't rejected
+/// at the profile layer).
+fn apply_eap(out: &mut OwnedNetworkArgs, eap: &nexus_profile_store::Dot1xEapConfig) {
+    out.eap = Some(eap_method_wpa_name(eap.eap));
+    out.identity = Some(eap.identity.clone());
+    out.anonymous_identity = eap.anonymous_identity.clone();
+    out.ca_cert = eap.ca_cert.clone();
+    out.client_cert = eap.client_cert.clone();
+    out.private_key = eap.client_key.clone();
+    out.private_key_passwd = eap
+        .client_key_password
+        .as_ref()
+        .map(|p| p.expose_secret().to_owned());
+    out.password = eap.password.as_ref().map(|p| p.expose_secret().to_owned());
+    out.phase2 = eap.phase2.clone();
+    out.domain_suffix_match = eap.domain_suffix_match.clone();
+}
+
+/// Uppercase name wpa_supplicant expects for each
+/// [`nexus_profile_store::EapMethod`]. The `eap` network-block key
+/// accepts any of these.
+fn eap_method_wpa_name(m: nexus_profile_store::EapMethod) -> &'static str {
+    use nexus_profile_store::EapMethod;
+    match m {
+        EapMethod::Peap => "PEAP",
+        EapMethod::Ttls => "TTLS",
+        EapMethod::Tls => "TLS",
+        EapMethod::PwdMschapv2 => "PWD",
+        EapMethod::Leap => "LEAP",
+        EapMethod::Fast => "FAST",
+    }
+}
+
+/// Hex-encode a 32-byte raw PMK for the `psk` field.
+/// `hex::encode` would pull in another dep just for this one call;
+/// open-coded is cheaper.
+fn hex_encode_psk(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Build the `HashMap<&str, Value<'_>>` that wpa_supplicant's
+/// `AddNetwork` expects from an [`OwnedNetworkArgs`]. The `Value`
+/// entries borrow from `args`, so the returned map must not
+/// outlive it.
+fn wpa_network_dict<'a>(args: &'a OwnedNetworkArgs) -> HashMap<&'a str, Value<'a>> {
+    let mut m: HashMap<&str, Value<'_>> = HashMap::new();
+    m.insert("ssid", Value::from(args.ssid.as_slice()));
+    if let Some(s) = args.scan_ssid {
+        m.insert("scan_ssid", Value::from(s));
+    }
+    m.insert("key_mgmt", Value::from(args.key_mgmt));
+    if let Some(p) = &args.psk {
+        m.insert("psk", Value::from(p.as_str()));
+    }
+    if let Some(p) = &args.sae_password {
+        m.insert("sae_password", Value::from(p.as_str()));
+    }
+    if let Some(e) = args.eap {
+        m.insert("eap", Value::from(e));
+    }
+    if let Some(s) = &args.identity {
+        m.insert("identity", Value::from(s.as_str()));
+    }
+    if let Some(s) = &args.anonymous_identity {
+        m.insert("anonymous_identity", Value::from(s.as_str()));
+    }
+    if let Some(s) = &args.ca_cert {
+        m.insert("ca_cert", Value::from(s.as_str()));
+    }
+    if let Some(s) = &args.client_cert {
+        m.insert("client_cert", Value::from(s.as_str()));
+    }
+    if let Some(s) = &args.private_key {
+        m.insert("private_key", Value::from(s.as_str()));
+    }
+    if let Some(s) = &args.private_key_passwd {
+        m.insert("private_key_passwd", Value::from(s.as_str()));
+    }
+    if let Some(s) = &args.password {
+        m.insert("password", Value::from(s.as_str()));
+    }
+    if let Some(s) = &args.phase2 {
+        m.insert("phase2", Value::from(s.as_str()));
+    }
+    if let Some(s) = &args.domain_suffix_match {
+        m.insert("domain_suffix_match", Value::from(s.as_str()));
+    }
+    m.insert("ieee80211w", Value::from(args.ieee80211w));
+    if let Some(s) = &args.bssid {
+        m.insert("bssid", Value::from(s.as_str()));
+    }
+    if let Some(s) = &args.bssid_blacklist {
+        m.insert("bssid_blacklist", Value::from(s.as_str()));
+    }
+    m.insert("priority", Value::from(args.priority));
+    m
 }
 
 // ---- backend -------------------------------------------------------------
@@ -148,6 +407,26 @@ impl Drop for WpaSupplicantBackend {
     }
 }
 
+impl WpaSupplicantBackend {
+    /// Build a per-interface `WpaInterfaceProxy` bound to the
+    /// object path the backend remembered at `attach` time. Returns
+    /// [`WifiError::NotAttached`] for unknown ifindices — the trait's
+    /// contract says callers must `attach` first.
+    async fn iface_proxy(&self, ifindex: u32) -> Result<WpaInterfaceProxy<'static>> {
+        let path = self
+            .interfaces
+            .get(&ifindex)
+            .map(|i| i.path.clone())
+            .ok_or(WifiError::NotAttached { ifindex })?;
+        WpaInterfaceProxy::builder(&self.connection)
+            .path(path)
+            .map_err(zbus_err)?
+            .build()
+            .await
+            .map_err(zbus_err)
+    }
+}
+
 #[async_trait]
 impl WifiSupplicantBackend for WpaSupplicantBackend {
     async fn attach(&mut self, ifindex: u32, ifname: &str) -> Result<()> {
@@ -182,10 +461,17 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
             .map_err(zbus_err)?;
 
         // Snapshot the current State before the watcher starts so a
-        // freshly-attached interface in e.g. `disconnected` emits
-        // one event immediately.
+        // freshly-attached interface in e.g. `disconnected` — or in
+        // `completed`, if we re-attached to an already-associated
+        // interface across a nexusd restart — emits one event
+        // immediately.
         if let Ok(s) = iface_proxy.state().await {
-            if let Some(state) = translate_wpa_state(&s) {
+            let state_opt = if s == "completed" {
+                resolve_completed(&self.connection, &iface_proxy).await
+            } else {
+                translate_wpa_state(&s)
+            };
+            if let Some(state) = state_opt {
                 let _ = self
                     .event_tx
                     .send(SupplicantEvent::State { ifindex, state });
@@ -205,7 +491,23 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
             .build()
             .await
             .map_err(zbus_err)?;
-        let state_watcher = spawn_state_watcher(props_proxy, ifindex, self.event_tx.clone());
+        // The state watcher additionally needs a live interface proxy
+        // so it can resolve `State = completed` → `Connected { bssid,
+        // ssid, frequency }` via CurrentBSS reads.
+        let iface_for_state: WpaInterfaceProxy<'static> =
+            WpaInterfaceProxy::builder(&self.connection)
+                .path(path.clone())
+                .map_err(zbus_err)?
+                .build()
+                .await
+                .map_err(zbus_err)?;
+        let state_watcher = spawn_state_watcher(
+            props_proxy,
+            iface_for_state,
+            self.connection.clone(),
+            ifindex,
+            self.event_tx.clone(),
+        );
 
         // Re-build the interface proxy as `'static` for the ScanDone
         // watcher task. Two separate tasks (state + scan) keeps each
@@ -308,41 +610,84 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
         Ok(out)
     }
 
-    async fn connect(&mut self, _ifindex: u32, _network: &NetworkConfig) -> Result<NetworkHandle> {
-        // TODO DD-003 §9.4: network-dict builder per security mode
-        //       then Interface1.AddNetwork + SelectNetwork.
-        Err(WifiError::Supplicant {
-            backend: "wpa_supplicant",
-            source: "connect: awaiting DD-003 §9.4 wiring".into(),
-        })
+    async fn connect(&mut self, ifindex: u32, network: &NetworkConfig) -> Result<NetworkHandle> {
+        let iface = self.iface_proxy(ifindex).await?;
+        let owned = build_wpa_network_args(network)?;
+        let args = wpa_network_dict(&owned);
+        let net_path = iface.add_network(args).await.map_err(zbus_err)?;
+        iface.select_network(&net_path).await.map_err(zbus_err)?;
+        // Opaque handle. The raw string form is cheap to pass
+        // around; the supplicant ObjectPath can be reconstructed
+        // in `forget_network` via `OwnedObjectPath::try_from`.
+        Ok(NetworkHandle(net_path.as_str().to_owned()))
     }
 
-    async fn disconnect(&mut self, _ifindex: u32) -> Result<()> {
-        // TODO DD-003 §9.4: Interface1.Disconnect.
-        Err(WifiError::Supplicant {
-            backend: "wpa_supplicant",
-            source: "disconnect: awaiting DD-003 §9.4 wiring".into(),
-        })
-    }
-
-    async fn forget_network(&mut self, _ifindex: u32, _handle: NetworkHandle) -> Result<()> {
-        // TODO DD-003 §9.4: Interface1.RemoveNetwork(handle).
+    async fn disconnect(&mut self, ifindex: u32) -> Result<()> {
+        let iface = self.iface_proxy(ifindex).await?;
+        iface.disconnect().await.map_err(zbus_err)?;
         Ok(())
     }
 
-    async fn roam(&mut self, _ifindex: u32, _target: RoamTarget) -> Result<()> {
-        // TODO DD-003 §9.3: Interface1.Roam(bssid) / Reassociate.
-        Err(WifiError::Supplicant {
+    async fn forget_network(&mut self, ifindex: u32, handle: NetworkHandle) -> Result<()> {
+        let iface = self.iface_proxy(ifindex).await?;
+        let path = OwnedObjectPath::try_from(handle.0).map_err(|e| WifiError::Supplicant {
             backend: "wpa_supplicant",
-            source: "roam: awaiting DD-003 §9.3 wiring".into(),
-        })
+            source: format!("bad network handle: {e}").into(),
+        })?;
+        // Tolerate `NetworkUnknown` — the supplicant may already have
+        // dropped the network via its own housekeeping (e.g. our
+        // earlier `connect` for a different profile removed it).
+        if let Err(e) = iface.remove_network(&path).await {
+            if !is_network_unknown(&e) {
+                return Err(zbus_err(e));
+            }
+        }
+        Ok(())
     }
 
-    async fn signal_info(&self, _ifindex: u32) -> Result<SignalInfo> {
-        // TODO DD-003 §9.2: Interface1.SignalPoll → a{sv} dict.
-        Err(WifiError::Supplicant {
-            backend: "wpa_supplicant",
-            source: "signal_info: awaiting DD-003 §9.2 wiring".into(),
+    async fn roam(&mut self, ifindex: u32, target: RoamTarget) -> Result<()> {
+        let iface = self.iface_proxy(ifindex).await?;
+        match target {
+            RoamTarget::Auto => iface.reassociate().await.map_err(zbus_err)?,
+            RoamTarget::Bss(mac) => {
+                // wpa_supplicant wants the BSSID as a formatted
+                // string, not raw bytes.
+                iface.roam(&format!("{mac}")).await.map_err(zbus_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn signal_info(&self, ifindex: u32) -> Result<SignalInfo> {
+        let iface = self.iface_proxy(ifindex).await?;
+        let dict = iface.signal_poll().await.map_err(zbus_err)?;
+        // Fields are all nominally optional — different drivers
+        // populate different subsets. Missing → 0 / None so the
+        // caller at least gets the rssi snapshot.
+        let rssi_dbm = signal_i32(&dict, "rssi").unwrap_or(0);
+        let noise_dbm = signal_i32(&dict, "noise");
+        let snr_db = noise_dbm.map(|n| rssi_dbm - n);
+        let frequency = signal_u32(&dict, "frequency").unwrap_or(0);
+        let linkspeed = signal_i32(&dict, "linkspeed").unwrap_or(0);
+        // wpa_supplicant only publishes one rate value; we expose
+        // the same number as both tx and rx until the supplicant
+        // grows separate counters.
+        let rate = linkspeed.max(0) as f32;
+        // `SignalInfo::bssid` is required. Pull it from the live
+        // association; fall back to zero MAC when we're not
+        // currently associated (the caller treats that as stale).
+        let current_bss_path = iface.current_bss().await.map_err(zbus_err)?;
+        let bssid = read_bssid(&self.connection, current_bss_path)
+            .await
+            .unwrap_or(nexus_core::MacAddr([0; 6]));
+        Ok(SignalInfo {
+            bssid,
+            rssi_dbm,
+            noise_dbm,
+            snr_db,
+            tx_bitrate_mbps: rate,
+            rx_bitrate_mbps: rate,
+            frequency,
         })
     }
 
@@ -550,6 +895,8 @@ fn extract_key_mgmt(dict: &HashMap<String, OwnedValue>) -> Vec<String> {
 /// emits `DaemonDown` and the backend reconnects on next DaemonUp.
 fn spawn_state_watcher(
     props: zbus::fdo::PropertiesProxy<'static>,
+    iface: WpaInterfaceProxy<'static>,
+    connection: Connection,
     ifindex: u32,
     event_tx: broadcast::Sender<SupplicantEvent>,
 ) -> JoinHandle<()> {
@@ -574,12 +921,22 @@ fn spawn_state_watcher(
                 // State arrives as a `Value::Str`. Convert tolerantly
                 // — a non-string value would be a daemon bug, but we
                 // don't want a panic path there.
-                if let Ok(owned) = OwnedValue::try_from(raw) {
-                    if let Ok(s) = <String>::try_from(owned) {
-                        if let Some(state) = translate_wpa_state(&s) {
-                            let _ = event_tx.send(SupplicantEvent::State { ifindex, state });
-                        }
-                    }
+                let Ok(owned) = OwnedValue::try_from(raw) else {
+                    continue;
+                };
+                let Ok(s) = <String>::try_from(owned) else {
+                    continue;
+                };
+                // `completed` needs a BSS read to produce the
+                // Connected variant; everything else maps straight
+                // through `translate_wpa_state`.
+                let state_opt = if s == "completed" {
+                    resolve_completed(&connection, &iface).await
+                } else {
+                    translate_wpa_state(&s)
+                };
+                if let Some(state) = state_opt {
+                    let _ = event_tx.send(SupplicantEvent::State { ifindex, state });
                 }
             }
         }
@@ -593,6 +950,65 @@ fn zbus_err(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> WifiError
         backend: "wpa_supplicant",
         source: e.into(),
     }
+}
+
+/// Decode an i32 out of wpa_supplicant's `SignalPoll` a{sv}. The
+/// supplicant picks the smallest integer type that fits, so we
+/// accept i16/i32/u16/u32 and widen.
+fn signal_i32(dict: &HashMap<String, OwnedValue>, key: &str) -> Option<i32> {
+    let v = dict.get(key)?;
+    if let Ok(n) = i32::try_from(v) {
+        return Some(n);
+    }
+    if let Ok(n) = i16::try_from(v) {
+        return Some(n as i32);
+    }
+    if let Ok(n) = u32::try_from(v) {
+        return Some(n as i32);
+    }
+    if let Ok(n) = u16::try_from(v) {
+        return Some(n as i32);
+    }
+    None
+}
+
+/// Same as [`signal_i32`] but for unsigned fields like `frequency`.
+fn signal_u32(dict: &HashMap<String, OwnedValue>, key: &str) -> Option<u32> {
+    let v = dict.get(key)?;
+    if let Ok(n) = u32::try_from(v) {
+        return Some(n);
+    }
+    if let Ok(n) = u16::try_from(v) {
+        return Some(n as u32);
+    }
+    if let Ok(n) = i32::try_from(v) {
+        if n >= 0 {
+            return Some(n as u32);
+        }
+    }
+    None
+}
+
+/// Pull the BSSID from a BSS object at `path`. Returns `None` when
+/// `path` is the root (`/`, reported while disassociated) or the
+/// read fails — callers substitute the zero MAC.
+async fn read_bssid(conn: &Connection, path: OwnedObjectPath) -> Option<nexus_core::MacAddr> {
+    if path.as_str() == "/" {
+        return None;
+    }
+    let bss = BssProxy::builder(conn)
+        .path(path)
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+    let bytes = bss.bssid().await.ok()?;
+    if bytes.len() != 6 {
+        return None;
+    }
+    Some(nexus_core::MacAddr([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+    ]))
 }
 
 /// wpa_supplicant raises this error name when `CreateInterface` is
@@ -616,45 +1032,121 @@ fn is_unknown_interface(e: &zbus::Error) -> bool {
     )
 }
 
+/// Similarly tolerant for `RemoveNetwork`: the network may already
+/// be gone (e.g. wpa_supplicant auto-purged it after a prior
+/// failure, or we're replaying `forget` on a stale handle).
+fn is_network_unknown(e: &zbus::Error) -> bool {
+    matches!(
+        e,
+        zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "fi.w1.wpa_supplicant1.NetworkUnknown"
+    )
+}
+
 // ---- state translation (unchanged from scaffold) ------------------------
 
 /// Translate wpa_supplicant's `State` property string into a
 /// [`super::SupplicantState`] shape per DD-003 §9.5.
+///
+/// Every state except `completed` maps cleanly to a single variant
+/// here. `completed` carries BSSID / SSID / frequency fields that
+/// can only be populated by reading `CurrentBSS`, so it returns
+/// `None` from the pure translator — see [`resolve_completed`] for
+/// the IO-bound path the watcher uses.
 pub fn translate_wpa_state(state_str: &str) -> Option<super::SupplicantState> {
     use super::{DisconnectHint, SupplicantState};
     match state_str {
+        "inactive" => Some(SupplicantState::Disconnected {
+            reason: DisconnectHint::LocalRequest,
+        }),
         "scanning" => Some(SupplicantState::Scanning),
-        "associating" => Some(SupplicantState::Associating),
         "authenticating" => Some(SupplicantState::Authenticating),
+        "associating" | "associated" => Some(SupplicantState::Associating),
         "4way_handshake" | "group_handshake" => Some(SupplicantState::FourWayHandshake),
         "disconnected" => Some(SupplicantState::Disconnected {
             reason: DisconnectHint::Unspecified,
         }),
-        // `associated` / `completed` / transitional states that
-        // don't map 1:1 here are resolved by the PropertiesChanged
-        // watcher once the BSSID / SSID fields arrive alongside
-        // `completed`.
+        // `completed` is resolved by `resolve_completed` — we
+        // can't build the `Connected` variant without a D-Bus read
+        // of `CurrentBSS`.
         _ => None,
     }
+}
+
+/// Build a [`SupplicantState::Connected`] by reading the given
+/// interface's `CurrentBSS` and then that BSS's `SSID` / `BSSID` /
+/// `Frequency` properties. Returns `None` when `CurrentBSS` is `/`
+/// (the daemon briefly reports `completed` before the association
+/// fully settles, during which the BSS path is unset).
+async fn resolve_completed(
+    connection: &Connection,
+    iface: &WpaInterfaceProxy<'_>,
+) -> Option<super::SupplicantState> {
+    use super::SupplicantState;
+    let path = iface.current_bss().await.ok()?;
+    if path.as_str() == "/" {
+        return None;
+    }
+    let bss = BssProxy::builder(connection)
+        .path(path)
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+    let ssid_bytes = bss.ssid().await.ok()?;
+    let ssid = nexus_core::Ssid::new(ssid_bytes).ok()?;
+    let bssid_bytes = bss.bssid().await.ok()?;
+    if bssid_bytes.len() != 6 {
+        return None;
+    }
+    let bssid = nexus_core::MacAddr([
+        bssid_bytes[0],
+        bssid_bytes[1],
+        bssid_bytes[2],
+        bssid_bytes[3],
+        bssid_bytes[4],
+        bssid_bytes[5],
+    ]);
+    let frequency = bss.frequency().await.ok()? as u32;
+    Some(SupplicantState::Connected {
+        bssid,
+        ssid,
+        frequency,
+    })
 }
 
 /// Translate a numeric 802.11 disconnect reason (the wire-format
 /// `Reason Code` from IEEE 802.11-2020 Table 9-49) into the coarse
 /// [`super::DisconnectHint`] consumed by the backend. See
 /// DD-003 §9.6.
+///
+/// wpa_supplicant re-uses the same `i32` for locally-initiated
+/// disconnects: negative values are its own codes, positive values
+/// are the wire reason codes. Zero means "unspecified / absent."
 pub fn translate_disconnect_reason(code: i32) -> super::DisconnectHint {
     use super::DisconnectHint;
     match code {
-        // Locally initiated disconnects
-        -3 | 1 => DisconnectHint::LocalRequest,
-        // Auth-related
-        2 | 13 => DisconnectHint::AuthFailure,
-        // 4-way handshake failure
+        // Locally-initiated: Nexus-side disconnect (-3) or the
+        // station voluntarily leaving (802.11 reason 3).
+        -3 | 3 => DisconnectHint::LocalRequest,
+        // AP-initiated deauth with "unspecified reason" — AP still
+        // reachable but no longer willing to talk. Treated like a
+        // plain disconnect with hope of reassoc.
+        1 => DisconnectHint::Unspecified,
+        // Previous authentication no longer valid (802.11 reason 2)
+        // and 802.1X EAP failure (reason 23): both indicate the
+        // credentials the supplicant presented are stale / wrong.
+        2 | 13 | 23 => DisconnectHint::AuthFailure,
+        // 802.1X-wrapped handshake timeout.
         15 => DisconnectHint::HandshakeTimeout,
-        // Association / driver timeout
-        3 | 4 | 23 => DisconnectHint::AssociationTimeout,
-        // PSK failures surface as reason 15 or via EAPOL events; be
-        // tolerant and accept either path.
+        // Association / driver timeout: reason 17 is
+        // "association timeout from AP".
+        17 => DisconnectHint::AssociationTimeout,
+        // Inactivity deauth (reason 4) and class-2-frame
+        // protocol glitches (6, 7): AP still reachable; no
+        // credential change needed; typically retriable.
+        4 | 6 | 7 => DisconnectHint::Unspecified,
+        // 0 / unmapped positive codes → unspecified.
         _ => DisconnectHint::Unspecified,
     }
 }
@@ -662,6 +1154,230 @@ pub fn translate_disconnect_reason(code: i32) -> super::DisconnectHint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- build_wpa_network_args (DD-003 §9.4) ---------------------------
+
+    fn mk_network_config(
+        ssid: &[u8],
+        security: nexus_profile_store::SecurityConfig,
+    ) -> crate::types::NetworkConfig {
+        crate::types::NetworkConfig {
+            ssid: nexus_core::Ssid::new(ssid.to_vec()).unwrap(),
+            hidden: false,
+            security,
+            priority: 0,
+            bssid_preferred: None,
+            bssid_blacklist: Vec::new(),
+            scan_freqs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn builder_open_uses_none_keymgmt_and_disables_pmf() {
+        use nexus_profile_store::SecurityConfig;
+        let c = mk_network_config(b"open-net", SecurityConfig::Open);
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "NONE");
+        assert_eq!(a.ieee80211w, 0);
+        assert!(a.psk.is_none());
+        assert!(a.sae_password.is_none());
+        assert_eq!(a.ssid, b"open-net".to_vec());
+    }
+
+    #[test]
+    fn builder_owe_requires_pmf() {
+        use nexus_profile_store::SecurityConfig;
+        let c = mk_network_config(b"owe-net", SecurityConfig::Owe);
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "OWE");
+        assert_eq!(a.ieee80211w, 2);
+    }
+
+    #[test]
+    fn builder_wpa2_personal_passphrase_populates_psk_and_pmf_capable() {
+        use nexus_profile_store::{SecurityConfig, WpaPsk};
+        let c = mk_network_config(
+            b"home",
+            SecurityConfig::Wpa2Personal {
+                psk: WpaPsk::Passphrase(crate::secretstring("correct horse battery staple")),
+            },
+        );
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "WPA-PSK");
+        assert_eq!(a.psk.as_deref(), Some("correct horse battery staple"));
+        assert!(a.sae_password.is_none());
+        assert_eq!(a.ieee80211w, 1);
+    }
+
+    #[test]
+    fn builder_wpa2_personal_rawpsk_hex_encodes_the_pmk() {
+        use nexus_profile_store::{SecurityConfig, WpaPsk};
+        let mut pmk = [0u8; 32];
+        pmk[0] = 0xDE;
+        pmk[1] = 0xAD;
+        pmk[2] = 0xBE;
+        pmk[3] = 0xEF;
+        let c = mk_network_config(
+            b"home",
+            SecurityConfig::Wpa2Personal {
+                psk: WpaPsk::RawPsk(pmk),
+            },
+        );
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "WPA-PSK");
+        // Must be 64 hex chars.
+        assert_eq!(a.psk.as_ref().unwrap().len(), 64);
+        assert!(a.psk.as_ref().unwrap().starts_with("deadbeef"));
+    }
+
+    #[test]
+    fn builder_wpa3_personal_uses_sae_password_and_required_pmf() {
+        use nexus_profile_store::SecurityConfig;
+        let c = mk_network_config(
+            b"home3",
+            SecurityConfig::Wpa3Personal {
+                passphrase: crate::secretstring("sae-pass"),
+            },
+        );
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "SAE");
+        assert!(a.psk.is_none());
+        assert_eq!(a.sae_password.as_deref(), Some("sae-pass"));
+        assert_eq!(a.ieee80211w, 2);
+    }
+
+    #[test]
+    fn builder_transition_mode_sets_both_psk_and_sae() {
+        use nexus_profile_store::SecurityConfig;
+        let c = mk_network_config(
+            b"home-mixed",
+            SecurityConfig::Wpa2Wpa3Personal {
+                passphrase: crate::secretstring("shared-pass"),
+            },
+        );
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "WPA-PSK SAE");
+        assert_eq!(a.psk.as_deref(), Some("shared-pass"));
+        assert_eq!(a.sae_password.as_deref(), Some("shared-pass"));
+        assert_eq!(a.ieee80211w, 2);
+    }
+
+    fn mk_eap() -> nexus_profile_store::Dot1xEapConfig {
+        use nexus_profile_store::{Dot1xEapConfig, EapMethod};
+        Dot1xEapConfig {
+            eap: EapMethod::Peap,
+            identity: "alice".into(),
+            anonymous_identity: Some("anon@example".into()),
+            ca_cert: Some("/etc/nexus/ca.pem".into()),
+            client_cert: None,
+            client_key: None,
+            client_key_password: None,
+            phase2: Some("auth=MSCHAPV2".into()),
+            domain_suffix_match: Some("example.com".into()),
+            password: Some(crate::secretstring("hunter2")),
+        }
+    }
+
+    #[test]
+    fn builder_wpa2_enterprise_sets_eap_fields_and_capable_pmf() {
+        use nexus_profile_store::SecurityConfig;
+        let c = mk_network_config(b"corp2", SecurityConfig::Wpa2Enterprise(mk_eap()));
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "WPA-EAP");
+        assert_eq!(a.eap, Some("PEAP"));
+        assert_eq!(a.identity.as_deref(), Some("alice"));
+        assert_eq!(a.anonymous_identity.as_deref(), Some("anon@example"));
+        assert_eq!(a.ca_cert.as_deref(), Some("/etc/nexus/ca.pem"));
+        assert_eq!(a.phase2.as_deref(), Some("auth=MSCHAPV2"));
+        assert_eq!(a.domain_suffix_match.as_deref(), Some("example.com"));
+        assert_eq!(a.password.as_deref(), Some("hunter2"));
+        assert_eq!(a.ieee80211w, 1);
+    }
+
+    #[test]
+    fn builder_wpa3_enterprise_uses_sha256_keymgmt_and_required_pmf() {
+        use nexus_profile_store::SecurityConfig;
+        let c = mk_network_config(b"corp3", SecurityConfig::Wpa3Enterprise(mk_eap()));
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.key_mgmt, "WPA-EAP-SHA256");
+        assert_eq!(a.ieee80211w, 2);
+    }
+
+    #[test]
+    fn builder_hidden_sets_scan_ssid() {
+        use nexus_profile_store::SecurityConfig;
+        let mut c = mk_network_config(b"stealth", SecurityConfig::Open);
+        c.hidden = true;
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.scan_ssid, Some(1));
+    }
+
+    #[test]
+    fn builder_bssid_and_blacklist_are_formatted() {
+        use nexus_core::MacAddr;
+        use nexus_profile_store::SecurityConfig;
+        let mut c = mk_network_config(b"pinned", SecurityConfig::Open);
+        c.bssid_preferred = Some(MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01]));
+        c.bssid_blacklist = vec![
+            MacAddr([0x11; 6]),
+            MacAddr([0x22, 0x33, 0x44, 0x55, 0x66, 0x77]),
+        ];
+        let a = build_wpa_network_args(&c).unwrap();
+        assert_eq!(a.bssid.as_deref(), Some("aa:bb:cc:dd:ee:01"));
+        // Space-separated list per wpa_supplicant's accepted form.
+        assert_eq!(
+            a.bssid_blacklist.as_deref(),
+            Some("11:11:11:11:11:11 22:33:44:55:66:77")
+        );
+    }
+
+    #[test]
+    fn network_dict_round_trips_every_owned_field() {
+        // Builds the `HashMap<&str, Value<'_>>` and spot-checks that
+        // the entries we set end up in the dict. The Value types
+        // don't round-trip cleanly through equality (they're not
+        // PartialEq); we just assert presence for the non-trivial
+        // fields.
+        use nexus_profile_store::{SecurityConfig, WpaPsk};
+        let c = mk_network_config(
+            b"ssid",
+            SecurityConfig::Wpa2Personal {
+                psk: WpaPsk::Passphrase(crate::secretstring("pw")),
+            },
+        );
+        let owned = build_wpa_network_args(&c).unwrap();
+        let dict = wpa_network_dict(&owned);
+        assert!(dict.contains_key("ssid"));
+        assert!(dict.contains_key("key_mgmt"));
+        assert!(dict.contains_key("psk"));
+        assert!(dict.contains_key("ieee80211w"));
+        assert!(dict.contains_key("priority"));
+        // `sae_password` is only present on SAE/transition configs.
+        assert!(!dict.contains_key("sae_password"));
+    }
+
+    // ---- signal-poll helpers --------------------------------------------
+
+    #[test]
+    fn signal_i32_accepts_multiple_integer_widths() {
+        let mut d = HashMap::new();
+        d.insert("rssi".into(), Value::from(-65i32).try_into().unwrap());
+        d.insert("noise".into(), Value::from(-95i16).try_into().unwrap());
+        d.insert("linkspeed".into(), Value::from(150u32).try_into().unwrap());
+        assert_eq!(signal_i32(&d, "rssi"), Some(-65));
+        assert_eq!(signal_i32(&d, "noise"), Some(-95));
+        assert_eq!(signal_i32(&d, "linkspeed"), Some(150));
+        assert_eq!(signal_i32(&d, "missing"), None);
+    }
+
+    #[test]
+    fn signal_u32_rejects_negative_i32() {
+        let mut d = HashMap::new();
+        d.insert("freq".into(), Value::from(-1i32).try_into().unwrap());
+        assert_eq!(signal_u32(&d, "freq"), None);
+    }
+
+    // ---- existing tests -------------------------------------------------
 
     /// Build an `OwnedValue` wrapping an `as` (array of strings) —
     /// matches wpa_supplicant's real `KeyMgmt` property type.
@@ -754,11 +1470,21 @@ mod tests {
     fn state_table_covers_dd003_section_9_5() {
         use super::super::SupplicantState;
         assert!(matches!(
+            translate_wpa_state("inactive"),
+            Some(SupplicantState::Disconnected { .. })
+        ));
+        assert!(matches!(
             translate_wpa_state("scanning"),
             Some(SupplicantState::Scanning)
         ));
         assert!(matches!(
             translate_wpa_state("associating"),
+            Some(SupplicantState::Associating)
+        ));
+        // `associated` rolls up into Associating — the BSS is
+        // chosen but the 4-way hasn't begun.
+        assert!(matches!(
+            translate_wpa_state("associated"),
             Some(SupplicantState::Associating)
         ));
         assert!(matches!(
@@ -777,32 +1503,46 @@ mod tests {
             translate_wpa_state("disconnected"),
             Some(SupplicantState::Disconnected { .. })
         ));
+        // `completed` resolves via `resolve_completed` (IO-bound);
+        // the pure translator returns None.
         assert!(translate_wpa_state("completed").is_none());
         assert!(translate_wpa_state("unknown_future").is_none());
     }
 
     #[test]
-    fn disconnect_reasons_split_into_retriable_and_fail_fast() {
+    fn disconnect_reasons_cover_dd003_section_9_6() {
         use super::super::DisconnectHint;
-        assert!(matches!(
-            translate_disconnect_reason(15),
-            DisconnectHint::HandshakeTimeout
-        ));
-        assert!(matches!(
-            translate_disconnect_reason(2),
-            DisconnectHint::AuthFailure
-        ));
-        assert!(matches!(
-            translate_disconnect_reason(3),
-            DisconnectHint::AssociationTimeout
-        ));
-        assert!(matches!(
+        // Locally-initiated
+        assert_eq!(
             translate_disconnect_reason(-3),
             DisconnectHint::LocalRequest
-        ));
-        assert!(matches!(
+        );
+        // STA leaving (reason 3)
+        assert_eq!(translate_disconnect_reason(3), DisconnectHint::LocalRequest);
+        // AP-initiated unspecified deauth
+        assert_eq!(translate_disconnect_reason(1), DisconnectHint::Unspecified);
+        // Auth-related
+        assert_eq!(translate_disconnect_reason(2), DisconnectHint::AuthFailure);
+        // 802.1X EAP failure
+        assert_eq!(translate_disconnect_reason(23), DisconnectHint::AuthFailure);
+        // 4-way handshake timeout
+        assert_eq!(
+            translate_disconnect_reason(15),
+            DisconnectHint::HandshakeTimeout
+        );
+        // Association timeout
+        assert_eq!(
+            translate_disconnect_reason(17),
+            DisconnectHint::AssociationTimeout
+        );
+        // Inactivity deauth — retriable, coarsely unspecified
+        assert_eq!(translate_disconnect_reason(4), DisconnectHint::Unspecified);
+        // Protocol glitches
+        assert_eq!(translate_disconnect_reason(6), DisconnectHint::Unspecified);
+        // Unknown codes
+        assert_eq!(
             translate_disconnect_reason(999),
             DisconnectHint::Unspecified
-        ));
+        );
     }
 }
