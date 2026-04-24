@@ -21,6 +21,7 @@
 
 pub mod cli;
 pub mod commands;
+pub mod completion;
 pub mod dispatch;
 pub mod errors;
 pub mod errors_map;

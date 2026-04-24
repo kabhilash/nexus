@@ -1,0 +1,126 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH nexusctl 1  "nexusctl 0.1.0" 
+.SH NAME
+nexusctl \- Command\-line client for nexusd
+.SH SYNOPSIS
+\fBnexusctl\fR [\fB\-f\fR|\fB\-\-format\fR] [\fB\-\-json\fR] [\fB\-t\fR|\fB\-\-terse\fR] [\fB\-\-pretty\fR] [\fB\-\-fields\fR] [\fB\-\-separator\fR] [\fB\-\-color\fR] [\fB\-\-no\-color\fR] [\fB\-\-timeout\fR] [\fB\-\-bus\fR] [\fB\-v\fR|\fB\-\-verbose\fR] [\fB\-q\fR|\fB\-\-quiet\fR] [\fB\-\-no\-interactive\fR] [\fB\-\-no\-polkit\-agent\fR] [\fB\-\-config\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIsubcommands\fR]
+.SH DESCRIPTION
+Command\-line client for nexusd
+.SH OPTIONS
+.TP
+\fB\-f\fR, \fB\-\-format\fR \fI<FORMAT>\fR
+Output format: human, terse, json, or pretty
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+human
+.IP \(bu 2
+terse
+.IP \(bu 2
+json
+.IP \(bu 2
+pretty
+.RE
+.TP
+\fB\-\-json\fR
+Shorthand for `\-\-format json`
+.TP
+\fB\-t\fR, \fB\-\-terse\fR
+Shorthand for `\-\-format terse` (separator\-joined, one record per line — ideal for shell scripts)
+.TP
+\fB\-\-pretty\fR
+Shorthand for `\-\-format pretty` (verbose single\-record view)
+.TP
+\fB\-\-fields\fR \fI<FIELDS>\fR
+Comma\-separated field whitelist for `\-\-terse` output
+.TP
+\fB\-\-separator\fR \fI<SEPARATOR>\fR [default: :]
+Separator for `\-\-terse` output. Default `:`
+.TP
+\fB\-\-color\fR \fI<COLOR>\fR [default: auto]
+When to use ANSI colors
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto
+.IP \(bu 2
+always
+.IP \(bu 2
+never
+.RE
+.TP
+\fB\-\-no\-color\fR
+Disable ANSI colors (equivalent to `\-\-color never`)
+.TP
+\fB\-\-timeout\fR \fI<SECONDS>\fR
+Override the D\-Bus call timeout for this invocation (seconds)
+.TP
+\fB\-\-bus\fR \fI<ADDRESS>\fR
+D\-Bus bus address (for test harnesses running on session bus)
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Log D\-Bus calls and signal subscriptions to stderr
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Suppress non\-essential output
+.TP
+\fB\-\-no\-interactive\fR
+Fail instead of prompting. Default: auto\-detect TTY
+.TP
+\fB\-\-no\-polkit\-agent\fR
+Skip auto\-spawning `pkttyagent` for PolicyKit prompts. Useful when the caller has already got an agent, or explicitly wants mutating commands to fail hard on AuthFailed
+.TP
+\fB\-\-config\fR \fI<PATH>\fR
+Alternative config file path
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+nexusctl\-status(1)
+Show overall daemon status
+.TP
+nexusctl\-iface(1)
+Interface operations
+.TP
+nexusctl\-eth(1)
+Ethernet shortcuts (equivalent to `iface ... \-\-kind ethernet`)
+.TP
+nexusctl\-wifi(1)
+Wi\-Fi operations
+.TP
+nexusctl\-bt(1)
+Bluetooth operations
+.TP
+nexusctl\-gnss(1)
+GNSS operations
+.TP
+nexusctl\-profile(1)
+Profile management
+.TP
+nexusctl\-power(1)
+PowerState control
+.TP
+nexusctl\-admin(1)
+Administrative operations
+.TP
+nexusctl\-watch(1)
+Subscribe to D\-Bus signals and print a live event stream
+.TP
+nexusctl\-completions(1)
+Emit a shell completion script on stdout
+.TP
+nexusctl\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.1.0

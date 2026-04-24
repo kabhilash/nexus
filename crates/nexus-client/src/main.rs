@@ -16,7 +16,8 @@ use std::process::ExitCode;
 use clap::Parser;
 use tracing::Level;
 
-use nexus_client::cli::Cli;
+use nexus_client::cli::{Cli, Command};
+use nexus_client::commands;
 use nexus_client::dispatch::dispatch;
 use nexus_client::errors::NexusctlError;
 use nexus_client::output::OutputFormat;
@@ -30,6 +31,18 @@ async fn main() -> ExitCode {
     init_tracing(cli.global.verbose);
 
     let format = cli.global.output_format();
+
+    // `completions` is self-contained — it reads the Cli struct,
+    // generates a script, and writes to stdout. No D-Bus connection,
+    // no polkit agent, no watchdog. Packagers invoke this in sterile
+    // chroots where even opening the bus would fail; short-circuit
+    // before any of that machinery spins up.
+    if let Some(Command::Completions { shell }) = &cli.command {
+        let mut stdout = std::io::stdout().lock();
+        let r = commands::completions::run(shell.as_completion_shell(), &mut stdout);
+        let _ = stdout.flush();
+        return finish(r, format);
+    }
 
     // Install the double-Ctrl-C watchdog early so it's active
     // across every command, not just mutating ones. Read-only

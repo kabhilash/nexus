@@ -21,7 +21,8 @@ pub fn command_is_mutating(command: &Option<Command>) -> bool {
         | Some(Command::Iface { .. })
         | Some(Command::Eth { .. })
         | Some(Command::Gnss { .. })
-        | Some(Command::Watch { .. }) => false,
+        | Some(Command::Watch { .. })
+        | Some(Command::Completions { .. }) => false,
         Some(Command::Wifi { sub }) => matches!(
             sub,
             WifiSub::Scan { .. }
@@ -310,6 +311,10 @@ pub async fn dispatch(
                 tokio::signal::ctrl_c(),
             )
             .await
+        }
+
+        Some(Command::Completions { shell }) => {
+            commands::completions::run(shell.as_completion_shell(), stdout)
         }
 
         Some(Command::Admin { sub }) => match sub {

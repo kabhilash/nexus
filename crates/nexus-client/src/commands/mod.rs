@@ -10,6 +10,7 @@
 pub mod admin;
 pub mod bt;
 pub mod bt_mutating;
+pub mod completions;
 pub mod gnss;
 pub mod iface;
 pub mod power;

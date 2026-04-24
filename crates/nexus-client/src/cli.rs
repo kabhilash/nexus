@@ -28,9 +28,11 @@ pub struct Cli {
 /// Global options per DD-008 §4.2.
 #[derive(Debug, Args, Default, Clone)]
 pub struct GlobalOpts {
+    /// Output format: human, terse, json, or pretty.
     #[arg(global = true, long, short = 'f', value_enum)]
     pub format: Option<OutputFormat>,
 
+    /// Shorthand for `--format json`.
     #[arg(
         global = true,
         long,
@@ -38,6 +40,8 @@ pub struct GlobalOpts {
     )]
     pub json: bool,
 
+    /// Shorthand for `--format terse` (separator-joined, one record
+    /// per line — ideal for shell scripts).
     #[arg(
         global = true,
         long,
@@ -46,6 +50,7 @@ pub struct GlobalOpts {
     )]
     pub terse: bool,
 
+    /// Shorthand for `--format pretty` (verbose single-record view).
     #[arg(
         global = true,
         long,
@@ -53,40 +58,49 @@ pub struct GlobalOpts {
     )]
     pub pretty: bool,
 
+    /// Comma-separated field whitelist for `--terse` output.
     #[arg(global = true, long, value_delimiter = ',')]
     pub fields: Option<Vec<String>>,
 
+    /// Separator for `--terse` output. Default `:`.
     #[arg(global = true, long, default_value = ":")]
     pub separator: String,
 
+    /// When to use ANSI colors.
     #[arg(global = true, long, value_enum, default_value_t = ColorChoice::Auto)]
     pub color: ColorChoice,
 
+    /// Disable ANSI colors (equivalent to `--color never`).
     #[arg(global = true, long)]
     pub no_color: bool,
 
+    /// Override the D-Bus call timeout for this invocation (seconds).
     #[arg(global = true, long, value_name = "SECONDS")]
     pub timeout: Option<u64>,
 
+    /// D-Bus bus address (for test harnesses running on session bus).
     #[arg(global = true, long, value_name = "ADDRESS")]
     pub bus: Option<String>,
 
+    /// Log D-Bus calls and signal subscriptions to stderr.
     #[arg(global = true, long, short = 'v')]
     pub verbose: bool,
 
+    /// Suppress non-essential output.
     #[arg(global = true, long, short = 'q')]
     pub quiet: bool,
 
+    /// Fail instead of prompting. Default: auto-detect TTY.
     #[arg(global = true, long)]
     pub no_interactive: bool,
 
-    /// Skip auto-spawning `pkttyagent` for PolicyKit prompts
-    /// (DD-008 §6.3). Useful when the caller has already got an
-    /// agent or explicitly wants mutating commands to fail hard
-    /// on AuthFailed.
+    /// Skip auto-spawning `pkttyagent` for PolicyKit prompts. Useful
+    /// when the caller has already got an agent, or explicitly wants
+    /// mutating commands to fail hard on AuthFailed.
     #[arg(global = true, long)]
     pub no_polkit_agent: bool,
 
+    /// Alternative config file path.
     #[arg(global = true, long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 }
@@ -175,49 +189,113 @@ impl ProfileKind {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Show overall daemon status.
+    #[command(long_about = "Print the daemon version, power state, and \
+        a one-line summary per managed interface.\n\n\
+        Example:\n    \
+        nexusctl status")]
     Status,
     /// Interface operations.
+    #[command(long_about = "List, inspect, and follow managed network \
+        interfaces.\n\n\
+        Examples:\n    \
+        nexusctl iface list\n    \
+        nexusctl iface list --kind wifi\n    \
+        nexusctl iface show eth0")]
     Iface {
         #[command(subcommand)]
         sub: IfaceSub,
     },
-    /// Ethernet shortcuts (equivalent to `iface … --kind ethernet`).
+    /// Ethernet shortcuts (equivalent to `iface ... --kind ethernet`).
+    #[command(long_about = "Convenience aliases for Ethernet \
+        interfaces. Equivalent to `iface list --kind ethernet` / \
+        `iface show <iface>` but keeps the verbs grouped by \
+        technology.\n\n\
+        Examples:\n    \
+        nexusctl eth list\n    \
+        nexusctl eth show eth0")]
     Eth {
         #[command(subcommand)]
         sub: EthSub,
     },
-    /// Wi-Fi operations (read-only subset; `scan`/`connect` land in
-    /// Phase 7.4).
+    /// Wi-Fi operations.
+    #[command(long_about = "List Wi-Fi interfaces, scan, connect, and \
+        manage stored profiles.\n\n\
+        Examples:\n    \
+        nexusctl wifi list\n    \
+        nexusctl wifi scan wlan0\n    \
+        nexusctl wifi connect 'home-ssid' --psk 'secret'\n    \
+        nexusctl wifi disconnect wlan0")]
     Wifi {
         #[command(subcommand)]
         sub: WifiSub,
     },
     /// Bluetooth operations.
+    #[command(long_about = "List adapters and devices, pair, connect, \
+        and manage trust.\n\n\
+        Examples:\n    \
+        nexusctl bt adapters\n    \
+        nexusctl bt scan hci0 --duration 15\n    \
+        nexusctl bt pair AA:BB:CC:DD:EE:01\n    \
+        nexusctl bt connect AA:BB:CC:DD:EE:01")]
     Bt {
         #[command(subcommand)]
         sub: BtSub,
     },
     /// GNSS operations.
+    #[command(long_about = "Inspect GNSS devices and their current \
+        fix.\n\n\
+        Examples:\n    \
+        nexusctl gnss list\n    \
+        nexusctl gnss show /dev/gps0\n    \
+        nexusctl gnss satellites")]
     Gnss {
         #[command(subcommand)]
         sub: GnssSub,
     },
     /// Profile management.
+    #[command(long_about = "Create, list, update, import, export, and \
+        delete stored Wi-Fi / Ethernet profiles.\n\n\
+        Examples:\n    \
+        nexusctl profile list\n    \
+        nexusctl profile show home-ssid\n    \
+        nexusctl profile add-wifi 'home-ssid' --psk 'secret' --label home\n    \
+        nexusctl profile remove home-ssid\n    \
+        nexusctl profile export home-ssid")]
     Profile {
         #[command(subcommand)]
         sub: ProfileSub,
     },
-    /// PowerState control. Read-only today.
+    /// PowerState control.
+    #[command(long_about = "Inspect or change the daemon's PowerState \
+        (active / background / sleep).\n\n\
+        Examples:\n    \
+        nexusctl power get\n    \
+        nexusctl power set background")]
     Power {
         #[command(subcommand)]
         sub: PowerSub,
     },
-    /// Administrative operations (read-only subset).
+    /// Administrative operations.
+    #[command(long_about = "Master-key rotation, backup lease, \
+        diagnostics bundle, and config reload. All require \
+        PolicyKit authorisation.\n\n\
+        Examples:\n    \
+        nexusctl admin master-key-info\n    \
+        nexusctl admin rotate-master-key\n    \
+        nexusctl admin reload-config")]
     Admin {
         #[command(subcommand)]
         sub: AdminSub,
     },
-    /// Subscribe to D-Bus signals. DD-008 §7.4.
+    /// Subscribe to D-Bus signals and print a live event stream.
+    #[command(long_about = "Stream events from nexusd — interface \
+        arrivals, link-state changes, Wi-Fi scans, Bluetooth \
+        pairing steps, and more. Use `--filter 'field=glob'` to \
+        narrow; repeat the flag for AND semantics.\n\n\
+        Examples:\n    \
+        nexusctl watch\n    \
+        nexusctl watch wifi\n    \
+        nexusctl watch --filter 'iface=wlan0' --filter 'kind=wifi-*'")]
     Watch {
         #[command(subcommand)]
         sub: Option<WatchSub>,
@@ -225,50 +303,89 @@ pub enum Command {
         #[arg(long = "filter", value_name = "FILTER", global = true)]
         filter: Vec<String>,
     },
+    /// Emit a shell completion script on stdout.
+    #[command(long_about = "Emit a shell completion script on \
+        stdout. Redirect into the packager-appropriate path; \
+        nexusctl does not install the file itself. See DD-008 §10 \
+        for the full install matrix.\n\n\
+        Examples:\n    \
+        nexusctl completions bash > /etc/bash_completion.d/nexusctl\n    \
+        nexusctl completions zsh  > ~/.zfunc/_nexusctl\n    \
+        nexusctl completions fish > ~/.config/fish/completions/nexusctl.fish")]
+    Completions {
+        /// Target shell. One of: bash, zsh, fish, powershell (pwsh).
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
+}
+
+/// Shells `nexusctl completions` can emit for. DD-008 §10.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    #[value(alias = "pwsh")]
+    Powershell,
+}
+
+impl CompletionShell {
+    pub fn as_completion_shell(self) -> crate::completion::Shell {
+        match self {
+            CompletionShell::Bash => crate::completion::Shell::Bash,
+            CompletionShell::Zsh => crate::completion::Shell::Zsh,
+            CompletionShell::Fish => crate::completion::Shell::Fish,
+            CompletionShell::Powershell => crate::completion::Shell::PowerShell,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum WatchSub {
+    /// All events (the default).
     Events,
+    /// Interface arrivals, departures, and link-state changes.
     Iface,
+    /// Wi-Fi scans, state transitions, signal updates.
     Wifi,
+    /// Bluetooth adapter/device state and pairing events.
     Bt,
+    /// GNSS fix updates.
     Gnss,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum IfaceSub {
+    /// List managed interfaces.
     List {
         /// Restrict to a single kind.
         #[arg(long, value_enum)]
         kind: Option<InterfaceKind>,
     },
-    Show {
-        iface: String,
-    },
-    /// Last N events for an interface. Planned feature — see
-    /// DD-008 §4.1 (the daemon doesn't yet retain history).
-    Events {
-        iface: String,
-    },
+    /// Show detailed state for a single interface.
+    Show { iface: String },
+    /// Last N events for an interface. Planned feature — the daemon
+    /// doesn't yet retain history.
+    Events { iface: String },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum EthSub {
+    /// List Ethernet interfaces.
     List,
+    /// Show detailed Ethernet state, including 802.1X authentication.
     Show { iface: String },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum WifiSub {
+    /// List Wi-Fi interfaces.
     List,
-    Show {
-        iface: Option<String>,
-    },
+    /// Show the current connection, signal, and security.
+    Show { iface: Option<String> },
     /// Trigger a scan and print results.
-    Scan {
-        iface: Option<String>,
-    },
+    Scan { iface: Option<String> },
     /// Connect by SSID. When `--psk` is provided and no matching
     /// profile exists, nexusctl creates one on-the-fly.
     Connect {
@@ -277,7 +394,7 @@ pub enum WifiSub {
         iface: Option<String>,
         #[arg(long)]
         psk: Option<String>,
-        /// Suppress the DD-008 §6.2 credential-leak warning.
+        /// Suppress the credential-leak warning.
         #[arg(long)]
         no_warn_psk: bool,
     },
@@ -287,32 +404,27 @@ pub enum WifiSub {
         #[arg(long)]
         iface: Option<String>,
     },
-    Disconnect {
-        iface: Option<String>,
-    },
+    /// Disconnect the current Wi-Fi session.
+    Disconnect { iface: Option<String> },
     /// Delete a stored Wi-Fi profile (matched by SSID or ULID).
-    Forget {
-        reference: String,
-    },
+    Forget { reference: String },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum BtSub {
+    /// List Bluetooth adapters.
     Adapters,
+    /// List known Bluetooth devices.
     List {
         #[arg(long, conflicts_with = "connected")]
         paired: bool,
         #[arg(long, conflicts_with = "paired")]
         connected: bool,
     },
-    Show {
-        address: String,
-    },
+    /// Show detailed state for a Bluetooth device.
+    Show { address: String },
     /// Power an adapter on or off.
-    Power {
-        hci: String,
-        state: OnOff,
-    },
+    Power { hci: String, state: OnOff },
     /// Discover devices for a bounded duration.
     Scan {
         hci: Option<String>,
@@ -320,24 +432,18 @@ pub enum BtSub {
         #[arg(long, default_value_t = 10)]
         duration: u64,
     },
-    Connect {
-        address: String,
-    },
-    Disconnect {
-        address: String,
-    },
-    Forget {
-        address: String,
-    },
-    /// Set or clear the trusted flag.
-    Trust {
-        address: String,
-        state: OnOff,
-    },
-    /// Interactive pairing. DD-008 §6.1.
+    /// Connect to a paired device.
+    Connect { address: String },
+    /// Disconnect a device but keep the bond.
+    Disconnect { address: String },
+    /// Remove the bond with a device.
+    Forget { address: String },
+    /// Set or clear the trusted flag on a device.
+    Trust { address: String, state: OnOff },
+    /// Pair with a device interactively.
     Pair {
         address: String,
-        /// Override `bluetooth.agent_response_timeout_s` for this
+        /// Override the agent response timeout (seconds) for this
         /// invocation.
         #[arg(long, default_value_t = 90)]
         timeout: u64,
@@ -359,23 +465,25 @@ impl OnOff {
 
 #[derive(Debug, Subcommand)]
 pub enum GnssSub {
+    /// List GNSS devices.
     List,
+    /// Show the current fix for a GNSS device.
     Show { device: Option<String> },
+    /// Show the satellite counts for a GNSS device.
     Satellites { device: Option<String> },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ProfileSub {
+    /// List stored profiles.
     List {
         #[arg(long, value_enum)]
         kind: Option<ProfileKind>,
     },
-    Show {
-        reference: String,
-    },
-    Export {
-        reference: String,
-    },
+    /// Show a stored profile.
+    Show { reference: String },
+    /// Dump a profile's TOML to stdout.
+    Export { reference: String },
     /// Create a Wi-Fi profile. Either supply `<ssid>` inline along
     /// with `--psk`, or `--file <path>` / `--file -` for a full TOML.
     AddWifi {
@@ -421,9 +529,7 @@ pub enum ProfileSub {
         file: Option<String>,
     },
     /// Remove a stored profile.
-    Remove {
-        reference: String,
-    },
+    Remove { reference: String },
     /// Update a single top-level field on a profile.
     Update {
         reference: String,
@@ -440,8 +546,9 @@ pub enum ProfileSub {
 
 #[derive(Debug, Subcommand)]
 pub enum PowerSub {
+    /// Print the daemon's current PowerState.
     Get,
-    /// Change the daemon's power state.
+    /// Change the daemon's PowerState.
     Set {
         #[arg(value_enum)]
         state: PowerStateArg,
@@ -468,17 +575,16 @@ impl PowerStateArg {
 
 #[derive(Debug, Subcommand)]
 pub enum AdminSub {
+    /// Show the Profile Store master-key source and status.
     MasterKeyInfo,
-    /// Fire-and-forget rotation — prints the job id for
-    /// `nexusctl watch`.
+    /// Rotate the Profile Store master key (fire-and-forget; prints
+    /// the job id — watch `master-key-rotated` for the outcome).
     RotateMasterKey,
     /// Acquire a backup lease (prints the lease token).
     FreezeBackup,
-    /// Release a previously-acquired lease.
-    ReleaseBackup {
-        lease: String,
-    },
-    /// Request a support bundle. Phase 7.4 stub — streaming the
+    /// Release a previously-acquired backup lease.
+    ReleaseBackup { lease: String },
+    /// Request a support bundle. Planned feature — streaming the
     /// bundle fd lands in a later phase.
     Diagnostics {
         #[arg(long, value_name = "PATH")]
