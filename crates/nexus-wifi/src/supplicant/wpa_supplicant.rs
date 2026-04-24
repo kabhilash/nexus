@@ -7,16 +7,25 @@
 //!   flows back as [`SupplicantEvent::DaemonUp`] / [`DaemonDown`].
 //! - [`attach`] calls `CreateInterface` (or falls back to
 //!   `GetInterface` when the interface is already owned), remembers
-//!   the interface object path, and spawns a per-interface watcher
-//!   that relays `State` property changes as
-//!   [`SupplicantEvent::State`].
-//! - [`detach`] aborts the watcher and calls `RemoveInterface`.
+//!   the interface object path, and spawns two per-interface
+//!   watchers: one for `PropertiesChanged` on `State`
+//!   (→ [`SupplicantEvent::State`]) and one for the `ScanDone`
+//!   signal (→ [`SupplicantEvent::ScanComplete`]).
+//! - [`detach`] aborts both watchers and calls `RemoveInterface`.
+//! - [`scan`] invokes `Interface1.Scan(a{sv})` with a `Type` field
+//!   derived from `ScanParams::active`. Results arrive via the
+//!   `ScanDone` watcher already spawned at attach time.
+//! - [`get_scan_results`] reads `Interface1.BSSs` then each
+//!   `BSS1.{SSID,BSSID,Frequency,Signal,WPA,RSN,Age}` and returns a
+//!   [`BssInfo`] for every BSS whose SSID is non-empty (hidden APs
+//!   report empty SSID in probe responses and are filtered out —
+//!   connecting to them is a profile-driven flow, not a scan one).
 //!
 //! The per-network mutating methods (`connect`, `disconnect`,
-//! `scan`, `signal_info`, `roam`, `forget_network`) still return
-//! [`WifiError::Supplicant`] — they need security-mode dict builders
-//! per DD-003 §9.4 and the hwsim harness from §14.2 to cover the
-//! handshake states. They stay stubs until that harness lands.
+//! `roam`, `signal_info`) still return [`WifiError::Supplicant`] —
+//! they need the security-mode dict builder per DD-003 §9.4 and the
+//! hwsim harness from §14.2 to cover the handshake states. They stay
+//! stubs until that harness lands.
 
 use std::collections::HashMap;
 
@@ -54,17 +63,55 @@ trait WpaSupplicant {
     default_service = "fi.w1.wpa_supplicant1"
 )]
 trait WpaInterface {
+    fn scan(&self, args: HashMap<&str, Value<'_>>) -> zbus::Result<()>;
+
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
+
+    #[zbus(property, name = "BSSs")]
+    fn bsss(&self) -> zbus::Result<Vec<OwnedObjectPath>>;
+
+    #[zbus(signal)]
+    fn scan_done(&self, success: bool) -> zbus::Result<()>;
+}
+
+/// A single BSS seen by the supplicant scan cache. Properties only —
+/// there's no method call involved in reading a scan result.
+#[proxy(
+    interface = "fi.w1.wpa_supplicant1.BSS",
+    default_service = "fi.w1.wpa_supplicant1"
+)]
+trait Bss {
+    #[zbus(property, name = "SSID")]
+    fn ssid(&self) -> zbus::Result<Vec<u8>>;
+
+    #[zbus(property, name = "BSSID")]
+    fn bssid(&self) -> zbus::Result<Vec<u8>>;
+
+    #[zbus(property)]
+    fn frequency(&self) -> zbus::Result<u16>;
+
+    #[zbus(property)]
+    fn signal(&self) -> zbus::Result<i16>;
+
+    #[zbus(property)]
+    fn age(&self) -> zbus::Result<u32>;
+
+    #[zbus(property, name = "WPA")]
+    fn wpa(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
+
+    #[zbus(property, name = "RSN")]
+    fn rsn(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
 }
 
 // ---- backend -------------------------------------------------------------
 
-/// Bundle of things an attached interface's watcher task needs to
+/// Bundle of things an attached interface's watcher tasks need to
 /// stay alive until `detach`.
 struct AttachedInterface {
     path: OwnedObjectPath,
-    watcher: JoinHandle<()>,
+    state_watcher: JoinHandle<()>,
+    scan_watcher: JoinHandle<()>,
 }
 
 pub struct WpaSupplicantBackend {
@@ -95,7 +142,8 @@ impl Drop for WpaSupplicantBackend {
             h.abort();
         }
         for (_, iface) in self.interfaces.drain() {
-            iface.watcher.abort();
+            iface.state_watcher.abort();
+            iface.scan_watcher.abort();
         }
     }
 }
@@ -157,17 +205,42 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
             .build()
             .await
             .map_err(zbus_err)?;
-        let watcher = spawn_interface_watcher(props_proxy, ifindex, self.event_tx.clone());
-        self.interfaces
-            .insert(ifindex, AttachedInterface { path, watcher });
+        let state_watcher = spawn_state_watcher(props_proxy, ifindex, self.event_tx.clone());
+
+        // Re-build the interface proxy as `'static` for the ScanDone
+        // watcher task. Two separate tasks (state + scan) keeps each
+        // one small, and abort() on detach is straightforward.
+        let iface_for_scan: WpaInterfaceProxy<'static> =
+            WpaInterfaceProxy::builder(&self.connection)
+                .path(path.clone())
+                .map_err(zbus_err)?
+                .build()
+                .await
+                .map_err(zbus_err)?;
+        let scan_watcher = spawn_scan_watcher(iface_for_scan, ifindex, self.event_tx.clone());
+
+        self.interfaces.insert(
+            ifindex,
+            AttachedInterface {
+                path,
+                state_watcher,
+                scan_watcher,
+            },
+        );
         Ok(())
     }
 
     async fn detach(&mut self, ifindex: u32) -> Result<()> {
-        let Some(AttachedInterface { path, watcher }) = self.interfaces.remove(&ifindex) else {
+        let Some(AttachedInterface {
+            path,
+            state_watcher,
+            scan_watcher,
+        }) = self.interfaces.remove(&ifindex)
+        else {
             return Ok(());
         };
-        watcher.abort();
+        state_watcher.abort();
+        scan_watcher.abort();
         let root = WpaSupplicantProxy::new(&self.connection)
             .await
             .map_err(zbus_err)?;
@@ -182,18 +255,57 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
         Ok(())
     }
 
-    async fn scan(&mut self, _ifindex: u32, _params: ScanParams) -> Result<()> {
-        // TODO DD-003 §9.2: Interface1.Scan(a{sv}{Type, SSIDs, Channels}).
-        //       ScanDone signal → SupplicantEvent::ScanComplete.
-        Err(WifiError::Supplicant {
-            backend: "wpa_supplicant",
-            source: "scan: awaiting DD-003 §9.2 wiring".into(),
-        })
+    async fn scan(&mut self, ifindex: u32, params: ScanParams) -> Result<()> {
+        let path = self
+            .interfaces
+            .get(&ifindex)
+            .map(|i| i.path.clone())
+            .ok_or(WifiError::NotAttached { ifindex })?;
+        let iface = WpaInterfaceProxy::builder(&self.connection)
+            .path(path)
+            .map_err(zbus_err)?
+            .build()
+            .await
+            .map_err(zbus_err)?;
+        // Required: `Type`. Optional: `SSIDs` (aay), `Channels` (a(uu)).
+        // We pass only Type for now — broadcast active/passive scan.
+        // Per-SSID and per-channel narrowing lands with the connect
+        // flow where targeted probes pay off.
+        let type_str = if params.active { "active" } else { "passive" };
+        let mut args: HashMap<&str, Value<'_>> = HashMap::new();
+        args.insert("Type", Value::from(type_str));
+        iface.scan(args).await.map_err(zbus_err)?;
+        Ok(())
     }
 
-    async fn get_scan_results(&self, _ifindex: u32) -> Result<Vec<BssInfo>> {
-        // TODO DD-003 §9.2: Interface1.BSSs → read BSS1 properties.
-        Ok(Vec::new())
+    async fn get_scan_results(&self, ifindex: u32) -> Result<Vec<BssInfo>> {
+        let path = self
+            .interfaces
+            .get(&ifindex)
+            .map(|i| i.path.clone())
+            .ok_or(WifiError::NotAttached { ifindex })?;
+        let iface = WpaInterfaceProxy::builder(&self.connection)
+            .path(path)
+            .map_err(zbus_err)?
+            .build()
+            .await
+            .map_err(zbus_err)?;
+        let bss_paths = iface.bsss().await.map_err(zbus_err)?;
+        let mut out = Vec::with_capacity(bss_paths.len());
+        for p in bss_paths {
+            match read_bss(&self.connection, p).await {
+                Ok(Some(info)) => out.push(info),
+                // BSS had an empty SSID (hidden AP) or malformed data.
+                // Skip rather than abort — one bad cache entry can't
+                // invalidate the whole scan.
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::debug!(error = %e, "wpa_supplicant: skipping unreadable BSS");
+                    continue;
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn connect(&mut self, _ifindex: u32, _network: &NetworkConfig) -> Result<NetworkHandle> {
@@ -296,12 +408,147 @@ fn spawn_daemon_watcher(
     })
 }
 
+/// Spawn a task that watches the interface's `ScanDone` signal and
+/// converts each firing into [`SupplicantEvent::ScanComplete`].
+/// `success=false` is still forwarded — the backend's scan-complete
+/// path treats it as "results are authoritative now, whatever they
+/// are" and a failed scan just means the BSS list didn't refresh.
+fn spawn_scan_watcher(
+    iface: WpaInterfaceProxy<'static>,
+    ifindex: u32,
+    event_tx: broadcast::Sender<SupplicantEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut stream = match iface.receive_scan_done().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(ifindex, error = %e, "wpa_supplicant: ScanDone subscribe failed");
+                return;
+            }
+        };
+        while let Some(_sig) = stream.next().await {
+            let _ = event_tx.send(SupplicantEvent::ScanComplete { ifindex });
+        }
+    })
+}
+
+/// Read the BSS at `path` and translate to [`BssInfo`]. Returns
+/// `Ok(None)` when the BSS's SSID is empty (hidden AP in probe
+/// response) — callers skip those entries rather than surfacing a
+/// noise row. Returns `Err` only when the D-Bus read itself fails.
+async fn read_bss(
+    connection: &Connection,
+    path: OwnedObjectPath,
+) -> Result<Option<crate::types::BssInfo>> {
+    use nexus_core::{MacAddr, Ssid};
+
+    let bss = BssProxy::builder(connection)
+        .path(path)
+        .map_err(zbus_err)?
+        .build()
+        .await
+        .map_err(zbus_err)?;
+
+    let ssid_bytes = bss.ssid().await.map_err(zbus_err)?;
+    if ssid_bytes.is_empty() {
+        return Ok(None);
+    }
+    let Ok(ssid) = Ssid::new(ssid_bytes) else {
+        // >32 bytes or otherwise invalid — treat as uninteresting.
+        return Ok(None);
+    };
+    let bssid_bytes = bss.bssid().await.map_err(zbus_err)?;
+    if bssid_bytes.len() != 6 {
+        return Ok(None);
+    }
+    let bssid = MacAddr([
+        bssid_bytes[0],
+        bssid_bytes[1],
+        bssid_bytes[2],
+        bssid_bytes[3],
+        bssid_bytes[4],
+        bssid_bytes[5],
+    ]);
+    let frequency = bss.frequency().await.map_err(zbus_err)? as u32;
+    let signal_dbm = bss.signal().await.map_err(zbus_err)? as i32;
+    let age_s = bss.age().await.unwrap_or(0);
+    let wpa = bss.wpa().await.unwrap_or_default();
+    let rsn = bss.rsn().await.unwrap_or_default();
+    let security = detect_security(&wpa, &rsn);
+
+    Ok(Some(crate::types::BssInfo {
+        bssid,
+        ssid,
+        frequency,
+        signal_dbm,
+        capabilities: crate::types::BssCapabilities::default(),
+        security,
+        age_ms: (age_s as u64).saturating_mul(1000),
+    }))
+}
+
+/// Convert wpa_supplicant's `WPA` and `RSN` a{sv} dicts into the
+/// set of security modes the AP advertises. Looks only at the
+/// `KeyMgmt` entry — that's enough to distinguish the six
+/// [`SecurityMode`] variants the rest of the stack cares about. See
+/// DD-003 §9.2 for the translation table.
+fn detect_security(
+    wpa: &HashMap<String, OwnedValue>,
+    rsn: &HashMap<String, OwnedValue>,
+) -> Vec<nexus_core::SecurityMode> {
+    use nexus_core::SecurityMode;
+    let rsn_mgmt = extract_key_mgmt(rsn);
+    let wpa_mgmt = extract_key_mgmt(wpa);
+    let mut out = Vec::new();
+    // Prefer the RSN (WPA2/3) advertisement. An AP running in
+    // WPA2/WPA3 transition mode lists both `wpa-psk` and `sae` here.
+    if !rsn_mgmt.is_empty() {
+        let has_sae = rsn_mgmt.iter().any(|s| s == "sae");
+        let has_psk = rsn_mgmt
+            .iter()
+            .any(|s| s == "wpa-psk" || s == "wpa-psk-sha256");
+        let has_eap = rsn_mgmt.iter().any(|s| s.contains("wpa-eap"));
+        let has_owe = rsn_mgmt.iter().any(|s| s == "owe");
+        if has_sae && has_psk {
+            out.push(SecurityMode::Wpa2Wpa3Transition);
+        } else if has_sae {
+            out.push(SecurityMode::Wpa3Sae);
+        } else if has_psk {
+            out.push(SecurityMode::Wpa2Psk);
+        }
+        if has_eap {
+            out.push(SecurityMode::Wpa2Eap);
+        }
+        if has_owe {
+            out.push(SecurityMode::Owe);
+        }
+    } else if wpa_mgmt.iter().any(|s| s == "wpa-psk") {
+        // Legacy WPA1-PSK. We don't have a dedicated variant; round
+        // it up to Wpa2Psk so the selector at least picks something
+        // rather than treating it as Open.
+        out.push(SecurityMode::Wpa2Psk);
+    }
+    if out.is_empty() {
+        out.push(SecurityMode::Open);
+    }
+    out
+}
+
+/// Extract the `KeyMgmt: as` from a WPA/RSN property dict.
+/// Missing or wrongly-typed entries yield an empty vec — caller
+/// treats that as "no key management advertised."
+fn extract_key_mgmt(dict: &HashMap<String, OwnedValue>) -> Vec<String> {
+    dict.get("KeyMgmt")
+        .and_then(|v| <Vec<String>>::try_from(v.try_clone().ok()?).ok())
+        .unwrap_or_default()
+}
+
 /// Spawn a task that watches `PropertiesChanged` on the interface
 /// object and forwards each State transition as
 /// [`SupplicantEvent::State`]. The watcher exits when the signal
 /// stream closes (daemon went away) — the daemon watcher then
 /// emits `DaemonDown` and the backend reconnects on next DaemonUp.
-fn spawn_interface_watcher(
+fn spawn_state_watcher(
     props: zbus::fdo::PropertiesProxy<'static>,
     ifindex: u32,
     event_tx: broadcast::Sender<SupplicantEvent>,
@@ -415,6 +662,93 @@ pub fn translate_disconnect_reason(code: i32) -> super::DisconnectHint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build an `OwnedValue` wrapping an `as` (array of strings) —
+    /// matches wpa_supplicant's real `KeyMgmt` property type.
+    fn keymgmt_value(items: &[&str]) -> OwnedValue {
+        let vec: Vec<String> = items.iter().map(|s| (*s).to_owned()).collect();
+        Value::new(vec).try_into().expect("OwnedValue from as")
+    }
+
+    fn keymgmt_dict(items: &[&str]) -> HashMap<String, OwnedValue> {
+        let mut m = HashMap::new();
+        m.insert("KeyMgmt".to_owned(), keymgmt_value(items));
+        m
+    }
+
+    #[test]
+    fn security_translator_picks_wpa2_psk_from_rsn() {
+        use nexus_core::SecurityMode;
+        let rsn = keymgmt_dict(&["wpa-psk"]);
+        let wpa = HashMap::new();
+        assert_eq!(detect_security(&wpa, &rsn), vec![SecurityMode::Wpa2Psk]);
+    }
+
+    #[test]
+    fn security_translator_picks_wpa3_sae_only_when_no_psk() {
+        use nexus_core::SecurityMode;
+        let rsn = keymgmt_dict(&["sae"]);
+        let wpa = HashMap::new();
+        assert_eq!(detect_security(&wpa, &rsn), vec![SecurityMode::Wpa3Sae]);
+    }
+
+    #[test]
+    fn security_translator_picks_transition_mode_for_psk_plus_sae() {
+        use nexus_core::SecurityMode;
+        let rsn = keymgmt_dict(&["wpa-psk", "sae"]);
+        let wpa = HashMap::new();
+        assert_eq!(
+            detect_security(&wpa, &rsn),
+            vec![SecurityMode::Wpa2Wpa3Transition]
+        );
+    }
+
+    #[test]
+    fn security_translator_adds_enterprise_when_eap_advertised() {
+        use nexus_core::SecurityMode;
+        let rsn = keymgmt_dict(&["wpa-eap"]);
+        let wpa = HashMap::new();
+        assert_eq!(detect_security(&wpa, &rsn), vec![SecurityMode::Wpa2Eap]);
+    }
+
+    #[test]
+    fn security_translator_falls_back_to_open_on_empty_dicts() {
+        use nexus_core::SecurityMode;
+        let rsn = HashMap::new();
+        let wpa = HashMap::new();
+        assert_eq!(detect_security(&wpa, &rsn), vec![SecurityMode::Open]);
+    }
+
+    #[test]
+    fn security_translator_rounds_legacy_wpa1_psk_up_to_wpa2() {
+        use nexus_core::SecurityMode;
+        // RSN absent, only legacy WPA present — our selector doesn't
+        // have a WPA1 variant; round up to Wpa2Psk so profile matching
+        // at least attempts the connect.
+        let rsn = HashMap::new();
+        let wpa = keymgmt_dict(&["wpa-psk"]);
+        assert_eq!(detect_security(&wpa, &rsn), vec![SecurityMode::Wpa2Psk]);
+    }
+
+    #[test]
+    fn security_translator_owe_is_reported() {
+        use nexus_core::SecurityMode;
+        let rsn = keymgmt_dict(&["owe"]);
+        let wpa = HashMap::new();
+        assert_eq!(detect_security(&wpa, &rsn), vec![SecurityMode::Owe]);
+    }
+
+    #[test]
+    fn key_mgmt_extractor_handles_missing_and_malformed() {
+        let empty = HashMap::new();
+        assert!(extract_key_mgmt(&empty).is_empty());
+        // Wrongly-typed entry — a single string where the property
+        // shape promises `as`. Should silently yield empty rather
+        // than panic.
+        let mut bogus = HashMap::new();
+        bogus.insert("KeyMgmt".into(), Value::from("wpa-psk").try_into().unwrap());
+        assert!(extract_key_mgmt(&bogus).is_empty());
+    }
 
     #[test]
     fn state_table_covers_dd003_section_9_5() {
