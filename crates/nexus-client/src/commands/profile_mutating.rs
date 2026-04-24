@@ -35,8 +35,21 @@ pub async fn add_wifi(
     let ssid_val = ssid.ok_or_else(|| NexusctlError::InvalidArgument {
         message: "profile add-wifi needs <ssid> or --file".into(),
     })?;
+    // Decide up front whether the operator is creating an
+    // open-network profile (`--security open` explicitly) or a
+    // secured one. Secured profiles need a PSK; when neither
+    // `--psk` nor `NEXUSCTL_PSK` is set, fall back to the
+    // interactive prompt. On a non-TTY, `resolve_psk` surfaces
+    // `NotInteractive` (exit 5) per DD-008 §6.2.
+    let want_credentials = security != "open"
+        && !(security == "auto" && psk.is_none() && !interactive_psk_available());
+    let passphrase = if want_credentials {
+        Some(crate::interactive::passphrase::resolve_psk(psk).await?)
+    } else {
+        None
+    };
     let security_type = if security == "auto" {
-        if psk.is_some() {
+        if passphrase.is_some() {
             "wpa2_personal".into()
         } else {
             "open".into()
@@ -47,7 +60,7 @@ pub async fn add_wifi(
     let settings = WifiProfileSettings {
         ssid: ssid_val.as_bytes().to_vec(),
         security_type,
-        passphrase: psk.map(str::to_owned),
+        passphrase,
         label: label.map(str::to_owned),
         priority,
         auto_connect,
@@ -290,6 +303,22 @@ pub async fn update(
         w,
     )
     .map_err(io_err)
+}
+
+/// Probe: are we sitting at an interactive TTY *or* is
+/// `NEXUSCTL_PSK` set? If yes, we can safely prompt. If no, an
+/// `--security auto` / no-`--psk` invocation on a non-TTY is open
+/// by default (same defensive choice dialoguer makes for password
+/// prompts — scripts asking for `auto` with no PSK clearly don't
+/// want to block).
+fn interactive_psk_available() -> bool {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return true;
+    }
+    std::env::var("NEXUSCTL_PSK")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 fn io_err(e: std::io::Error) -> NexusctlError {

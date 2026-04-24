@@ -608,6 +608,43 @@ async fn bt_connect_disconnect_forget_trust_route_to_ops() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn profile_add_wifi_no_psk_no_tty_exits_5() {
+    // DD-008 §6.2 exit criterion: `profile add-wifi` without --psk
+    // (and without NEXUSCTL_PSK) on a non-TTY must exit 5 with
+    // `NotInteractive`.
+    unsafe {
+        std::env::remove_var("NEXUSCTL_PSK");
+    }
+    let rec = Recorder::new();
+    let mut stderr = Vec::new();
+    let mut stdout = Vec::new();
+    let err = commands::profile_mutating::add_wifi(
+        rec.as_ref(),
+        Some("home"),
+        None,            // psk
+        None,            // file
+        None,            // label
+        None,            // priority
+        None,            // auto_connect
+        None,            // hidden
+        None,            // fast_transition
+        "wpa2_personal", // security: force a credentialed kind
+        true,            // no_warn_psk
+        &mut stderr,
+        OutputFormat::Human,
+        &RenderContext::default(),
+        &mut stdout,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, NexusctlError::NotInteractive { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 5);
+}
+
+#[tokio::test]
 async fn profile_add_wifi_with_psk_sets_security() {
     let rec = Recorder::new();
     let mut stderr = Vec::new();

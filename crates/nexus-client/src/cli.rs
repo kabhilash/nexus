@@ -80,6 +80,13 @@ pub struct GlobalOpts {
     #[arg(global = true, long)]
     pub no_interactive: bool,
 
+    /// Skip auto-spawning `pkttyagent` for PolicyKit prompts
+    /// (DD-008 §6.3). Useful when the caller has already got an
+    /// agent or explicitly wants mutating commands to fail hard
+    /// on AuthFailed.
+    #[arg(global = true, long)]
+    pub no_polkit_agent: bool,
+
     #[arg(global = true, long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 }

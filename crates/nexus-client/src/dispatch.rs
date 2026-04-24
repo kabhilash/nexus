@@ -9,6 +9,54 @@ use crate::commands;
 use crate::errors::NexusctlError;
 use crate::proxy::{BluetoothListFilter, ManagerOps};
 
+/// Classify the top-level command. Used by `main` to decide
+/// whether to auto-spawn `pkttyagent` (DD-008 §6.3) for PolicyKit
+/// prompts. Read-only commands don't trigger PolicyKit, so the
+/// extra process + terminal handoff is pure overhead.
+pub fn command_is_mutating(command: &Option<Command>) -> bool {
+    match command {
+        None
+        | Some(Command::Status)
+        | Some(Command::Iface { .. })
+        | Some(Command::Eth { .. })
+        | Some(Command::Gnss { .. }) => false,
+        Some(Command::Wifi { sub }) => matches!(
+            sub,
+            WifiSub::Scan { .. }
+                | WifiSub::Connect { .. }
+                | WifiSub::ConnectProfile { .. }
+                | WifiSub::Disconnect { .. }
+                | WifiSub::Forget { .. }
+        ),
+        Some(Command::Bt { sub }) => matches!(
+            sub,
+            BtSub::Power { .. }
+                | BtSub::Scan { .. }
+                | BtSub::Connect { .. }
+                | BtSub::Disconnect { .. }
+                | BtSub::Forget { .. }
+                | BtSub::Trust { .. }
+                | BtSub::Pair { .. }
+        ),
+        Some(Command::Profile { sub }) => matches!(
+            sub,
+            ProfileSub::AddWifi { .. }
+                | ProfileSub::AddEthernet { .. }
+                | ProfileSub::Import { .. }
+                | ProfileSub::Remove { .. }
+                | ProfileSub::Update { .. }
+        ),
+        Some(Command::Power { sub }) => matches!(sub, PowerSub::Set { .. }),
+        Some(Command::Admin { sub }) => matches!(
+            sub,
+            AdminSub::RotateMasterKey
+                | AdminSub::FreezeBackup
+                | AdminSub::ReleaseBackup { .. }
+                | AdminSub::ReloadConfig
+        ),
+    }
+}
+
 pub async fn dispatch(
     cli: &Cli,
     ops: &dyn ManagerOps,

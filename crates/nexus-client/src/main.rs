@@ -31,6 +31,26 @@ async fn main() -> ExitCode {
 
     let format = cli.global.output_format();
 
+    // Install the double-Ctrl-C watchdog early so it's active
+    // across every command, not just mutating ones. Read-only
+    // commands barely have time to notice the first SIGINT before
+    // they'd exit anyway, so the cost is negligible.
+    let _watchdog = nexus_client::interactive::cancellation::install_double_sigint_watchdog();
+
+    // Spawn `pkttyagent` when the command class is likely to need
+    // PolicyKit. We can't perfectly classify from CLI-parse alone
+    // without a full reflection of every subcommand, so the rule
+    // is: if the operator didn't opt out *and* the subcommand is
+    // one we know mutates, auto-spawn. The guard's Drop releases
+    // the process on every exit path.
+    let wants_agent = !cli.global.no_polkit_agent
+        && !matches!(
+            std::env::var("NEXUSCTL_NO_POLKIT_AGENT").as_deref(),
+            Ok("1")
+        )
+        && nexus_client::dispatch::command_is_mutating(&cli.command);
+    let _polkit = nexus_client::interactive::polkit::PolkitAgent::maybe_spawn(wants_agent);
+
     let ops = match ZbusManagerOps::connect(cli.global.bus.as_deref()).await {
         Ok(o) => o,
         Err(e) => return finish(Err(e), format),

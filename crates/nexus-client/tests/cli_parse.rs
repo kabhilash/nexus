@@ -47,6 +47,51 @@ fn iface_list_accepts_kind_filter() {
 }
 
 #[test]
+fn no_polkit_agent_flag_is_global() {
+    let cli = parse(&["--no-polkit-agent", "bt", "pair", "AA:BB:CC:DD:EE:01"]).unwrap();
+    assert!(cli.global.no_polkit_agent);
+}
+
+#[test]
+fn command_is_mutating_classifier_matches_dd008() {
+    use nexus_client::cli::{
+        AdminSub, BtSub, Command, OnOff, PowerStateArg, PowerSub, ProfileSub, WifiSub,
+    };
+    use nexus_client::dispatch::command_is_mutating;
+
+    // Read-only paths.
+    assert!(!command_is_mutating(&None));
+    assert!(!command_is_mutating(&Some(Command::Status)));
+
+    // A sampling of mutating paths.
+    assert!(command_is_mutating(&Some(Command::Wifi {
+        sub: WifiSub::Disconnect { iface: None }
+    })));
+    assert!(command_is_mutating(&Some(Command::Bt {
+        sub: BtSub::Power {
+            hci: "hci0".into(),
+            state: OnOff::On
+        }
+    })));
+    assert!(command_is_mutating(&Some(Command::Profile {
+        sub: ProfileSub::Remove {
+            reference: "x".into()
+        }
+    })));
+    assert!(command_is_mutating(&Some(Command::Power {
+        sub: PowerSub::Set {
+            state: PowerStateArg::Active
+        }
+    })));
+    assert!(command_is_mutating(&Some(Command::Admin {
+        sub: AdminSub::RotateMasterKey
+    })));
+    assert!(!command_is_mutating(&Some(Command::Admin {
+        sub: AdminSub::MasterKeyInfo
+    })));
+}
+
+#[test]
 fn bt_pair_parses_with_default_timeout() {
     use nexus_client::cli::BtSub;
     let cli = parse(&["bt", "pair", "AA:BB:CC:DD:EE:01"]).unwrap();
