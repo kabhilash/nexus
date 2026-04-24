@@ -53,6 +53,38 @@ fn version_flag_prints_version_and_exits_zero() {
 }
 
 #[test]
+fn config_load_error_surfaces_on_stderr_not_silent() {
+    // Regression: an error from `Config::load_from_path` used to be
+    // routed only through `tracing::error!`, which fires before
+    // `init_tracing` installs a subscriber — the operator saw exit
+    // 1 with zero output and no way to tell what went wrong. The
+    // fix emits the error on stderr unconditionally.
+    let bin = env!("CARGO_BIN_EXE_nexusd");
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg_path = tmp.path().join("nexus.toml");
+    // Missing leading `b` — mirrors the real-world typo that first
+    // surfaced this bug.
+    std::fs::write(&cfg_path, "us_capacity = 512\n").unwrap();
+
+    let out = Command::new(bin)
+        .arg("--config")
+        .arg(&cfg_path)
+        .output()
+        .expect("spawn nexusd");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit 1, got {:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nexusd:"), "stderr: {stderr}");
+    // Some slice of the config path must appear so the operator
+    // knows which file failed.
+    assert!(stderr.contains("nexus.toml"), "stderr: {stderr}");
+}
+
+#[test]
 fn fatal_preflight_finding_aborts_with_action_item() {
     // Point profile_store.root at a plain file — preflight classifies
     // that as fatal and prints an action item. nexusd must exit 1

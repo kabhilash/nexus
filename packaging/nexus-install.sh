@@ -32,6 +32,11 @@ UNITDIR="${UNITDIR:-/lib/systemd/system}"
 TMPFILESDIR="${TMPFILESDIR:-/usr/lib/tmpfiles.d}"
 POLKIT_ACTIONS="${POLKIT_ACTIONS:-/usr/share/polkit-1/actions}"
 POLKIT_RULES="${POLKIT_RULES:-/etc/polkit-1/rules.d}"
+# D-Bus system bus policy. `/etc/dbus-1/system.d/` is the
+# administrator-owned tree; distro packages drop into
+# `/usr/share/dbus-1/system.d/`. We use /etc so distro updates
+# don't reach in and overwrite.
+DBUS_SYSTEM_D="${DBUS_SYSTEM_D:-/etc/dbus-1/system.d}"
 
 # Where this script lives — used to locate the packaging/ tree
 # when running from a source checkout.
@@ -190,6 +195,14 @@ maybe install -D -m 0644 \
     "$REPO_ROOT/packaging/polkit-1/actions/fi.nexus.policy" \
     "$POLKIT_ACTIONS/fi.nexus.policy"
 
+# D-Bus bus policy. Without this, dbus-daemon denies nexusd the
+# right to own `fi.nexus1` on the system bus — exit code 1 with
+# only `org.freedesktop.DBus.Error.AccessDenied` to go on.
+log "installing D-Bus system bus policy → $DBUS_SYSTEM_D/fi.nexus1.conf"
+maybe install -D -m 0644 \
+    "$REPO_ROOT/packaging/dbus-1/system.d/fi.nexus1.conf" \
+    "$DBUS_SYSTEM_D/fi.nexus1.conf"
+
 # Rules file is installed only if no existing one would be clobbered.
 if [[ -f "$POLKIT_RULES/50-nexus.rules" ]]; then
     log "$POLKIT_RULES/50-nexus.rules already exists — not overwriting"
@@ -210,6 +223,14 @@ maybe systemd-tmpfiles --create "$TMPFILESDIR/nexus.conf"
 log "daemon-reload + enabling nexus.service"
 maybe systemctl daemon-reload
 maybe systemctl enable nexus.service
+
+# Ask dbus-daemon to re-read its policy tree so the new
+# fi.nexus1.conf takes effect without a reboot. `reload dbus` is a
+# soft reload; clients are unaffected.
+if systemctl is-active --quiet dbus; then
+    log "reloading dbus so fi.nexus1.conf takes effect"
+    maybe systemctl reload dbus
+fi
 
 log "done. Review $CONFDIR/nexus.toml, then start with:"
 log "  systemctl start nexus"

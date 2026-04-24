@@ -50,6 +50,15 @@ async fn main() -> ExitCode {
         Ok(ParsedArgs::Run(args)) => match run(args).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
+                // Belt-and-braces: `error!` only surfaces if a
+                // tracing subscriber is live — but config load + the
+                // preflight step run *before* init_tracing, so an
+                // error from either would silently vanish into a
+                // non-existent subscriber and the operator would see
+                // exit 1 with no output. Write to stderr directly
+                // first, then emit the tracing event so structured
+                // logs capture it when a subscriber does exist.
+                eprintln!("nexusd: {e:#}");
                 error!(error = %format!("{e:#}"), "nexusd startup failed");
                 ExitCode::FAILURE
             }
