@@ -16,6 +16,132 @@ use std::time::{Duration, Instant};
 
 use nexus_daemon::{Config, SubsystemName};
 
+#[test]
+fn help_flag_prints_usage_and_exits_zero() {
+    let bin = env!("CARGO_BIN_EXE_nexusd");
+    let out = Command::new(bin)
+        .arg("--help")
+        .output()
+        .expect("spawn nexusd --help");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Key topics the operator expects to see.
+    assert!(stdout.contains("Usage:"), "stdout: {stdout}");
+    assert!(stdout.contains("--config"), "stdout: {stdout}");
+    assert!(stdout.contains("RUST_LOG"), "stdout: {stdout}");
+    assert!(stdout.contains("SIGTERM"), "stdout: {stdout}");
+    // Help goes to stdout, not stderr (Unix convention).
+    assert!(out.stderr.is_empty(), "stderr: {:?}", out.stderr);
+}
+
+#[test]
+fn version_flag_prints_version_and_exits_zero() {
+    let bin = env!("CARGO_BIN_EXE_nexusd");
+    let out = Command::new(bin)
+        .arg("--version")
+        .output()
+        .expect("spawn nexusd --version");
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // "nexusd x.y.z\n" — must start with the binary name and
+    // include the cargo package version.
+    assert!(stdout.starts_with("nexusd "), "stdout: {stdout}");
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn fatal_preflight_finding_aborts_with_action_item() {
+    // Point profile_store.root at a plain file — preflight classifies
+    // that as fatal and prints an action item. nexusd must exit 1
+    // before any subsystem spawns (we never bind a bus name, so no
+    // cleanup is needed).
+    let bin = env!("CARGO_BIN_EXE_nexusd");
+    let tmp = tempfile::tempdir().unwrap();
+    let blocker = tmp.path().join("not-a-dir");
+    std::fs::write(&blocker, b"junk").unwrap();
+    let cfg_path = tmp.path().join("nexus.toml");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+bus_capacity = 32
+log_level = "error"
+
+[supervision]
+restart = false
+
+[interface_monitor]
+enabled = false
+
+[profile_store]
+root = "{}"
+key_source = "in_memory"
+in_memory_seed = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[dbus]
+enabled = false
+bus_name = "fi.nexus1.test.preflight"
+use_session_bus = true
+allow_all_authz = true
+
+[ethernet]
+enabled = false
+
+[wifi]
+enabled = false
+
+[bluetooth]
+enabled = false
+
+[gnss]
+enabled = false
+"#,
+            blocker.display(),
+        ),
+    )
+    .unwrap();
+
+    let out = Command::new(bin)
+        .arg("--config")
+        .arg(&cfg_path)
+        .output()
+        .expect("spawn nexusd");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit 1, got {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The finding header and action-item line both land on stderr.
+    assert!(stderr.contains("[fatal] profile_store"), "stderr: {stderr}");
+    assert!(stderr.contains("-> "), "stderr: {stderr}");
+}
+
+#[test]
+fn unknown_flag_exits_with_usage_code() {
+    let bin = env!("CARGO_BIN_EXE_nexusd");
+    let out = Command::new(bin)
+        .arg("--totally-made-up")
+        .output()
+        .expect("spawn nexusd with bad flag");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2 (usage), got {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("nexusd:"), "stderr: {stderr}");
+    // Error hint points operators at --help.
+    assert!(stderr.contains("--help"), "stderr: {stderr}");
+}
+
 fn fixture(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("tests");

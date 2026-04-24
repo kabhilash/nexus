@@ -21,7 +21,7 @@ use anyhow::{Context, Result, anyhow};
 use nexus_bluetooth::{BluetoothConfig, MockBluezClient, ZbusBluezClient, spawn_bluetooth_backend};
 use nexus_core::NexusEvent;
 use nexus_daemon::{
-    Config, LogLevelSetter, ReloadCoordinator, ReloadOps, SubsystemName, spawn_bus,
+    Config, LogLevelSetter, ReloadCoordinator, ReloadOps, SubsystemName, preflight, spawn_bus,
     spawn_supervised,
 };
 use nexus_dbus::{
@@ -46,31 +46,47 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let args = match parse_args(std::env::args().skip(1).collect()) {
-        Ok(a) => a,
+    match parse_args(std::env::args().skip(1).collect()) {
+        Ok(ParsedArgs::Run(args)) => match run(args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!(error = %format!("{e:#}"), "nexusd startup failed");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(ParsedArgs::PrintHelp) => {
+            print!("{}", help_text());
+            ExitCode::SUCCESS
+        }
+        Ok(ParsedArgs::PrintVersion) => {
+            println!("nexusd {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("nexusd: {e}");
-            eprintln!("usage: nexusd [--config PATH]");
-            return ExitCode::from(2);
-        }
-    };
-
-    match run(args).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            error!(error = %format!("{e:#}"), "nexusd startup failed");
-            ExitCode::FAILURE
+            eprintln!("try `nexusd --help` for usage");
+            ExitCode::from(2)
         }
     }
 }
 
-#[derive(Debug)]
+/// Result of parsing argv. `Run` carries the effective config path;
+/// `PrintHelp` / `PrintVersion` mean main should emit the canned
+/// text and exit 0 without booting the daemon.
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedArgs {
+    Run(CliArgs),
+    PrintHelp,
+    PrintVersion,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct CliArgs {
     config_path: PathBuf,
 }
 
-fn parse_args(args: Vec<String>) -> Result<CliArgs> {
-    let mut config_path = PathBuf::from("/etc/nexus/nexus.toml");
+fn parse_args(args: Vec<String>) -> Result<ParsedArgs> {
+    let mut config_path: Option<PathBuf> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -78,14 +94,74 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs> {
                 let value = iter
                     .next()
                     .ok_or_else(|| anyhow!("--config requires a PATH argument"))?;
-                config_path = PathBuf::from(value);
+                config_path = Some(PathBuf::from(value));
             }
+            "-h" | "--help" => return Ok(ParsedArgs::PrintHelp),
+            "-V" | "--version" => return Ok(ParsedArgs::PrintVersion),
             other => {
                 return Err(anyhow!("unexpected argument: {other}"));
             }
         }
     }
-    Ok(CliArgs { config_path })
+    Ok(ParsedArgs::Run(CliArgs {
+        config_path: config_path.unwrap_or_else(|| PathBuf::from("/etc/nexus/nexus.toml")),
+    }))
+}
+
+/// Human-readable `--help` text. Kept as a function (rather than a
+/// `const`) so `CARGO_PKG_VERSION` is baked in at compile time while
+/// the body can use multi-line formatting freely.
+fn help_text() -> String {
+    format!(
+        "\
+nexusd {version} — the Nexus platform connectivity daemon
+
+Manages Ethernet, Wi-Fi, Bluetooth, and GNSS on embedded Linux
+devices behind a single D-Bus API. See docs/nexus-architecture.md
+for the full subsystem layout.
+
+Usage:
+    nexusd [OPTIONS]
+
+Options:
+        --config PATH    Path to the TOML config
+                         (default: /etc/nexus/nexus.toml)
+    -h, --help           Print this help and exit
+    -V, --version        Print the version string and exit
+
+Environment:
+    RUST_LOG             Overrides the log_level directive from the
+                         config for this run — takes tracing
+                         EnvFilter syntax, e.g.
+                           RUST_LOG=debug,nexus_wifi=trace
+    NOTIFY_SOCKET        When set (systemd unit), nexusd sends
+                         READY=1 once every subsystem is up and
+                         STOPPING=1 on graceful shutdown
+
+Signals:
+    SIGTERM / SIGINT     Start a graceful shutdown — supervisors
+                         stop, D-Bus name is released, exit 0
+
+Self-test:
+    On startup, nexusd probes the environment for the things each
+    enabled subsystem needs (profile-store write access, BlueZ /
+    wpa_supplicant / gpsd on PATH, …). Warnings print the required
+    fix and the daemon continues; fatal findings print the fix and
+    abort with exit 1 before any subsystem is spawned.
+
+Exit codes:
+    0    clean exit (including SIGTERM path)
+    1    runtime failure during startup or supervisor join
+         (includes a fatal preflight finding)
+    2    usage error (bad argv)
+
+Typical invocations:
+    nexusd                                  # use /etc/nexus/nexus.toml
+    nexusd --config /etc/nexus/dev.toml
+    RUST_LOG=debug nexusd --config ./local.toml
+",
+        version = env!("CARGO_PKG_VERSION"),
+    )
 }
 
 async fn run(args: CliArgs) -> Result<()> {
@@ -97,6 +173,22 @@ async fn run(args: CliArgs) -> Result<()> {
         bus_capacity = config.bus_capacity,
         "nexusd starting"
     );
+
+    // Self-test the environment before wiring any subsystems. Fatal
+    // findings abort with exit 1; warnings print action items but
+    // let the daemon proceed — backend reconnect loops handle the
+    // transient-external-daemon case on their own.
+    let findings = preflight::run(&config);
+    if !findings.is_empty() {
+        let mut stderr = std::io::stderr().lock();
+        let fatal =
+            preflight::report(&findings, &mut stderr).context("writing preflight report")?;
+        if fatal {
+            return Err(anyhow!(
+                "preflight self-test failed — see action items above"
+            ));
+        }
+    }
 
     let (event_tx, _event_rx) = spawn_bus(config.bus_capacity);
     let shutdown = CancellationToken::new();
@@ -635,15 +727,22 @@ async fn build_dbus_config(
 mod tests {
     use super::*;
 
+    fn unwrap_run(parsed: ParsedArgs) -> CliArgs {
+        match parsed {
+            ParsedArgs::Run(a) => a,
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_args_default() {
-        let args = parse_args(vec![]).unwrap();
+        let args = unwrap_run(parse_args(vec![]).unwrap());
         assert_eq!(args.config_path, PathBuf::from("/etc/nexus/nexus.toml"));
     }
 
     #[test]
     fn parse_args_with_config() {
-        let args = parse_args(vec!["--config".into(), "/tmp/foo.toml".into()]).unwrap();
+        let args = unwrap_run(parse_args(vec!["--config".into(), "/tmp/foo.toml".into()]).unwrap());
         assert_eq!(args.config_path, PathBuf::from("/tmp/foo.toml"));
     }
 
@@ -655,6 +754,63 @@ mod tests {
     #[test]
     fn parse_args_unknown() {
         assert!(parse_args(vec!["--wat".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_args_help_long_and_short() {
+        assert_eq!(
+            parse_args(vec!["--help".into()]).unwrap(),
+            ParsedArgs::PrintHelp
+        );
+        assert_eq!(
+            parse_args(vec!["-h".into()]).unwrap(),
+            ParsedArgs::PrintHelp
+        );
+    }
+
+    #[test]
+    fn parse_args_version_long_and_short() {
+        assert_eq!(
+            parse_args(vec!["--version".into()]).unwrap(),
+            ParsedArgs::PrintVersion
+        );
+        assert_eq!(
+            parse_args(vec!["-V".into()]).unwrap(),
+            ParsedArgs::PrintVersion
+        );
+    }
+
+    #[test]
+    fn parse_args_help_wins_over_config() {
+        // `--help` short-circuits, matching clap's behaviour. Lets
+        // operators run `nexusd --config /nonexistent --help` without
+        // the nonexistent config producing an error.
+        assert_eq!(
+            parse_args(vec![
+                "--config".into(),
+                "/tmp/x.toml".into(),
+                "--help".into()
+            ])
+            .unwrap(),
+            ParsedArgs::PrintHelp
+        );
+    }
+
+    #[test]
+    fn help_text_mentions_key_topics() {
+        // The message is part of the operator-visible surface. If any
+        // of these topics stop appearing in --help, we've regressed.
+        let h = help_text();
+        assert!(h.contains("--config"));
+        assert!(h.contains("--help"));
+        assert!(h.contains("--version"));
+        assert!(h.contains("RUST_LOG"));
+        assert!(h.contains("SIGTERM"));
+        assert!(h.contains("NOTIFY_SOCKET"));
+        // The self-test section is an operator-visible contract.
+        assert!(h.contains("Self-test"));
+        // Current package version is baked in.
+        assert!(h.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

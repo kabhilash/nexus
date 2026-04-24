@@ -15,6 +15,7 @@
 
 pub mod bus;
 pub mod config;
+pub mod preflight;
 pub mod reload;
 pub mod supervision;
 
