@@ -1562,13 +1562,14 @@ nl80211 supports configuring the Wi-Fi chipset to wake the host on specific even
 
 Independent of the system-wide `PowerState`, each wireless interface has a kernel `rfkill` switch. When rfkill is asserted, the interface is hard-disabled — no scans, no connections, minimal power draw. The `fi.nexus.Wifi.Powered` D-Bus property (DD-006 §6.3) exposes this state.
 
-**Shipped implementation (v0.x).** A dedicated `/dev/rfkill` watcher is out-of-scope for the first release; the backend uses the kernel admin state as a faithful proxy, because every Wi-Fi driver Nexus targets clears `IFF_UP` when rfkill asserts:
+**Shipped implementation.** `nexus-wifi::rfkill` opens `/dev/rfkill` twice:
 
-- **Read path.** `WifiInterfaceState.powered` is derived in `nexus-dbus::service::apply_wifi_powered_from_operstate` from the kernel `OperState` already observed by the Interface Monitor: `Down | NotPresent ⇒ false`, anything else ⇒ `true`. No new event type or netlink subscription is needed.
-- **Write path.** `BackendOps::wifi_set_powered` in `nexus-daemon::wifi_ops` shells out to `ip link set dev <ifname> up|down`. The daemon runs as root, and the ifname is validated against a conservative `[A-Za-z0-9_.:@-]{1,15}` pattern (also rejecting a leading `-`) before it reaches `tokio::process::Command::args`.
-- **Feature gate.** When the Wi-Fi feature is disabled in `EnabledFeatures`, the property reads `false` unconditionally, matching the "we aren't managing this interface" semantics documented on `check_feature`.
+- **Read path.** A non-blocking fd wrapped in `tokio::io::unix::AsyncFd` drives a reader task that filters to `RFKILL_TYPE_WLAN` events, resolves each event's `idx` to its wiphy via `/sys/class/rfkill/rfkillN/name`, and emits `RfkillState { wiphy_name, powered }` over an mpsc to the Wi-Fi backend. The kernel sends synthetic `RFKILL_OP_ADD` events at `open()` time, so the initial state of every registered rfkill is captured with no separate sysfs enumeration. Out-of-band kernel events — hardware switches, `rfkill` userspace, direct sysfs writes — flow the same way. The backend republishes each edge as `NexusEvent::WifiRfkillChanged { ifindex, powered }` after resolving wiphy_name → ifindex through its local interface registry; the D-Bus service.rs handler writes that into `WifiInterfaceState.powered`.
+- **Write path.** A second, blocking fd holds the write side. `RfkillWriter::set_blocked(wiphy_name, block)` resolves wiphy_name → rfkill idx via `/sys/class/rfkill/rfkill*`, constructs an 8-byte `rfkill_event` with `op = RFKILL_OP_CHANGE`, and issues a single `write(2)` (run inside `tokio::task::spawn_blocking`). `WifiCommand::SetPowered` — sent by `nexus-daemon::wifi_ops` on a D-Bus `Powered` property write — routes through this path.
+- **Race seed.** Because the watcher's synthetic ADD events fire before the Wi-Fi backend has observed `InterfaceDiscovered`, the backend re-reads `/sys/class/rfkill/rfkillN/{soft,hard}` on each wifi `InterfaceDiscovered` and emits a synthetic `WifiRfkillChanged` so the initial `Powered` property value is correct.
+- **Feature gate.** When the Wi-Fi feature is disabled in `EnabledFeatures`, `fi.nexus.Wifi.Powered` reads `false` unconditionally, matching the "we aren't managing this interface" semantics documented on `check_feature`.
 
-**Residual — proper rfkill watcher.** The proxy misses two cases a dedicated `/dev/rfkill` reader would catch: (1) a driver that keeps `IFF_UP` asserted while soft-rfkilled, and (2) out-of-band hardware-switch (hard rfkill) events that don't round-trip through `ip link`. Neither has been observed on the supported hardware, but a future revision of this DD will add a `/dev/rfkill` reader task emitting a new `NexusEvent::WifiRfkillChanged` variant and sourcing `powered` from that directly. On rfkill assertion, the interface will transition to `Disconnected { reason: RfKilled }` (the reason is already defined in `NexusEvent`); on release, back to `Idle` so normal scan scheduling resumes.
+**Degrade path.** If `/dev/rfkill` can't be opened (container without the device, non-root, kernel without rfkill support), `spawn_wifi_backend` logs a warning and proceeds with the reader/writer unwired. `SetPowered` then returns `fi.nexus.Error.Io` ("rfkill writer not available") and the `Powered` property stays at its default (`false`). This keeps dev builds on container hosts running.
 
 The rfkill state is distinct from `PowerState::Sleep` — rfkill is a hard hardware block; sleep is a software scheduling decision. A device in `Active` power state with rfkill asserted stays blocked; a device in `Sleep` power state with rfkill unblocked only fires connect-time scans.
 
@@ -1620,7 +1621,7 @@ Verify behavior under different regulatory domains:
 
 Wi-Fi is the most complex backend. Phases reflect a layered build-up — trait first, default supplicant path next, refinements last. DD-001 must be at phase 5 (event emission) before starting; DD-002 can proceed in parallel.
 
-**Shipped status (v0.x).** Phases 1–9 and 11 landed and are live on the Raspberry Pi reference hardware against wpa_supplicant + BCM4345 (brcmfmac). Phase 10 (iwd backend) is the only phase not started. Residuals inside otherwise-complete phases are called out on the phase they belong to; see §13.5 for the rfkill proxy caveat.
+**Shipped status (v0.x).** Phases 1–9 and 11 landed and are live on the Raspberry Pi reference hardware against wpa_supplicant + BCM4345 (brcmfmac). Phase 10 (iwd backend) is the only phase not started. Phase 11's integration harness is in tree but its automatic execution waits on a privileged CI runner; see §14.2 and the Phase 11 notes below.
 
 ### Phase 1 — Skeleton and Lifecycle — **Shipped**
 
@@ -1710,15 +1711,15 @@ Handle `NameOwnerChanged` on `fi.w1.wpa_supplicant1` per §12.1.
 
 **Exit criterion:** Killing wpa_supplicant mid-connection causes clean recovery once systemd restarts it.
 
-### Phase 9 — Power Management — **Shipped (with residual)**
+### Phase 9 — Power Management — **Shipped**
 
 `src/power.rs`. Per-power-state scan and poll scheduling (§13).
 
 - D-Bus method on Nexus's manager for `SetPowerState`.
 - Scheduler adjustments per state.
-- `fi.nexus.Wifi.Powered`: read path derives from the kernel operstate in `nexus-dbus::service::apply_wifi_powered_from_operstate`; write path invokes `ip link set dev <ifname> up|down` from `nexus-daemon::wifi_ops::WifiBackendOps::wifi_set_powered` (ifname validated; daemon runs as root). Full detail + residual in §13.5.
+- `fi.nexus.Wifi.Powered`: `/dev/rfkill` reader + writer in `nexus-wifi::rfkill` (§13.5). Read path emits `NexusEvent::WifiRfkillChanged`; write path routes through `WifiCommand::SetPowered` into `RfkillWriter::set_blocked`.
 
-**Exit criterion:** Transitioning to `background` doubles scan intervals; transitioning to `sleep` pauses scheduled scans. *Residual — a dedicated `/dev/rfkill` watcher replacing the operstate proxy (§13.5).*
+**Exit criterion:** Transitioning to `background` doubles scan intervals; transitioning to `sleep` pauses scheduled scans. `Powered` read/write round-trips verified on real hardware: property writes flip the kernel rfkill state (validated via `/sys/class/rfkill/rfkillN/soft`); out-of-band sysfs writes propagate back through the property within the single-`read(2)` latency of the watcher task.
 
 ### Phase 10 — iwd Backend (Optional, Feature-Gated) — **Not started**
 
@@ -1730,14 +1731,14 @@ Handle `NameOwnerChanged` on `fi.w1.wpa_supplicant1` per §12.1.
 
 **Exit criterion:** With the feature enabled, core scenarios (Open, WPA2-PSK, WPA3-SAE) work. Enterprise support is best-effort.
 
-### Phase 11 — Metrics & Integration Tests — **Shipped (with residual)**
+### Phase 11 — Metrics & Integration Tests — **Shipped (harness in place; CI runner pending)**
 
 - Full metric set per the conventions established in DD-001 §9.5.
-- Full integration test matrix per §14.2.
+- Integration test harness at `crates/nexus-wifi/tests/hwsim/` + `tests/hwsim_integration.rs`, gated behind the `integration-linux` Cargo feature. RAII helpers for `mac80211_hwsim` (`modprobe` load + `rmmod` unload), `hostapd` (config generation + child-process teardown), and `wpa_supplicant` (per-interface spawn) make new scenarios additive. First smoke test (`scan_finds_hostapd_ap`) is `#[ignore]`d so stock `cargo test` skips it; capable hosts run `sudo cargo test -p nexus-wifi --features integration-linux --test hwsim_integration -- --ignored`.
 - Regulatory domain tests per §14.4.
 - Hardware lab validation matrix per §14.3.
 
-**Exit criterion:** CI green. Backend ready for production use with wpa_supplicant; iwd marked experimental. *Residual — the hwsim + hostapd harness from §14.2 is not yet in CI; integration-gated tests are behind the `integration-linux` feature and run manually. On real hardware (BCM4345 via brcmfmac on a Pi 4) scan → WPA2-Personal connect → disconnect → reconnect is verified.*
+**Exit criterion:** CI green. Backend ready for production use with wpa_supplicant; iwd marked experimental. *Residual — a privileged CI runner that can load kernel modules (for automatic `--ignored` execution of the hwsim suite). On real hardware (BCM4345 via brcmfmac on a Pi 4), the full scan → WPA2-Personal connect → disconnect → rfkill block/unblock → reconnect flow is verified manually and documented in each landing commit.*
 
 ### Parallel work and dependencies
 
