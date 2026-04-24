@@ -65,6 +65,7 @@ mod tests {
             state: "up".into(),
             mac: Some("aa:bb:cc:dd:ee:01".into()),
             carrier: true,
+            managed_profile: None,
         }];
         let mut buf = Vec::new();
         render_iface_list_pretty(&rows, &RenderContext::default(), &mut buf).unwrap();
@@ -85,6 +86,7 @@ mod tests {
                 state: "up".into(),
                 mac: None,
                 carrier: false,
+                managed_profile: None,
             },
             InterfaceSummary {
                 iface: "wlan0".into(),
@@ -92,6 +94,7 @@ mod tests {
                 state: "connected".into(),
                 mac: None,
                 carrier: true,
+                managed_profile: None,
             },
         ];
         let mut buf = Vec::new();

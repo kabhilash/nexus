@@ -38,10 +38,19 @@ impl Render for ManagerStatus {
 }
 
 fn render_status_block(status: &ManagerStatus, w: &mut dyn Write) -> io::Result<()> {
-    let key_w = "Master key:".len();
+    let key_w = "Capabilities:".len();
     writeln!(w, "{:<key_w$} {}", "Version:", status.version)?;
     writeln!(w, "{:<key_w$} {}", "Power state:", status.power_state)?;
-    writeln!(w, "{:<key_w$} {}", "Interfaces:", status.interface_count)?;
+    writeln!(
+        w,
+        "{:<key_w$} {} ({} ethernet, {} wifi, {} bluetooth, {} gnss)",
+        "Interfaces:",
+        status.interface_count,
+        status.ethernet_count,
+        status.wifi_count,
+        status.bluetooth_count,
+        status.gnss_count,
+    )?;
     writeln!(
         w,
         "{:<key_w$} {} wifi, {} ethernet, {} bluetooth",
@@ -49,6 +58,26 @@ fn render_status_block(status: &ManagerStatus, w: &mut dyn Write) -> io::Result<
         status.wifi_profile_count,
         status.ethernet_profile_count,
         status.bluetooth_profile_count
+    )?;
+    writeln!(
+        w,
+        "{:<key_w$} {}",
+        "BlueZ:",
+        if status.bluez_available {
+            "reachable"
+        } else {
+            "not reachable"
+        }
+    )?;
+    writeln!(
+        w,
+        "{:<key_w$} {}",
+        "gpsd:",
+        if status.gpsd_available {
+            "reachable"
+        } else {
+            "not reachable"
+        }
     )?;
     writeln!(w, "{:<key_w$} {}", "Master key:", status.master_key_source)?;
     if !status.api_capabilities.is_empty() {

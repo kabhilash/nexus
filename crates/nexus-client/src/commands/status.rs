@@ -46,10 +46,16 @@ mod tests {
                 power_state: "active".into(),
                 api_capabilities: vec![],
                 interface_count: 3,
+                ethernet_count: 1,
+                wifi_count: 1,
+                bluetooth_count: 1,
+                gnss_count: 0,
                 wifi_profile_count: 1,
                 ethernet_profile_count: 0,
                 bluetooth_profile_count: 0,
                 master_key_source: "file".into(),
+                bluez_available: true,
+                gpsd_available: false,
             })
         }
         async fn list_interfaces(&self) -> Result<Vec<InterfaceSummary>, NexusctlError> {

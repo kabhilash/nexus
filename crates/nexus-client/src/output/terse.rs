@@ -23,9 +23,15 @@ pub const STATUS_FIELDS: &[&str] = &[
     "version",
     "power_state",
     "interfaces",
+    "ethernet",
+    "wifi",
+    "bluetooth",
+    "gnss",
     "wifi_profiles",
     "ethernet_profiles",
     "bluetooth_profiles",
+    "bluez",
+    "gpsd",
     "master_key",
 ];
 
@@ -90,9 +96,25 @@ fn status_field_value(status: &ManagerStatus, field: &str) -> String {
         "version" => status.version.clone(),
         "power_state" => status.power_state.clone(),
         "interfaces" => status.interface_count.to_string(),
+        "ethernet" => status.ethernet_count.to_string(),
+        "wifi" => status.wifi_count.to_string(),
+        "bluetooth" => status.bluetooth_count.to_string(),
+        "gnss" => status.gnss_count.to_string(),
         "wifi_profiles" => status.wifi_profile_count.to_string(),
         "ethernet_profiles" => status.ethernet_profile_count.to_string(),
         "bluetooth_profiles" => status.bluetooth_profile_count.to_string(),
+        "bluez" => if status.bluez_available {
+            "true"
+        } else {
+            "false"
+        }
+        .into(),
+        "gpsd" => if status.gpsd_available {
+            "true"
+        } else {
+            "false"
+        }
+        .into(),
         "master_key" => status.master_key_source.clone(),
         _ => String::new(),
     }
@@ -140,6 +162,7 @@ mod tests {
             state: state.into(),
             mac: mac.map(str::to_owned),
             carrier: false,
+            managed_profile: None,
         }
     }
 
@@ -217,6 +240,7 @@ mod tests {
             state: "up".into(),
             mac: None,
             carrier: false,
+            managed_profile: None,
         }];
         let ctx = RenderContext {
             fields: Some(vec!["iface".into(), "state".into()]),

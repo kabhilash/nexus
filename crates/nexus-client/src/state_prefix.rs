@@ -127,11 +127,14 @@ pub fn classify(row: &InterfaceSummary) -> StatePrefix {
         _ => {}
     }
 
+    // `A` — profile attached (ManagedProfile points at a real
+    // profile object; `/` means none). Phase 3 plumbs this via
+    // `InterfaceSummary::managed_profile`.
+    let auto = row.managed_profile.is_some();
+
     StatePrefix {
         present,
-        // `A` needs profile-attachment signal; not in Phase 1
-        // data. See the module doc-comment.
-        auto: false,
+        auto,
         online,
         ready,
         fix,
@@ -150,6 +153,7 @@ mod tests {
             state: state.into(),
             mac: None,
             carrier,
+            managed_profile: None,
         }
     }
 
@@ -206,5 +210,13 @@ mod tests {
     fn down_ethernet_with_no_carrier_is_still_present_but_offline() {
         let p = classify(&row("ethernet", "down", false));
         assert_eq!(p.render(), "*  ");
+    }
+
+    #[test]
+    fn managed_profile_sets_auto_flag() {
+        let mut r = row("wifi", "connected", true);
+        r.managed_profile = Some("/fi/nexus1/profile/wifi/X".into());
+        let p = classify(&r);
+        assert_eq!(p.render(), "*AO");
     }
 }

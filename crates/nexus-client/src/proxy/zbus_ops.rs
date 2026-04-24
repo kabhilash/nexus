@@ -1,14 +1,39 @@
 //! Production `ManagerOps` impl. Wraps the generated zbus proxies
-//! and decodes the `a{sv}` snapshot into [`ManagerStatus`].
+//! and decodes them into the command-facing view types.
+//!
+//! Every method goes through the same shape:
+//! 1. Open the Manager proxy + resolve the needed object path(s).
+//! 2. Read each property the view needs.
+//! 3. Assemble and return the view struct.
+//!
+//! Per-property reads are a round-trip each — Phase 3 prefers
+//! "simple but obviously correct" over batched `Properties.GetAll`
+//! calls; a future perf pass can tighten that once measurements
+//! call for it.
 
 use async_trait::async_trait;
 use zbus::Connection;
 
 use crate::errors::NexusctlError;
 use crate::errors_map::from_zbus_error;
+use crate::path_resolve::{
+    resolve_bluetooth_device_by_address, resolve_gnss_by_device, resolve_interface_by_ifname,
+    resolve_interfaces_of_kind, resolve_profile_by_ref,
+};
+use crate::proxy::bluetooth::BluetoothProxy;
+use crate::proxy::bluetooth_device::BluetoothDeviceProxy;
+use crate::proxy::ethernet::EthernetProxy;
+use crate::proxy::gnss::GnssProxy;
 use crate::proxy::interface::InterfaceProxy;
 use crate::proxy::manager::ManagerProxy;
-use crate::proxy::{InterfaceSummary, ManagerOps, ManagerStatus};
+use crate::proxy::profile::{EthernetProfileProxy, ProfileProxy, WifiProfileProxy};
+use crate::proxy::wifi::WifiProxy;
+use crate::proxy::{
+    BluetoothAdapterDetail, BluetoothAdapterSummary, BluetoothDeviceDetail, BluetoothDeviceSummary,
+    BluetoothListFilter, EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix,
+    GnssSatellitesView, InterfaceDetail, InterfaceSummary, ManagerOps, ManagerStatus,
+    MasterKeyInfo, ProfileDetail, ProfileSummary, WifiDetail, WifiProfileDetail,
+};
 
 pub struct ZbusManagerOps {
     connection: Connection,
@@ -19,9 +44,6 @@ impl ZbusManagerOps {
         Self { connection }
     }
 
-    /// Open a connection to the system bus (or a custom address)
-    /// and wrap it. Used by the binary entry point; tests inject a
-    /// pre-built connection directly via [`Self::new`].
     pub async fn connect(bus_address: Option<&str>) -> Result<Self, NexusctlError> {
         let conn = match bus_address {
             Some(addr) => zbus::connection::Builder::address(addr)
@@ -33,6 +55,28 @@ impl ZbusManagerOps {
         };
         Ok(Self::new(conn))
     }
+
+    /// Internal helper: build an `InterfaceSummary` for an already-
+    /// resolved interface object path.
+    async fn read_interface_summary(
+        &self,
+        iface: &InterfaceProxy<'_>,
+    ) -> Result<InterfaceSummary, NexusctlError> {
+        let ifname = iface.ifname().await.map_err(from_zbus_error)?;
+        let kind = iface.kind().await.map_err(from_zbus_error)?;
+        let state = iface.oper_state().await.map_err(from_zbus_error)?;
+        let carrier = iface.carrier().await.map_err(from_zbus_error)?;
+        let mac_bytes = iface.mac().await.map_err(from_zbus_error)?;
+        let managed = iface.managed_profile().await.map_err(from_zbus_error)?;
+        Ok(InterfaceSummary {
+            iface: ifname,
+            kind,
+            state,
+            mac: format_mac(&mac_bytes),
+            carrier,
+            managed_profile: normalise_profile_path(managed.as_str()),
+        })
+    }
 }
 
 #[async_trait]
@@ -42,7 +86,53 @@ impl ManagerOps for ZbusManagerOps {
             .await
             .map_err(from_zbus_error)?;
         let dict = proxy.get_manager_status().await.map_err(from_zbus_error)?;
-        Ok(decode_manager_status(&dict))
+        let mut status = decode_manager_status(&dict);
+
+        // BlueZ / gpsd availability is derived client-side from the
+        // interface list. An adapter/GNSS interface in a
+        // "past-unavailable" state implies the underlying daemon is
+        // up.
+        let rows = self.list_interfaces().await?;
+        let mut eth = 0u32;
+        let mut wifi = 0u32;
+        let mut bt = 0u32;
+        let mut gnss = 0u32;
+        let mut bluez = false;
+        for r in &rows {
+            match r.kind.as_str() {
+                "ethernet" => eth += 1,
+                "wifi" | "wireless" => wifi += 1,
+                "bluetooth" => {
+                    bt += 1;
+                    if r.state != "unavailable" && !r.state.is_empty() {
+                        bluez = true;
+                    }
+                }
+                "gnss" => gnss += 1,
+                _ => {}
+            }
+        }
+        // `gpsd_available` needs a property read per GNSS interface.
+        let mut gpsd = false;
+        for (_ifname, path) in resolve_interfaces_of_kind(&self.connection, "gnss").await? {
+            let g = GnssProxy::builder(&self.connection)
+                .path(path)
+                .map_err(from_zbus_error)?
+                .build()
+                .await
+                .map_err(from_zbus_error)?;
+            if g.gpsd_connected().await.unwrap_or(false) {
+                gpsd = true;
+                break;
+            }
+        }
+        status.ethernet_count = eth;
+        status.wifi_count = wifi;
+        status.bluetooth_count = bt;
+        status.gnss_count = gnss;
+        status.bluez_available = bluez;
+        status.gpsd_available = gpsd;
+        Ok(status)
     }
 
     async fn list_interfaces(&self) -> Result<Vec<InterfaceSummary>, NexusctlError> {
@@ -53,47 +143,425 @@ impl ManagerOps for ZbusManagerOps {
         let mut out = Vec::with_capacity(paths.len());
         for path in paths {
             let proxy = InterfaceProxy::builder(&self.connection)
-                .path(path.clone())
+                .path(path)
                 .map_err(from_zbus_error)?
                 .build()
                 .await
                 .map_err(from_zbus_error)?;
-            // Each property read is a separate D-Bus call; that's
-            // fine for Phase 1 (small interface count, no caching).
-            // Later phases batch via `Properties.GetAll`.
-            let ifname = proxy.ifname().await.map_err(from_zbus_error)?;
-            let kind = proxy.kind().await.map_err(from_zbus_error)?;
-            let state = proxy.oper_state().await.map_err(from_zbus_error)?;
-            let carrier = proxy.carrier().await.map_err(from_zbus_error)?;
-            let mac_bytes = proxy.mac().await.map_err(from_zbus_error)?;
-            out.push(InterfaceSummary {
-                iface: ifname,
-                kind,
-                state,
-                mac: format_mac(&mac_bytes),
-                carrier,
+            out.push(self.read_interface_summary(&proxy).await?);
+        }
+        Ok(out)
+    }
+
+    async fn show_interface(&self, ifname: &str) -> Result<InterfaceDetail, NexusctlError> {
+        let path = resolve_interface_by_ifname(&self.connection, ifname).await?;
+        let iface = InterfaceProxy::builder(&self.connection)
+            .path(path.clone())
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        let summary = self.read_interface_summary(&iface).await?;
+        let ifindex = iface.ifindex().await.ok();
+        let mut detail = InterfaceDetail {
+            summary: summary.clone(),
+            mtu: None, // MTU isn't exposed on fi.nexus.Interface today.
+            ifindex,
+            wifi: None,
+            ethernet: None,
+            bluetooth: None,
+            gnss: None,
+        };
+        match summary.kind.as_str() {
+            "wifi" | "wireless" => {
+                let w = WifiProxy::builder(&self.connection)
+                    .path(path)
+                    .map_err(from_zbus_error)?
+                    .build()
+                    .await
+                    .map_err(from_zbus_error)?;
+                let bss = w.connected_bss().await.map_err(from_zbus_error)?;
+                let (ssid_str, _bytes, bssid_bytes, freq, rssi, sec) = bss;
+                let state = w.state().await.map_err(from_zbus_error)?;
+                detail.wifi = Some(WifiDetail {
+                    state,
+                    ssid: non_empty(ssid_str),
+                    bssid: format_mac(&bssid_bytes),
+                    frequency_mhz: freq,
+                    signal_dbm: rssi,
+                    security: sec,
+                    supplicant: w.supplicant().await.map_err(from_zbus_error)?,
+                    roaming_mode: w.roaming_mode().await.map_err(from_zbus_error)?,
+                    powered: w.powered().await.map_err(from_zbus_error)?,
+                });
+            }
+            "ethernet" => {
+                let e = EthernetProxy::builder(&self.connection)
+                    .path(path)
+                    .map_err(from_zbus_error)?
+                    .build()
+                    .await
+                    .map_err(from_zbus_error)?;
+                detail.ethernet = Some(EthernetDetail {
+                    state: e.state().await.map_err(from_zbus_error)?,
+                    auth_backend: e.auth_backend().await.map_err(from_zbus_error)?,
+                    auth_failure_reason: e.auth_failure_reason().await.map_err(from_zbus_error)?,
+                    eap_method: e.eap_method().await.map_err(from_zbus_error)?,
+                });
+            }
+            "bluetooth" => {
+                let b = BluetoothProxy::builder(&self.connection)
+                    .path(path)
+                    .map_err(from_zbus_error)?
+                    .build()
+                    .await
+                    .map_err(from_zbus_error)?;
+                let known = b.known_devices().await.map_err(from_zbus_error)?;
+                detail.bluetooth = Some(BluetoothAdapterDetail {
+                    address: b.address().await.map_err(from_zbus_error)?,
+                    powered: b.powered().await.map_err(from_zbus_error)?,
+                    discoverable: b.discoverable().await.map_err(from_zbus_error)?,
+                    pairable: b.pairable().await.map_err(from_zbus_error)?,
+                    discovering: b.discovering().await.map_err(from_zbus_error)?,
+                    nexus_discovering: b.nexus_discovering().await.map_err(from_zbus_error)?,
+                    state: b.state().await.map_err(from_zbus_error)?,
+                    known_device_paths: known.into_iter().map(|p| p.as_str().to_owned()).collect(),
+                });
+            }
+            "gnss" => {
+                detail.gnss = Some(read_gnss_detail(&self.connection, path).await?);
+            }
+            _ => {}
+        }
+        Ok(detail)
+    }
+
+    async fn list_bluetooth_adapters(&self) -> Result<Vec<BluetoothAdapterSummary>, NexusctlError> {
+        let mut out = Vec::new();
+        for (ifname, path) in resolve_interfaces_of_kind(&self.connection, "bluetooth").await? {
+            let adapter = BluetoothProxy::builder(&self.connection)
+                .path(path)
+                .map_err(from_zbus_error)?
+                .build()
+                .await
+                .map_err(from_zbus_error)?;
+            let devices = adapter.known_devices().await.map_err(from_zbus_error)?;
+            out.push(BluetoothAdapterSummary {
+                ifname,
+                address: adapter.address().await.map_err(from_zbus_error)?,
+                state: adapter.state().await.map_err(from_zbus_error)?,
+                powered: adapter.powered().await.map_err(from_zbus_error)?,
+                discovering: adapter.discovering().await.map_err(from_zbus_error)?,
+                known_device_count: devices.len() as u32,
             });
         }
         Ok(out)
     }
+
+    async fn list_bluetooth_devices(
+        &self,
+        filter: BluetoothListFilter,
+    ) -> Result<Vec<BluetoothDeviceSummary>, NexusctlError> {
+        let mut out = Vec::new();
+        for (ifname, adapter_path) in
+            resolve_interfaces_of_kind(&self.connection, "bluetooth").await?
+        {
+            let adapter = BluetoothProxy::builder(&self.connection)
+                .path(adapter_path)
+                .map_err(from_zbus_error)?
+                .build()
+                .await
+                .map_err(from_zbus_error)?;
+            let devices = adapter.known_devices().await.map_err(from_zbus_error)?;
+            for dpath in devices {
+                let summary =
+                    read_bluetooth_device_summary(&self.connection, &ifname, dpath).await?;
+                let keep = match filter {
+                    BluetoothListFilter::All => true,
+                    BluetoothListFilter::Paired => summary.paired,
+                    BluetoothListFilter::Connected => summary.connected,
+                };
+                if keep {
+                    out.push(summary);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn show_bluetooth_device(
+        &self,
+        address: &str,
+    ) -> Result<BluetoothDeviceDetail, NexusctlError> {
+        let path = resolve_bluetooth_device_by_address(&self.connection, address).await?;
+        let dev = BluetoothDeviceProxy::builder(&self.connection)
+            .path(path.clone())
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        let adapter_path = dev.adapter().await.map_err(from_zbus_error)?;
+        let adapter_ifname = last_path_component(adapter_path.as_str());
+        let summary =
+            read_bluetooth_device_summary(&self.connection, &adapter_ifname, path.clone()).await?;
+        Ok(BluetoothDeviceDetail {
+            summary,
+            address_type: dev.address_type().await.map_err(from_zbus_error)?,
+            alias: dev.alias().await.map_err(from_zbus_error)?,
+            tx_power: dev.tx_power().await.map_err(from_zbus_error)?,
+            uuids: dev.uuids().await.map_err(from_zbus_error)?,
+            blocked: dev.blocked().await.map_err(from_zbus_error)?,
+            profile_path: normalise_profile_path(
+                dev.profile().await.map_err(from_zbus_error)?.as_str(),
+            ),
+        })
+    }
+
+    async fn gnss_satellites(
+        &self,
+        device: Option<&str>,
+    ) -> Result<GnssSatellitesView, NexusctlError> {
+        let path = resolve_gnss_by_device(&self.connection, device).await?;
+        let proxy = GnssProxy::builder(&self.connection)
+            .path(path.clone())
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        Ok(GnssSatellitesView {
+            device: proxy.device_path().await.map_err(from_zbus_error)?,
+            in_view: proxy.satellites_in_view().await.map_err(from_zbus_error)?,
+            used: proxy.satellites_used().await.map_err(from_zbus_error)?,
+        })
+    }
+
+    async fn list_profiles(
+        &self,
+        kind_filter: Option<&str>,
+    ) -> Result<Vec<ProfileSummary>, NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        let mut paths = Vec::new();
+        if kind_filter.map(|k| k == "wifi").unwrap_or(true) {
+            paths.extend(mgr.wifi_profiles().await.map_err(from_zbus_error)?);
+        }
+        if kind_filter.map(|k| k == "ethernet").unwrap_or(true) {
+            paths.extend(mgr.ethernet_profiles().await.map_err(from_zbus_error)?);
+        }
+        let mut out = Vec::new();
+        for path in paths {
+            let p = ProfileProxy::builder(&self.connection)
+                .path(path)
+                .map_err(from_zbus_error)?
+                .build()
+                .await
+                .map_err(from_zbus_error)?;
+            out.push(ProfileSummary {
+                id: p.id().await.map_err(from_zbus_error)?,
+                kind: p.kind().await.map_err(from_zbus_error)?,
+                label: p.label().await.map_err(from_zbus_error)?,
+                credentials_invalid: p.credentials_invalid().await.map_err(from_zbus_error)?,
+                created_at: p.created_at().await.map_err(from_zbus_error)?,
+                updated_at: p.updated_at().await.map_err(from_zbus_error)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn show_profile(&self, reference: &str) -> Result<ProfileDetail, NexusctlError> {
+        let path = resolve_profile_by_ref(&self.connection, reference).await?;
+        let base = ProfileProxy::builder(&self.connection)
+            .path(path.clone())
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        let summary = ProfileSummary {
+            id: base.id().await.map_err(from_zbus_error)?,
+            kind: base.kind().await.map_err(from_zbus_error)?,
+            label: base.label().await.map_err(from_zbus_error)?,
+            credentials_invalid: base.credentials_invalid().await.map_err(from_zbus_error)?,
+            created_at: base.created_at().await.map_err(from_zbus_error)?,
+            updated_at: base.updated_at().await.map_err(from_zbus_error)?,
+        };
+        let mut detail = ProfileDetail {
+            summary: summary.clone(),
+            wifi: None,
+            ethernet: None,
+        };
+        match summary.kind.as_str() {
+            "wifi" => {
+                let w = WifiProfileProxy::builder(&self.connection)
+                    .path(path)
+                    .map_err(from_zbus_error)?
+                    .build()
+                    .await
+                    .map_err(from_zbus_error)?;
+                let ssid_bytes = w.ssid().await.map_err(from_zbus_error)?;
+                let security = w.security().await.map_err(from_zbus_error)?;
+                let security_type = security
+                    .get("type")
+                    .and_then(|v| <&str>::try_from(v).ok())
+                    .map(str::to_owned)
+                    .unwrap_or_default();
+                let has_creds: Vec<String> = w
+                    .has_credentials()
+                    .await
+                    .map_err(from_zbus_error)?
+                    .into_iter()
+                    .filter(|(_, v)| *v)
+                    .map(|(k, _)| k)
+                    .collect();
+                detail.wifi = Some(WifiProfileDetail {
+                    ssid: String::from_utf8_lossy(&ssid_bytes).into_owned(),
+                    hidden: w.hidden().await.map_err(from_zbus_error)?,
+                    priority: w.priority().await.map_err(from_zbus_error)?,
+                    auto_connect: w.auto_connect().await.map_err(from_zbus_error)?,
+                    fast_transition: w.fast_transition().await.map_err(from_zbus_error)?,
+                    security_type,
+                    has_credentials: has_creds,
+                    bssid_preferred: format_mac(
+                        &w.bssid_preferred().await.map_err(from_zbus_error)?,
+                    ),
+                    bssid_blacklist: w
+                        .bssid_blacklist()
+                        .await
+                        .map_err(from_zbus_error)?
+                        .into_iter()
+                        .filter_map(|b| format_mac(&b))
+                        .collect(),
+                    scan_frequencies: w.scan_frequencies().await.map_err(from_zbus_error)?,
+                });
+            }
+            "ethernet" => {
+                let e = EthernetProfileProxy::builder(&self.connection)
+                    .path(path)
+                    .map_err(from_zbus_error)?
+                    .build()
+                    .await
+                    .map_err(from_zbus_error)?;
+                let has_creds: Vec<String> = e
+                    .has_credentials()
+                    .await
+                    .map_err(from_zbus_error)?
+                    .into_iter()
+                    .filter(|(_, v)| *v)
+                    .map(|(k, _)| k)
+                    .collect();
+                detail.ethernet = Some(EthernetProfileDetail {
+                    ifname: e.ifname().await.map_err(from_zbus_error)?,
+                    auto_connect: e.auto_connect().await.map_err(from_zbus_error)?,
+                    dot1x_enabled: e.dot1x_enabled().await.map_err(from_zbus_error)?,
+                    dot1x_eap: e.dot1x_eap().await.map_err(from_zbus_error)?,
+                    has_credentials: has_creds,
+                });
+            }
+            _ => {}
+        }
+        Ok(detail)
+    }
+
+    async fn export_profile(&self, reference: &str) -> Result<String, NexusctlError> {
+        // The daemon doesn't expose a `Profile.Export()` method, so
+        // we assemble the TOML from the properties. Credentials
+        // aren't available over D-Bus; exported profiles are
+        // skeletons the operator fills in on import.
+        let detail = self.show_profile(reference).await?;
+        Ok(profile_to_toml(&detail))
+    }
+
+    async fn master_key_info(&self) -> Result<MasterKeyInfo, NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        Ok(MasterKeyInfo {
+            source: mgr.master_key_source().await.map_err(from_zbus_error)?,
+        })
+    }
 }
 
-/// `MAC` from `fi.nexus.Interface` is `ay`; canonicalise to a
-/// colon-separated lower-hex string (`aa:bb:cc:…`). Empty bytes
-/// (e.g., GNSS) collapse to `None` so the JSON renderer emits
-/// `null` and the human renderer prints an em-dash.
+async fn read_bluetooth_device_summary(
+    conn: &Connection,
+    adapter_ifname: &str,
+    dpath: zbus::zvariant::OwnedObjectPath,
+) -> Result<BluetoothDeviceSummary, NexusctlError> {
+    let dev = BluetoothDeviceProxy::builder(conn)
+        .path(dpath)
+        .map_err(from_zbus_error)?
+        .build()
+        .await
+        .map_err(from_zbus_error)?;
+    Ok(BluetoothDeviceSummary {
+        adapter: adapter_ifname.to_owned(),
+        address: dev.address().await.map_err(from_zbus_error)?,
+        name: dev.name().await.map_err(from_zbus_error)?,
+        state: dev.state().await.map_err(from_zbus_error)?,
+        paired: dev.paired().await.map_err(from_zbus_error)?,
+        bonded: dev.bonded().await.map_err(from_zbus_error)?,
+        trusted: dev.trusted().await.map_err(from_zbus_error)?,
+        connected: dev.connected().await.map_err(from_zbus_error)?,
+        rssi: dev.rssi().await.map_err(from_zbus_error)?,
+        transport: dev.transport().await.map_err(from_zbus_error)?,
+    })
+}
+
+async fn read_gnss_detail(
+    conn: &Connection,
+    path: zbus::zvariant::OwnedObjectPath,
+) -> Result<GnssDetail, NexusctlError> {
+    let g = GnssProxy::builder(conn)
+        .path(path)
+        .map_err(from_zbus_error)?
+        .build()
+        .await
+        .map_err(from_zbus_error)?;
+    let fix_tuple = g.last_fix().await.map_err(from_zbus_error)?;
+    let last_fix = if fix_tuple.1 >= 2 {
+        Some(GnssFix {
+            time_unix_ms: fix_tuple.0,
+            mode: fix_tuple.1,
+            latitude: fix_tuple.2,
+            longitude: fix_tuple.3,
+            altitude_m: fix_tuple.4,
+            speed_mps: fix_tuple.5,
+            track_deg: fix_tuple.6,
+            horizontal_error_m: fix_tuple.7,
+            vertical_error_m: fix_tuple.8,
+            satellites_used: fix_tuple.9,
+        })
+    } else {
+        None
+    };
+    Ok(GnssDetail {
+        state: g.state().await.map_err(from_zbus_error)?,
+        device_path: g.device_path().await.map_err(from_zbus_error)?,
+        vendor_model: g.vendor_model().await.map_err(from_zbus_error)?,
+        gpsd_connected: g.gpsd_connected().await.map_err(from_zbus_error)?,
+        satellites_in_view: g.satellites_in_view().await.map_err(from_zbus_error)?,
+        satellites_used: g.satellites_used().await.map_err(from_zbus_error)?,
+        horizontal_error_m: g.horizontal_error_m().await.map_err(from_zbus_error)?,
+        last_fix,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Decoders + utilities
+// ---------------------------------------------------------------------------
+
 pub(crate) fn format_mac(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return None;
     }
-    let parts: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    Some(parts.join(":"))
+    Some(
+        bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":"),
+    )
 }
 
-/// Decode the `a{sv}` returned by `Manager.GetManagerStatus()` into
-/// [`ManagerStatus`]. Missing keys default to empty / zero — the
-/// daemon is the schema authority but a client at the wrong version
-/// shouldn't crash on a missing field.
 pub(crate) fn decode_manager_status(
     dict: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
 ) -> ManagerStatus {
@@ -119,11 +587,67 @@ pub(crate) fn decode_manager_status(
         power_state: s("PowerState"),
         api_capabilities: arr("ApiCapabilities"),
         interface_count: interfaces.len() as u32,
+        ethernet_count: 0,
+        wifi_count: 0,
+        bluetooth_count: 0,
+        gnss_count: 0,
         wifi_profile_count: u("WifiProfileCount"),
         ethernet_profile_count: u("EthernetProfileCount"),
         bluetooth_profile_count: u("BluetoothProfileCount"),
         master_key_source: s("MasterKeySource"),
+        bluez_available: false,
+        gpsd_available: false,
     }
+}
+
+/// Empty SSIDs come across as empty strings; return `None` so
+/// downstream renderers display a dash rather than an empty cell.
+fn non_empty(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Filter the sentinel "no profile attached" object path (`/`). Any
+/// other value is returned wrapped in `Some`.
+fn normalise_profile_path(p: &str) -> Option<String> {
+    if p.is_empty() || p == "/" {
+        None
+    } else {
+        Some(p.to_owned())
+    }
+}
+
+fn last_path_component(p: &str) -> String {
+    p.rsplit('/').next().unwrap_or("").to_owned()
+}
+
+/// Assemble a minimal TOML document from a `ProfileDetail`.
+/// Credentials are *not* included — they never leave the daemon
+/// via D-Bus. Operators edit the exported file and re-import it,
+/// supplying fresh credentials at import time.
+fn profile_to_toml(detail: &ProfileDetail) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# id = {}\n", detail.summary.id));
+    out.push_str(&format!("kind = {:?}\n", detail.summary.kind));
+    out.push_str(&format!("label = {:?}\n", detail.summary.label));
+    if let Some(w) = &detail.wifi {
+        out.push_str("\n[wifi]\n");
+        out.push_str(&format!("ssid = {:?}\n", w.ssid));
+        out.push_str(&format!("hidden = {}\n", w.hidden));
+        out.push_str(&format!("priority = {}\n", w.priority));
+        out.push_str(&format!("auto_connect = {}\n", w.auto_connect));
+        out.push_str(&format!("fast_transition = {}\n", w.fast_transition));
+        out.push_str(&format!("security_type = {:?}\n", w.security_type));
+        out.push_str("# credentials are not exported; provide them at import time\n");
+    }
+    if let Some(e) = &detail.ethernet {
+        out.push_str("\n[ethernet]\n");
+        out.push_str(&format!("ifname = {:?}\n", e.ifname));
+        out.push_str(&format!("auto_connect = {}\n", e.auto_connect));
+        out.push_str(&format!("dot1x_enabled = {}\n", e.dot1x_enabled));
+        out.push_str(&format!("dot1x_eap = {:?}\n", e.dot1x_eap));
+        out.push_str("# credentials are not exported; provide them at import time\n");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -179,8 +703,16 @@ mod tests {
         assert_eq!(s.power_state, "active");
         assert_eq!(s.interface_count, 2);
         assert_eq!(s.wifi_profile_count, 2);
-        assert_eq!(s.ethernet_profile_count, 1);
-        assert_eq!(s.bluetooth_profile_count, 0);
         assert_eq!(s.master_key_source, "file");
+    }
+
+    #[test]
+    fn normalise_profile_path_maps_root_to_none() {
+        assert_eq!(normalise_profile_path("/"), None);
+        assert_eq!(normalise_profile_path(""), None);
+        assert_eq!(
+            normalise_profile_path("/fi/nexus1/profile/wifi/X"),
+            Some("/fi/nexus1/profile/wifi/X".to_owned())
+        );
     }
 }

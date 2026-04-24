@@ -28,9 +28,38 @@ fn iface_list_subcommand_parses() {
     assert!(matches!(
         cli.command,
         Some(Command::Iface {
-            sub: IfaceSub::List
+            sub: IfaceSub::List { kind: None }
         })
     ));
+}
+
+#[test]
+fn iface_list_accepts_kind_filter() {
+    let cli = parse(&["iface", "list", "--kind", "wifi"]).unwrap();
+    match cli.command {
+        Some(Command::Iface {
+            sub: IfaceSub::List { kind },
+        }) => {
+            assert_eq!(kind.map(|k| k.as_wire()), Some("wifi"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn bt_list_paired_connected_conflict() {
+    assert_eq!(
+        parse(&["bt", "list", "--paired", "--connected"])
+            .unwrap_err()
+            .kind(),
+        clap::error::ErrorKind::ArgumentConflict
+    );
+}
+
+#[test]
+fn profile_show_requires_reference() {
+    let err = parse(&["profile", "show"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
 }
 
 #[test]

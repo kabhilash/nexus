@@ -8,8 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use insta::assert_snapshot;
-use nexus_client::cli::{Command, IfaceSub};
-use nexus_client::dispatch::run_command;
+use nexus_client::commands;
 use nexus_client::errors::NexusctlError;
 use nexus_client::output::{OutputFormat, RenderContext};
 use nexus_client::proxy::{InterfaceSummary, ManagerOps, ManagerStatus};
@@ -38,12 +37,17 @@ fn fixture() -> Arc<Fixture> {
             power_state: "active".into(),
             api_capabilities: vec!["events".into(), "properties".into()],
             interface_count: 4,
+            ethernet_count: 1,
+            wifi_count: 1,
+            bluetooth_count: 1,
+            gnss_count: 1,
             wifi_profile_count: 2,
             ethernet_profile_count: 1,
             bluetooth_profile_count: 0,
             master_key_source: "file".into(),
+            bluez_available: true,
+            gpsd_available: true,
         },
-        // One interface of each kind per the prompt.
         rows: vec![
             InterfaceSummary {
                 iface: "eth0".into(),
@@ -51,6 +55,7 @@ fn fixture() -> Arc<Fixture> {
                 state: "up".into(),
                 mac: Some("aa:bb:cc:dd:ee:01".into()),
                 carrier: true,
+                managed_profile: None,
             },
             InterfaceSummary {
                 iface: "wlan0".into(),
@@ -58,6 +63,7 @@ fn fixture() -> Arc<Fixture> {
                 state: "connected".into(),
                 mac: Some("aa:bb:cc:dd:ee:03".into()),
                 carrier: true,
+                managed_profile: Some("/fi/nexus1/profile/wifi/X".into()),
             },
             InterfaceSummary {
                 iface: "hci0".into(),
@@ -65,6 +71,7 @@ fn fixture() -> Arc<Fixture> {
                 state: "powered".into(),
                 mac: Some("dd:ee:ff:00:11:22".into()),
                 carrier: false,
+                managed_profile: None,
             },
             InterfaceSummary {
                 iface: "/dev/gps0".into(),
@@ -72,6 +79,7 @@ fn fixture() -> Arc<Fixture> {
                 state: "tracking".into(),
                 mac: None,
                 carrier: false,
+                managed_profile: None,
             },
         ],
     })
@@ -80,30 +88,20 @@ fn fixture() -> Arc<Fixture> {
 async fn render_iface_list(format: OutputFormat, ctx: &RenderContext) -> String {
     let ops = fixture();
     let mut buf = Vec::new();
-    run_command(
-        &Command::Iface {
-            sub: IfaceSub::List,
-        },
-        format,
-        ctx,
-        ops.as_ref(),
-        &mut buf,
-    )
-    .await
-    .expect("render");
+    commands::iface::list(ops.as_ref(), None, format, ctx, &mut buf)
+        .await
+        .expect("render");
     String::from_utf8(buf).unwrap()
 }
 
 async fn render_status(format: OutputFormat, ctx: &RenderContext) -> String {
     let ops = fixture();
     let mut buf = Vec::new();
-    run_command(&Command::Status, format, ctx, ops.as_ref(), &mut buf)
+    commands::status::run(ops.as_ref(), format, ctx, &mut buf)
         .await
         .expect("render");
     String::from_utf8(buf).unwrap()
 }
-
-// ---- iface list × {human, terse, json, pretty} --------------------
 
 #[tokio::test]
 async fn snapshot_iface_list_human() {
@@ -111,7 +109,7 @@ async fn snapshot_iface_list_human() {
     assert_snapshot!(s, @r"
           IFACE      KIND       STATE      MAC
      *O   eth0       ethernet   up         aa:bb:cc:dd:ee:01
-     *O   wlan0      wifi       connected  aa:bb:cc:dd:ee:03
+     *AO  wlan0      wifi       connected  aa:bb:cc:dd:ee:03
      *R   hci0       bluetooth  powered    dd:ee:ff:00:11:22
      *F   /dev/gps0  gnss       tracking   —
     ");
@@ -160,7 +158,8 @@ async fn snapshot_iface_list_json() {
         "kind": "wifi",
         "state": "connected",
         "mac": "aa:bb:cc:dd:ee:03",
-        "carrier": true
+        "carrier": true,
+        "managed_profile": "/fi/nexus1/profile/wifi/X"
       },
       {
         "iface": "hci0",
@@ -210,18 +209,17 @@ async fn snapshot_iface_list_pretty() {
     ");
 }
 
-// ---- status × {human, terse, json} --------------------------------
-// Pretty and human are identical for status; only snapshot once.
-
 #[tokio::test]
 async fn snapshot_status_human() {
     let s = render_status(OutputFormat::Human, &RenderContext::default()).await;
     assert_snapshot!(s, @r"
-    Version:    0.1.0
-    Power state: active
-    Interfaces: 4
-    Profiles:   2 wifi, 1 ethernet, 0 bluetooth
-    Master key: file
+    Version:      0.1.0
+    Power state:  active
+    Interfaces:   4 (1 ethernet, 1 wifi, 1 bluetooth, 1 gnss)
+    Profiles:     2 wifi, 1 ethernet, 0 bluetooth
+    BlueZ:        reachable
+    gpsd:         reachable
+    Master key:   file
     Capabilities: events, properties
     ");
 }
@@ -229,7 +227,7 @@ async fn snapshot_status_human() {
 #[tokio::test]
 async fn snapshot_status_terse() {
     let s = render_status(OutputFormat::Terse, &RenderContext::default()).await;
-    assert_snapshot!(s, @"0.1.0:active:4:2:1:0:file");
+    assert_snapshot!(s, @"0.1.0:active:4:1:1:1:1:2:1:0:true:true:file");
 }
 
 #[tokio::test]
@@ -244,10 +242,16 @@ async fn snapshot_status_json() {
         "properties"
       ],
       "interface_count": 4,
+      "ethernet_count": 1,
+      "wifi_count": 1,
+      "bluetooth_count": 1,
+      "gnss_count": 1,
       "wifi_profile_count": 2,
       "ethernet_profile_count": 1,
       "bluetooth_profile_count": 0,
-      "master_key_source": "file"
+      "master_key_source": "file",
+      "bluez_available": true,
+      "gpsd_available": true
     }
     "#);
 }

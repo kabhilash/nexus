@@ -29,6 +29,7 @@ use clap::ValueEnum;
 pub mod human;
 pub mod json;
 pub mod pretty;
+pub mod records;
 pub mod terse;
 
 /// Which renderer to dispatch to.
