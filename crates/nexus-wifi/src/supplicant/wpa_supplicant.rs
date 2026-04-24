@@ -952,6 +952,12 @@ fn extract_key_mgmt(dict: &HashMap<String, OwnedValue>) -> Vec<String> {
 /// [`SupplicantEvent::State`]. The watcher exits when the signal
 /// stream closes (daemon went away) — the daemon watcher then
 /// emits `DaemonDown` and the backend reconnects on next DaemonUp.
+/// How often the state watcher polls as a fallback against missed
+/// `PropertiesChanged` signals. Two zbus property reads per tick
+/// per attached interface — cheap — and idempotent at the backend's
+/// dispatch layer (same state = no-op).
+const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 fn spawn_state_watcher(
     props: zbus::fdo::PropertiesProxy<'static>,
     iface: WpaInterfaceProxy<'static>,
@@ -967,39 +973,74 @@ fn spawn_state_watcher(
                 return;
             }
         };
-        while let Some(sig) = stream.next().await {
-            let Ok(args) = sig.args() else { continue };
-            // Only the `fi.w1.wpa_supplicant1.Interface` surface
-            // matters to us — skip changes on sibling interfaces
-            // hosted on the same object.
-            if args.interface_name != "fi.w1.wpa_supplicant1.Interface" {
-                continue;
-            }
-            let changed: &HashMap<&str, Value<'_>> = &args.changed_properties;
-            if let Some(raw) = changed.get("State") {
-                // State arrives as a `Value::Str`. Convert tolerantly
-                // — a non-string value would be a daemon bug, but we
-                // don't want a panic path there.
-                let Ok(owned) = OwnedValue::try_from(raw) else {
-                    continue;
-                };
-                let Ok(s) = <String>::try_from(owned) else {
-                    continue;
-                };
-                // `completed` needs a BSS read to produce the
-                // Connected variant; everything else maps straight
-                // through `translate_wpa_state`.
-                let state_opt = if s == "completed" {
-                    resolve_completed(&connection, &iface).await
-                } else {
-                    translate_wpa_state(&s)
-                };
-                if let Some(state) = state_opt {
-                    let _ = event_tx.send(SupplicantEvent::State { ifindex, state });
+        // Reconciliation tick. `PropertiesChanged` is the primary
+        // path; this is a safety net for two known failure modes
+        // observed on live hardware:
+        //
+        //   (a) Under heavy state churn, wpa_supplicant sometimes
+        //       advances `State` (e.g. `4way_handshake → completed`)
+        //       without firing a corresponding PropertiesChanged
+        //       for the new value. Reproduced on the Pi: the
+        //       interface was associated with a valid IP while our
+        //       cached state stayed at `handshaking` indefinitely.
+        //   (b) A rapid burst of signals can exceed the zbus
+        //       message stream's buffer; older entries get dropped.
+        //
+        // The tick re-reads `State` (and `CurrentBSS` for
+        // `completed`) and emits whatever the authoritative value
+        // is. `on_supplicant_state` in the backend is idempotent
+        // for steady-state — duplicates cost the two property
+        // reads and a broadcast send, nothing more.
+        let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                maybe_sig = stream.next() => {
+                    let Some(sig) = maybe_sig else { return };
+                    let Ok(args) = sig.args() else { continue };
+                    if args.interface_name != "fi.w1.wpa_supplicant1.Interface" {
+                        continue;
+                    }
+                    let changed: &HashMap<&str, Value<'_>> = &args.changed_properties;
+                    if !(changed.contains_key("State") || changed.contains_key("CurrentBSS")) {
+                        continue;
+                    }
+                    evaluate_and_emit(&connection, &iface, ifindex, &event_tx).await;
+                }
+                _ = tick.tick() => {
+                    evaluate_and_emit(&connection, &iface, ifindex, &event_tx).await;
                 }
             }
         }
     })
+}
+
+/// Read the interface's current State (and for `completed`,
+/// `CurrentBSS` via [`resolve_completed`]) and broadcast the
+/// resulting [`SupplicantEvent::State`]. Shared by the signal path
+/// and the reconciliation tick in [`spawn_state_watcher`].
+async fn evaluate_and_emit(
+    connection: &Connection,
+    iface: &WpaInterfaceProxy<'_>,
+    ifindex: u32,
+    event_tx: &broadcast::Sender<SupplicantEvent>,
+) {
+    let state_str = match iface.state().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(ifindex, error = %e, "wpa_supplicant: State read failed");
+            return;
+        }
+    };
+    let state_opt = if state_str == "completed" {
+        resolve_completed(connection, iface).await
+    } else {
+        translate_wpa_state(&state_str)
+    };
+    if let Some(state) = state_opt {
+        let _ = event_tx.send(SupplicantEvent::State { ifindex, state });
+    }
 }
 
 // ---- error helpers -------------------------------------------------------
