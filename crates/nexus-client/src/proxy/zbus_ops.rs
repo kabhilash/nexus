@@ -4,7 +4,8 @@
 use async_trait::async_trait;
 use zbus::Connection;
 
-use crate::errors::{NexusctlError, from_zbus_error};
+use crate::errors::NexusctlError;
+use crate::errors_map::from_zbus_error;
 use crate::proxy::interface::InterfaceProxy;
 use crate::proxy::manager::ManagerProxy;
 use crate::proxy::{InterfaceSummary, ManagerOps, ManagerStatus};

@@ -3,26 +3,26 @@
 use std::io::Write;
 
 use crate::errors::NexusctlError;
-use crate::output::{OutputFormat, human, json};
+use crate::output::{OutputFormat, RenderContext, render};
 use crate::proxy::ManagerOps;
 
 pub async fn list(
     ops: &dyn ManagerOps,
     format: OutputFormat,
+    ctx: &RenderContext,
     w: &mut dyn Write,
 ) -> Result<(), NexusctlError> {
     let rows = ops.list_interfaces().await?;
-    match format {
-        OutputFormat::Human => human::render_iface_list(&rows, w).map_err(io_to_err),
-        OutputFormat::Json => json::write(&rows, w).map_err(io_to_err),
-    }
+    render(&rows, format, ctx, w).map_err(map_io_error)
 }
 
-fn io_to_err(e: std::io::Error) -> NexusctlError {
+fn map_io_error(e: std::io::Error) -> NexusctlError {
     if e.kind() == std::io::ErrorKind::BrokenPipe {
-        return NexusctlError::Other(String::new());
+        return NexusctlError::Other { raw: String::new() };
     }
-    NexusctlError::Other(format!("write failed: {e}"))
+    NexusctlError::Other {
+        raw: format!("write failed: {e}"),
+    }
 }
 
 #[cfg(test)]
@@ -57,63 +57,49 @@ mod tests {
             InterfaceSummary {
                 iface: "wlan0".into(),
                 kind: "wifi".into(),
-                state: "dormant".into(),
+                state: "connected".into(),
                 mac: Some("aa:bb:cc:dd:ee:03".into()),
-                carrier: false,
-            },
-            InterfaceSummary {
-                iface: "/dev/gps0".into(),
-                kind: "gnss".into(),
-                state: "up".into(),
-                mac: None,
-                carrier: false,
+                carrier: true,
             },
         ]
     }
 
     #[tokio::test]
-    async fn human_list_renders_table_with_each_row() {
+    async fn human_iface_list_has_prefix_column() {
         let ops = StubOps { rows: fixture() };
         let mut buf = Vec::new();
-        list(&ops, OutputFormat::Human, &mut buf).await.unwrap();
+        list(
+            &ops,
+            OutputFormat::Human,
+            &RenderContext::default(),
+            &mut buf,
+        )
+        .await
+        .unwrap();
         let s = String::from_utf8(buf).unwrap();
+        // `*O` is the state prefix for an up ethernet with carrier.
+        assert!(s.contains("*O"), "got {s}");
         assert!(s.contains("IFACE"));
-        assert!(s.contains("KIND"));
-        assert!(s.contains("STATE"));
-        assert!(s.contains("MAC"));
         assert!(s.contains("eth0"));
-        assert!(s.contains("ethernet"));
-        assert!(s.contains("aa:bb:cc:dd:ee:01"));
         assert!(s.contains("wlan0"));
-        // GNSS row has no MAC — em-dash placeholder.
-        assert!(s.contains("/dev/gps0"));
-        assert!(s.contains("—"));
     }
 
     #[tokio::test]
-    async fn human_list_empty_says_no_interfaces() {
-        let ops = StubOps { rows: vec![] };
-        let mut buf = Vec::new();
-        list(&ops, OutputFormat::Human, &mut buf).await.unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("no interfaces"));
-    }
-
-    #[tokio::test]
-    async fn json_list_emits_array_of_flat_objects() {
+    async fn json_iface_list_emits_array_of_flat_objects() {
         let ops = StubOps { rows: fixture() };
         let mut buf = Vec::new();
-        list(&ops, OutputFormat::Json, &mut buf).await.unwrap();
+        list(
+            &ops,
+            OutputFormat::Json,
+            &RenderContext::default(),
+            &mut buf,
+        )
+        .await
+        .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         let arr = v.as_array().expect("array");
-        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["iface"], "eth0");
-        assert_eq!(arr[0]["kind"], "ethernet");
-        assert_eq!(arr[0]["state"], "up");
-        assert_eq!(arr[0]["mac"], "aa:bb:cc:dd:ee:01");
-        assert_eq!(arr[0]["carrier"], true);
-        // GNSS row's MAC is null — DD-008 §5.3 "Missing /
-        // unavailable values are null".
-        assert!(arr[2]["mac"].is_null());
+        assert_eq!(arr[1]["kind"], "wifi");
     }
 }

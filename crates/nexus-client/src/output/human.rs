@@ -1,22 +1,43 @@
-//! Human-friendly renderers. comfy-table for tables; vertical
-//! key/value for single records. DD-008 §5.1.
+//! Human renderer. DD-008 §5.1.
 //!
-//! The state-prefix column from §5.1's example output is deferred
-//! to Phase 2 — it requires per-kind state-machine context that
-//! Phase 1's `InterfaceSummary` doesn't carry. For now `iface list`
-//! emits IFACE / KIND / STATE / MAC.
+//! Lists use comfy-table; single records use a vertical key/value
+//! block. `iface list` grows a `S` (state-prefix) column populated
+//! by [`crate::state_prefix`].
+//!
+//! Colours are not yet wired — the colour choice is plumbed here
+//! via [`RenderContext`] and ready for a future commit; today the
+//! renderer is plain-text so the snapshot tests stay stable.
 
 use std::io::{self, Write};
 
-use comfy_table::{Cell, ContentArrangement, Table};
+use comfy_table::{Cell, ContentArrangement, Table, presets::NOTHING};
 
+use crate::output::{Render, RenderContext};
 use crate::proxy::{InterfaceSummary, ManagerStatus};
+use crate::state_prefix;
 
-pub fn render_status(status: &ManagerStatus, w: &mut dyn Write) -> io::Result<()> {
-    // Vertical key/value layout — single-record displays use this
-    // shape per §5.1 ("Single-record displays use a vertical
-    // layout"). Right-align the keys for visual alignment without a
-    // table border.
+impl Render for ManagerStatus {
+    fn render_human(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        render_status_block(self, w)
+    }
+
+    fn render_terse(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        super::terse::render_status_terse(self, ctx, w)
+    }
+
+    fn render_json(&self, w: &mut dyn Write) -> io::Result<()> {
+        super::json::write(self, w)
+    }
+
+    fn render_pretty(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        // Status is already a single-record view; pretty matches
+        // the human block today. Future phases may add gaps /
+        // dim hint text.
+        render_status_block(self, w)
+    }
+}
+
+fn render_status_block(status: &ManagerStatus, w: &mut dyn Write) -> io::Result<()> {
     let key_w = "Master key:".len();
     writeln!(w, "{:<key_w$} {}", "Version:", status.version)?;
     writeln!(w, "{:<key_w$} {}", "Power state:", status.power_state)?;
@@ -41,29 +62,52 @@ pub fn render_status(status: &ManagerStatus, w: &mut dyn Write) -> io::Result<()
     Ok(())
 }
 
-pub fn render_iface_list(rows: &[InterfaceSummary], w: &mut dyn Write) -> io::Result<()> {
-    if rows.is_empty() {
-        writeln!(w, "no interfaces")?;
-        return Ok(());
+impl Render for Vec<InterfaceSummary> {
+    fn render_human(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        if self.is_empty() {
+            writeln!(w, "no interfaces")?;
+            return Ok(());
+        }
+        let mut table = Table::new();
+        table
+            .load_preset(NOTHING)
+            .set_content_arrangement(ContentArrangement::Disabled)
+            .set_header(vec![
+                Cell::new(""),
+                Cell::new("IFACE"),
+                Cell::new("KIND"),
+                Cell::new("STATE"),
+                Cell::new("MAC"),
+            ]);
+        for r in self {
+            let prefix = state_prefix::classify(r).render();
+            let mac = r.mac.as_deref().unwrap_or("—");
+            table.add_row(vec![
+                Cell::new(prefix),
+                Cell::new(&r.iface),
+                Cell::new(&r.kind),
+                Cell::new(&r.state),
+                Cell::new(mac),
+            ]);
+        }
+        // comfy-table pads the last column with trailing spaces.
+        // Strip them so shell consumers and snapshot tests get the
+        // minimal, predictable output.
+        for line in table.to_string().lines() {
+            writeln!(w, "{}", line.trim_end())?;
+        }
+        Ok(())
     }
-    let mut table = Table::new();
-    table
-        .load_preset(comfy_table::presets::NOTHING)
-        .set_content_arrangement(ContentArrangement::Disabled)
-        .set_header(vec![
-            Cell::new("IFACE"),
-            Cell::new("KIND"),
-            Cell::new("STATE"),
-            Cell::new("MAC"),
-        ]);
-    for r in rows {
-        let mac = r.mac.as_deref().unwrap_or("—");
-        table.add_row(vec![
-            Cell::new(&r.iface),
-            Cell::new(&r.kind),
-            Cell::new(&r.state),
-            Cell::new(mac),
-        ]);
+
+    fn render_terse(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        super::terse::render_iface_list_terse(self, ctx, w)
     }
-    writeln!(w, "{table}")
+
+    fn render_json(&self, w: &mut dyn Write) -> io::Result<()> {
+        super::json::write(self, w)
+    }
+
+    fn render_pretty(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        super::pretty::render_iface_list_pretty(self, ctx, w)
+    }
 }

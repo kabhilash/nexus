@@ -1,16 +1,14 @@
-//! `nexusctl` binary entry point. Tiny — every interesting bit is
-//! in the library (`nexus_client::*`).
+//! `nexusctl` binary entry point.
 //!
 //! Lifecycle:
-//!
 //! 1. clap parses argv. Bad args → `clap::Error::exit` (exit 2).
 //! 2. Tracing subscriber initialises (DEBUG when `--verbose`, else
-//!    WARN). All logs go to stderr; stdout stays reserved for
-//!    command output.
-//! 3. Open a D-Bus connection (system bus, or `--bus` address for
-//!    test harnesses).
+//!    WARN). All logs go to stderr.
+//! 3. Open a D-Bus connection.
 //! 4. Dispatch to the command handler.
-//! 5. Exit with the DD-008 §4.3 code.
+//! 5. Exit with the DD-008 §4.3 code. Errors in JSON mode go to
+//!    stderr as the DD-008 §9 envelope; otherwise as a plain text
+//!    line.
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -21,6 +19,8 @@ use tracing::Level;
 use nexus_client::cli::Cli;
 use nexus_client::dispatch::dispatch;
 use nexus_client::errors::NexusctlError;
+use nexus_client::output::OutputFormat;
+use nexus_client::output::json;
 use nexus_client::proxy::ZbusManagerOps;
 
 #[tokio::main]
@@ -29,17 +29,17 @@ async fn main() -> ExitCode {
 
     init_tracing(cli.global.verbose);
 
+    let format = cli.global.output_format();
+
     let ops = match ZbusManagerOps::connect(cli.global.bus.as_deref()).await {
         Ok(o) => o,
-        Err(e) => return finish(Err(e)),
+        Err(e) => return finish(Err(e), format),
     };
 
     let mut stdout = std::io::stdout().lock();
     let result = dispatch(&cli, &ops, &mut stdout).await;
-    // Flush so the buffered table doesn't get clipped on early
-    // exit. Ignore EPIPE — our stdout consumer hung up.
     let _ = stdout.flush();
-    finish(result)
+    finish(result, format)
 }
 
 fn init_tracing(verbose: bool) {
@@ -50,16 +50,33 @@ fn init_tracing(verbose: bool) {
         .try_init();
 }
 
-fn finish(result: Result<(), NexusctlError>) -> ExitCode {
+fn finish(result: Result<(), NexusctlError>, format: OutputFormat) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // Empty messages happen on EPIPE — stay silent.
-            let msg = err.to_string();
-            if !msg.is_empty() {
-                let _ = writeln!(std::io::stderr(), "nexusctl: {msg}");
-            }
+            report_error(&err, format);
             ExitCode::from(err.exit_code() as u8)
+        }
+    }
+}
+
+fn report_error(err: &NexusctlError, format: OutputFormat) {
+    // Empty messages happen on EPIPE — stay silent.
+    let msg = err.to_string();
+    if msg.is_empty() {
+        return;
+    }
+    let mut stderr = std::io::stderr().lock();
+    match format {
+        OutputFormat::Json => {
+            // DD-008 §5.3: "Errors in JSON mode write a JSON error
+            // object to stderr and exit non-zero." Compact (no
+            // newlines within the object) so shell loops can read
+            // one record per line.
+            let _ = json::write_error_object(err, &mut stderr);
+        }
+        _ => {
+            let _ = writeln!(stderr, "nexusctl: {msg}");
         }
     }
 }

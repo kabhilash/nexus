@@ -5,7 +5,7 @@ use std::io::Write;
 use crate::cli::{Cli, Command, IfaceSub};
 use crate::commands;
 use crate::errors::NexusctlError;
-use crate::output::OutputFormat;
+use crate::output::{OutputFormat, RenderContext};
 use crate::proxy::ManagerOps;
 
 pub async fn dispatch(
@@ -14,32 +14,32 @@ pub async fn dispatch(
     w: &mut dyn Write,
 ) -> Result<(), NexusctlError> {
     let format = cli.global.output_format();
+    let ctx = cli.global.render_context();
     match &cli.command {
         // No subcommand → DD-008 §4.1: print the same one-screen
         // status summary `status` produces.
-        None => commands::status::run(ops, format, w).await,
-        Some(Command::Status) => commands::status::run(ops, format, w).await,
+        None => commands::status::run(ops, format, &ctx, w).await,
+        Some(Command::Status) => commands::status::run(ops, format, &ctx, w).await,
         Some(Command::Iface { sub }) => match sub {
-            IfaceSub::List => commands::iface::list(ops, format, w).await,
+            IfaceSub::List => commands::iface::list(ops, format, &ctx, w).await,
         },
     }
 }
 
-/// Convenience wrapper used by binary tests that already have a
-/// resolved [`OutputFormat`] (i.e., bypassing CLI parsing). Phase 1
-/// keeps both paths identical; future phases may diverge if
-/// `nexusctl shell` ends up reusing the dispatcher with its own
-/// format-resolution rules.
+/// Convenience wrapper for tests that already have a resolved
+/// [`OutputFormat`] and [`RenderContext`] and want to bypass clap
+/// parsing.
 pub async fn run_command(
     command: &Command,
     format: OutputFormat,
+    ctx: &RenderContext,
     ops: &dyn ManagerOps,
     w: &mut dyn Write,
 ) -> Result<(), NexusctlError> {
     match command {
-        Command::Status => commands::status::run(ops, format, w).await,
+        Command::Status => commands::status::run(ops, format, ctx, w).await,
         Command::Iface { sub } => match sub {
-            IfaceSub::List => commands::iface::list(ops, format, w).await,
+            IfaceSub::List => commands::iface::list(ops, format, ctx, w).await,
         },
     }
 }

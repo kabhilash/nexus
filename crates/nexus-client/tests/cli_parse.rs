@@ -92,3 +92,95 @@ fn help_flag_exits_with_clap_display_error() {
     let err = parse(&["--help"]).unwrap_err();
     assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
 }
+
+// ---- Phase 2 global flags -------------------------------------------
+
+#[test]
+fn terse_flag_selects_terse_format() {
+    let cli = parse(&["--terse", "iface", "list"]).unwrap();
+    assert!(cli.global.terse);
+    assert_eq!(cli.global.output_format(), OutputFormat::Terse);
+}
+
+#[test]
+fn pretty_flag_selects_pretty_format() {
+    let cli = parse(&["--pretty", "iface", "list"]).unwrap();
+    assert!(cli.global.pretty);
+    assert_eq!(cli.global.output_format(), OutputFormat::Pretty);
+}
+
+#[test]
+fn shorthand_flags_conflict_with_each_other() {
+    assert_eq!(
+        parse(&["--terse", "--json", "iface", "list"])
+            .unwrap_err()
+            .kind(),
+        clap::error::ErrorKind::ArgumentConflict
+    );
+    assert_eq!(
+        parse(&["--pretty", "--json", "iface", "list"])
+            .unwrap_err()
+            .kind(),
+        clap::error::ErrorKind::ArgumentConflict
+    );
+    assert_eq!(
+        parse(&["--terse", "--pretty", "iface", "list"])
+            .unwrap_err()
+            .kind(),
+        clap::error::ErrorKind::ArgumentConflict
+    );
+}
+
+#[test]
+fn fields_option_parses_comma_separated() {
+    let cli = parse(&["--fields", "iface,state", "iface", "list"]).unwrap();
+    assert_eq!(
+        cli.global.fields,
+        Some(vec!["iface".into(), "state".into()])
+    );
+}
+
+#[test]
+fn separator_option_round_trips() {
+    let cli = parse(&["--separator", "\t", "iface", "list"]).unwrap();
+    assert_eq!(cli.global.separator, "\t");
+}
+
+#[test]
+fn default_separator_is_colon() {
+    let cli = parse(&["iface", "list"]).unwrap();
+    assert_eq!(cli.global.separator, ":");
+}
+
+#[test]
+fn no_color_overrides_color() {
+    let cli = parse(&["--color", "always", "--no-color", "iface", "list"]).unwrap();
+    assert!(cli.global.no_color);
+    // color_choice() promotes --no-color to Never.
+    assert_eq!(
+        cli.global.color_choice(),
+        nexus_client::output::ColorChoice::Never
+    );
+}
+
+#[test]
+fn timeout_parses_as_seconds() {
+    let cli = parse(&["--timeout", "45", "iface", "list"]).unwrap();
+    assert_eq!(cli.global.timeout, Some(45));
+}
+
+#[test]
+fn quiet_and_no_interactive_are_recognized() {
+    let cli = parse(&["--quiet", "--no-interactive", "status"]).unwrap();
+    assert!(cli.global.quiet);
+    assert!(cli.global.no_interactive);
+}
+
+#[test]
+fn config_path_is_optional() {
+    let cli = parse(&["--config", "/tmp/nexusctl.toml", "status"]).unwrap();
+    assert_eq!(
+        cli.global.config.as_deref(),
+        Some(std::path::Path::new("/tmp/nexusctl.toml"))
+    );
+}
