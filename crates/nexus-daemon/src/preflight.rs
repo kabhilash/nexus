@@ -89,10 +89,22 @@ pub fn run(config: &Config) -> Vec<Finding> {
 /// mutating the process-wide environment (which would race under
 /// parallel test threads).
 pub fn run_with_path(config: &Config, path_var: Option<&std::ffi::OsStr>) -> Vec<Finding> {
+    run_with(config, path_var, &current_user_groups())
+}
+
+/// Fully-parametrised preflight. Both the `$PATH` string and the
+/// calling user's group list are injected so tests can exercise
+/// every branch deterministically.
+pub fn run_with(
+    config: &Config,
+    path_var: Option<&std::ffi::OsStr>,
+    user_groups: &[String],
+) -> Vec<Finding> {
     let mut out = Vec::new();
     check_profile_store_root(&config.profile_store.root, &mut out);
     check_master_key_source(&config.profile_store, &mut out);
     check_external_daemons(config, path_var, &mut out);
+    check_group_memberships(config, user_groups, &mut out);
     out
 }
 
@@ -265,6 +277,69 @@ fn check_external_daemons(
     }
 }
 
+/// Check that the running user is in any privileged groups enabled
+/// subsystems depend on. The real symptom of a missing group is a
+/// cryptic `AccessDenied` from the affected daemon's bus policy; the
+/// warning here turns that into a one-line action item.
+fn check_group_memberships(config: &Config, user_groups: &[String], out: &mut Vec<Finding>) {
+    // Wi-Fi: wpa_supplicant's default system-bus policy
+    // (/usr/share/dbus-1/system.d/wpa_supplicant.conf) restricts
+    // CreateInterface / RemoveInterface to root + members of
+    // `netdev`. Missing membership produces:
+    //   AccessDenied: Rejected send message, 2 matched rules; ...
+    //     member="CreateInterface"
+    if config.wifi.enabled
+        && config.wifi.backend == "wpa_supplicant"
+        && !user_groups.iter().any(|g| g == "netdev")
+    {
+        out.push(Finding::warn(
+            "wifi",
+            "the daemon user is not in the `netdev` group — \
+             wpa_supplicant will reject CreateInterface with AccessDenied",
+            "add the user and restart: \
+             sudo usermod -aG netdev nexus && sudo systemctl restart nexus",
+        ));
+    }
+
+    // Bluetooth: BlueZ's system-bus policy on most distros grants
+    // privileged access to members of `bluetooth`. Without it, the
+    // adapter state-change methods fail with AccessDenied once the
+    // backend gets past introspection.
+    if config.bluetooth.enabled
+        && !config.bluetooth.mock
+        && !user_groups.iter().any(|g| g == "bluetooth")
+    {
+        out.push(Finding::warn(
+            "bluetooth",
+            "the daemon user is not in the `bluetooth` group — \
+             BlueZ may reject privileged methods with AccessDenied",
+            "add the user and restart: \
+             sudo usermod -aG bluetooth nexus && sudo systemctl restart nexus",
+        ));
+    }
+}
+
+/// Current process's supplementary group *names*. Invokes
+/// `id -Gn` rather than calling `getgroups(2)` + `getgrgid(3)` so
+/// the dependency surface stays small (no `libc` in production
+/// deps) — the fork/exec cost is one-shot at daemon startup. An
+/// empty vec on failure is treated as "no groups," producing the
+/// same warnings as a genuinely unprivileged user.
+fn current_user_groups() -> Vec<String> {
+    std::process::Command::new("id")
+        .arg("-Gn")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .map(|s| s.to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// `which`-equivalent with an explicit `$PATH` string. Takes the
 /// lookup string as a parameter rather than reading the process env
 /// so tests can drive it without mutating the process-wide PATH
@@ -332,13 +407,20 @@ mod tests {
         std::ffi::OsString::from("/nonexistent")
     }
 
+    /// Groups list that covers every privileged membership the
+    /// preflight group-checker looks for. Tests pre-seed this so
+    /// the group check never fires unless a test explicitly opts in.
+    fn all_groups() -> Vec<String> {
+        vec!["netdev".into(), "bluetooth".into()]
+    }
+
     #[test]
     fn wifi_enabled_with_wpa_supplicant_backend_needs_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = base_config(tmp.path().join("store"));
         cfg.wifi.enabled = true;
         cfg.wifi.backend = "wpa_supplicant".into();
-        let findings = run_with_path(&cfg, Some(&empty_path()));
+        let findings = run_with(&cfg, Some(&empty_path()), &all_groups());
         assert_eq!(findings.len(), 1, "got: {findings:?}");
         assert_eq!(findings[0].severity, Severity::Warn);
         assert_eq!(findings[0].subject, "wifi");
@@ -355,7 +437,7 @@ mod tests {
         cfg.bluetooth.mock = true;
         cfg.gnss.enabled = true;
         cfg.gnss.mock = true;
-        let findings = run_with_path(&cfg, Some(&empty_path()));
+        let findings = run_with(&cfg, Some(&empty_path()), &all_groups());
         assert!(findings.is_empty(), "mock backends triggered: {findings:?}");
     }
 
@@ -365,7 +447,7 @@ mod tests {
         let mut cfg = base_config(tmp.path().join("store"));
         cfg.ethernet.enabled = true;
         cfg.ethernet.auth_backend = "wpa_supplicant".into();
-        let findings = run_with_path(&cfg, Some(&empty_path()));
+        let findings = run_with(&cfg, Some(&empty_path()), &all_groups());
         assert_eq!(findings.len(), 1, "got: {findings:?}");
         assert_eq!(findings[0].subject, "ethernet");
         assert!(findings[0].issue.contains("802.1X"));
@@ -379,10 +461,72 @@ mod tests {
         cfg.bluetooth.mock = false;
         cfg.gnss.enabled = true;
         cfg.gnss.mock = false;
-        let findings = run_with_path(&cfg, Some(&empty_path()));
+        let findings = run_with(&cfg, Some(&empty_path()), &all_groups());
         let subjects: Vec<_> = findings.iter().map(|f| f.subject).collect();
         assert!(subjects.contains(&"bluetooth"), "got: {subjects:?}");
         assert!(subjects.contains(&"gnss"), "got: {subjects:?}");
+    }
+
+    #[test]
+    fn wifi_user_not_in_netdev_group_triggers_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = base_config(tmp.path().join("store"));
+        cfg.wifi.enabled = true;
+        cfg.wifi.backend = "wpa_supplicant".into();
+        // Pretend the binary exists (path_var = None → the binary
+        // check short-circuits with "PATH missing" → false, which
+        // is the same as the binary being absent). Use an explicit
+        // PATH that contains this test's own workspace root so the
+        // binary check passes vacuously... actually easier: build a
+        // dir that contains a stub `wpa_supplicant` file.
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let stub = bindir.join("wpa_supplicant");
+        std::fs::write(&stub, b"").unwrap();
+        let path_var = std::ffi::OsString::from(bindir.as_os_str());
+
+        // No group memberships — the netdev check must fire.
+        let findings = run_with(&cfg, Some(&path_var), &[]);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert_eq!(findings[0].subject, "wifi");
+        assert!(findings[0].issue.contains("netdev"));
+        assert!(findings[0].action.contains("usermod -aG netdev"));
+    }
+
+    #[test]
+    fn bluetooth_user_not_in_bluetooth_group_triggers_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = base_config(tmp.path().join("store"));
+        cfg.bluetooth.enabled = true;
+        cfg.bluetooth.mock = false;
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        std::fs::write(bindir.join("bluetoothd"), b"").unwrap();
+        let path_var = std::ffi::OsString::from(bindir.as_os_str());
+
+        let findings = run_with(&cfg, Some(&path_var), &[]);
+        assert_eq!(findings.len(), 1, "got: {findings:?}");
+        assert_eq!(findings[0].subject, "bluetooth");
+        assert!(findings[0].issue.contains("bluetooth"));
+        assert!(findings[0].action.contains("usermod -aG bluetooth"));
+    }
+
+    #[test]
+    fn group_check_silent_when_membership_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = base_config(tmp.path().join("store"));
+        cfg.wifi.enabled = true;
+        cfg.wifi.backend = "wpa_supplicant".into();
+        cfg.bluetooth.enabled = true;
+        cfg.bluetooth.mock = false;
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        std::fs::write(bindir.join("wpa_supplicant"), b"").unwrap();
+        std::fs::write(bindir.join("bluetoothd"), b"").unwrap();
+        let path_var = std::ffi::OsString::from(bindir.as_os_str());
+
+        let findings = run_with(&cfg, Some(&path_var), &all_groups());
+        assert!(findings.is_empty(), "findings: {findings:?}");
     }
 
     #[test]
