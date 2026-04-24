@@ -1,0 +1,26 @@
+# Cross-compile configuration for the Astrax aarch64 target.
+#
+# The Poky SDK lives at /opt/astrax (installed by
+# .devcontainer/Dockerfile). Its environment script
+# (/opt/astrax/environment-setup-armv8a-poky-linux, sourced by
+# scripts/build-and-test.sh before cargo runs) prepends the
+# cross-toolchain to PATH, so `aarch64-poky-linux-gcc` resolves
+# here without needing an absolute path.
+#
+# Why both `linker` and the `--sysroot` link arg:
+#
+# - Without `linker`, cargo uses rustc's default, which on this image
+#   is rust-lld invoked via the *host* x86_64 gcc-ld wrapper — hence
+#   past "incompatible with elf64-x86-64" link errors. Pinning to
+#   aarch64-poky-linux-gcc uses the correct ld for the target.
+#
+# - Without `--sysroot`, the linker can't resolve libm.so: the Poky
+#   sysroot ships it as a GNU ld linker script that GROUPs absolute
+#   paths (`/usr/lib/libm.so.6`). Those paths only resolve against
+#   the sysroot root, which the linker learns about via --sysroot.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-poky-linux-gcc"
+rustflags = [
+    "-C",
+    "link-arg=--sysroot=/opt/astrax/sysroots/armv8a-poky-linux",
+]
