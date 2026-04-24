@@ -20,6 +20,7 @@ nexus-core = { path = "../nexus-core" }
 nexus-profile-store = { path = "../nexus-profile-store" }
 
 async-trait = { workspace = true }
+futures-util = "0.3"
 metrics = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
