@@ -5,7 +5,6 @@
 use std::fs;
 use std::panic;
 use std::path::Path;
-use std::time::Duration;
 
 use nexus_core::{NexusEvent, Ssid};
 use nexus_profile_store::{

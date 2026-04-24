@@ -4,18 +4,16 @@
 //! snapshot so both layers are anchored. `wifi show` ambiguity is
 //! exercised end-to-end.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use insta::assert_snapshot;
 use nexus_client::commands;
 use nexus_client::errors::NexusctlError;
 use nexus_client::output::{OutputFormat, RenderContext};
 use nexus_client::proxy::{
-    BluetoothAdapterDetail, BluetoothAdapterSummary, BluetoothDeviceDetail, BluetoothDeviceSummary,
-    BluetoothListFilter, EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix,
-    GnssSatellitesView, InterfaceDetail, InterfaceSummary, ManagerOps, ManagerStatus,
-    MasterKeyInfo, ProfileDetail, ProfileSummary, WifiDetail, WifiProfileDetail,
+    BluetoothAdapterSummary, BluetoothDeviceDetail, BluetoothDeviceSummary, BluetoothListFilter,
+    EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix, GnssSatellitesView,
+    InterfaceDetail, InterfaceSummary, ManagerOps, ManagerStatus, MasterKeyInfo, ProfileDetail,
+    ProfileSummary, WifiDetail, WifiProfileDetail,
 };
 
 /// A stub that serves pre-canned responses to every `ManagerOps`
