@@ -1,6 +1,6 @@
 [package]
 name = "nexus-daemon"
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+libc = { workspace = true }
 sd-notify = "0.4"
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -36,5 +37,4 @@ nexus-dbus = { path = "../nexus-dbus" }
 nexus-profile-store = { path = "../nexus-profile-store" }
 
 [dev-dependencies]
-libc = { workspace = true }
 tempfile = "3"

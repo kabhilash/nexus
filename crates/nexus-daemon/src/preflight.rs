@@ -94,17 +94,32 @@ pub fn run_with_path(config: &Config, path_var: Option<&std::ffi::OsStr>) -> Vec
 
 /// Fully-parametrised preflight. Both the `$PATH` string and the
 /// calling user's group list are injected so tests can exercise
-/// every branch deterministically.
+/// every branch deterministically. The `is_root` discriminant
+/// short-circuits the privileged-group check — tests pass `false`
+/// to exercise the warning path even when the test binary happens
+/// to run under uid 0 (CI containers).
 pub fn run_with(
     config: &Config,
     path_var: Option<&std::ffi::OsStr>,
     user_groups: &[String],
 ) -> Vec<Finding> {
+    run_with_full(config, path_var, user_groups, running_as_root())
+}
+
+/// Like [`run_with`] but lets the caller override the "am I root"
+/// check. Exposed for tests only.
+#[doc(hidden)]
+pub fn run_with_full(
+    config: &Config,
+    path_var: Option<&std::ffi::OsStr>,
+    user_groups: &[String],
+    is_root: bool,
+) -> Vec<Finding> {
     let mut out = Vec::new();
     check_profile_store_root(&config.profile_store.root, &mut out);
     check_master_key_source(&config.profile_store, &mut out);
     check_external_daemons(config, path_var, &mut out);
-    check_group_memberships(config, user_groups, &mut out);
+    check_group_memberships(config, user_groups, is_root, &mut out);
     out
 }
 
@@ -281,7 +296,19 @@ fn check_external_daemons(
 /// subsystems depend on. The real symptom of a missing group is a
 /// cryptic `AccessDenied` from the affected daemon's bus policy; the
 /// warning here turns that into a one-line action item.
-fn check_group_memberships(config: &Config, user_groups: &[String], out: &mut Vec<Finding>) {
+///
+/// Short-circuits when the daemon is running as root — D-Bus bus
+/// policies that grant access to specific groups also implicitly
+/// allow root, so the group check is vacuous.
+fn check_group_memberships(
+    config: &Config,
+    user_groups: &[String],
+    is_root: bool,
+    out: &mut Vec<Finding>,
+) {
+    if is_root {
+        return;
+    }
     // Wi-Fi: wpa_supplicant's default system-bus policy
     // (/usr/share/dbus-1/system.d/wpa_supplicant.conf) restricts
     // CreateInterface / RemoveInterface to root + members of
@@ -317,6 +344,14 @@ fn check_group_memberships(config: &Config, user_groups: &[String], out: &mut Ve
              sudo usermod -aG bluetooth nexus && sudo systemctl restart nexus",
         ));
     }
+}
+
+/// Portable "am I root?" check. `geteuid()` is always safe (no way
+/// to fail). Split out so it's swappable in tests if we ever need
+/// to exercise the non-root path without actually dropping privs.
+fn running_as_root() -> bool {
+    // SAFETY: `geteuid` is async-signal-safe and always succeeds.
+    unsafe { libc::geteuid() == 0 }
 }
 
 /// Current process's supplementary group *names*. Invokes
@@ -486,7 +521,7 @@ mod tests {
         let path_var = std::ffi::OsString::from(bindir.as_os_str());
 
         // No group memberships — the netdev check must fire.
-        let findings = run_with(&cfg, Some(&path_var), &[]);
+        let findings = run_with_full(&cfg, Some(&path_var), &[], /* is_root */ false);
         assert_eq!(findings.len(), 1, "got: {findings:?}");
         assert_eq!(findings[0].subject, "wifi");
         assert!(findings[0].issue.contains("netdev"));
@@ -504,7 +539,7 @@ mod tests {
         std::fs::write(bindir.join("bluetoothd"), b"").unwrap();
         let path_var = std::ffi::OsString::from(bindir.as_os_str());
 
-        let findings = run_with(&cfg, Some(&path_var), &[]);
+        let findings = run_with_full(&cfg, Some(&path_var), &[], /* is_root */ false);
         assert_eq!(findings.len(), 1, "got: {findings:?}");
         assert_eq!(findings[0].subject, "bluetooth");
         assert!(findings[0].issue.contains("bluetooth"));

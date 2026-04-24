@@ -130,8 +130,15 @@ impl DbusServiceHandle {
 /// Build and register the service, then spawn the event-translation
 /// task. Returns once the bus name is owned and `/fi/nexus1` is
 /// live.
+///
+/// `event_rx` is passed in by the daemon rather than derived via
+/// `event_tx.subscribe()` inside this function: that would race
+/// interface_monitor's cold-boot dump, which happens earlier in the
+/// daemon's startup sequence. Subscribing from `main` before any
+/// subsystem task spawns guarantees the dbus service sees every
+/// `InterfaceDiscovered` event.
 pub async fn spawn_dbus_service(
-    event_tx: broadcast::Sender<NexusEvent>,
+    event_rx: broadcast::Receiver<NexusEvent>,
     profile_store: Arc<dyn ProfileStore>,
     config: DbusConfig,
 ) -> crate::errors::Result<DbusServiceHandle> {
@@ -188,7 +195,6 @@ pub async fn spawn_dbus_service(
 
     let shutdown = CancellationToken::new();
     let shutdown_child = shutdown.clone();
-    let event_rx = event_tx.subscribe();
     let conn_clone = connection.clone();
     let state_clone = Arc::clone(&state);
     let services_clone = Arc::clone(&services);

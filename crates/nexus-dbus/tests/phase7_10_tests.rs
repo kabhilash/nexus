@@ -121,7 +121,9 @@ async fn spawn(
         rate_limits,
         enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
-    let h = spawn_dbus_service(event_tx.clone(), st, cfg).await.unwrap();
+    let h = spawn_dbus_service(event_tx.subscribe(), st, cfg)
+        .await
+        .unwrap();
     (h, event_tx)
 }
 
@@ -309,7 +311,9 @@ async fn rotate_master_key_denied_returns_auth_failed() {
         rate_limits: RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
-    let handle = spawn_dbus_service(event_tx, st, cfg).await.unwrap();
+    let handle = spawn_dbus_service(event_tx.subscribe(), st, cfg)
+        .await
+        .unwrap();
     let client = bus.connection().await;
 
     let err = client
@@ -526,7 +530,9 @@ async fn spawn_with_features(
         rate_limits: RateLimits::default(),
         enabled_features: enabled,
     };
-    let h = spawn_dbus_service(event_tx.clone(), st, cfg).await.unwrap();
+    let h = spawn_dbus_service(event_tx.subscribe(), st, cfg)
+        .await
+        .unwrap();
     (h, event_tx)
 }
 
@@ -793,7 +799,9 @@ async fn spawn_with_ops(
         },
         enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
-    spawn_dbus_service(event_tx, st, cfg).await.unwrap()
+    spawn_dbus_service(event_tx.subscribe(), st, cfg)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]

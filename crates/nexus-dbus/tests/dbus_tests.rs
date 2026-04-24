@@ -102,7 +102,9 @@ async fn spawn_service(bus: &Bus, bus_name: &str) -> nexus_dbus::DbusServiceHand
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
-    spawn_dbus_service(event_tx, store, config).await.unwrap()
+    spawn_dbus_service(event_tx.subscribe(), store, config)
+        .await
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +162,7 @@ async fn interface_appears_in_managed_objects_after_event() {
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
-    let handle = spawn_dbus_service(event_tx.clone(), store, config)
+    let handle = spawn_dbus_service(event_tx.subscribe(), store, config)
         .await
         .unwrap();
 
@@ -277,7 +279,7 @@ async fn wifi_interface_properties_readable() {
     let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
     let (_tmp, store) = start_store().await;
     let handle = spawn_dbus_service(
-        event_tx.clone(),
+        event_tx.subscribe(),
         store,
         DbusConfig {
             bus_name: "fi.nexus1.test_wifi".into(),
@@ -342,7 +344,7 @@ async fn bluetooth_interface_properties_readable() {
     let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
     let (_tmp, store) = start_store().await;
     let handle = spawn_dbus_service(
-        event_tx.clone(),
+        event_tx.subscribe(),
         store,
         DbusConfig {
             bus_name: "fi.nexus1.test_bt".into(),
@@ -411,7 +413,7 @@ async fn gnss_interface_properties_readable() {
     let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
     let (_tmp, store) = start_store().await;
     let handle = spawn_dbus_service(
-        event_tx.clone(),
+        event_tx.subscribe(),
         store,
         DbusConfig {
             bus_name: "fi.nexus1.test_gnss".into(),
@@ -513,7 +515,7 @@ async fn wifi_profile_with_credentials_exposes_has_credentials() {
     let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
     let store_arc: Arc<dyn ProfileStore> = store;
     let handle = spawn_dbus_service(
-        event_tx,
+        event_tx.subscribe(),
         store_arc,
         DbusConfig {
             bus_name: "fi.nexus1.test_prof".into(),

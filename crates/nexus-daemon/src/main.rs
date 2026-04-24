@@ -585,10 +585,20 @@ async fn spawn_all(
     }
 
     if config.dbus.enabled {
-        let ev = event_tx.clone();
         let store = Arc::clone(&profile_store);
         let dbus_cfg =
             build_dbus_config(config, Arc::clone(&reload_coordinator), wifi_cmd_tx.clone()).await?;
+        // Subscribe now, before any event-producing subsystem starts
+        // (interface_monitor's cold-boot dump fires during bootstrap).
+        // If we subscribed inside the supervised closure, the dbus
+        // subsystem would race against that dump and miss every
+        // InterfaceDiscovered event — the daemon would own
+        // `/fi/nexus1` but register no per-interface objects.
+        let dbus_event_rx = event_tx.subscribe();
+        // Same `Arc<Mutex<Option<_>>>` trick as the wifi cmd_rx: the
+        // supervisor closure is FnMut; stash the !Clone receiver
+        // behind a `take()` on first start.
+        let dbus_event_rx = Arc::new(tokio::sync::Mutex::new(Some(dbus_event_rx)));
         out.push((
             SubsystemName::Dbus,
             spawn_supervised(
@@ -597,11 +607,16 @@ async fn spawn_all(
                 event_tx.clone(),
                 shutdown.clone(),
                 move |cancel| {
-                    let ev = ev.clone();
                     let store = Arc::clone(&store);
                     let dbus_cfg = dbus_cfg.clone();
+                    let rx_slot = Arc::clone(&dbus_event_rx);
                     async move {
-                        let handle = spawn_dbus_service(ev, store, dbus_cfg)
+                        let rx = rx_slot
+                            .lock()
+                            .await
+                            .take()
+                            .ok_or_else(|| anyhow!("dbus event_rx already consumed"))?;
+                        let handle = spawn_dbus_service(rx, store, dbus_cfg)
                             .await
                             .map_err(|e| anyhow!("{e}"))?;
                         let mut join = handle.join;

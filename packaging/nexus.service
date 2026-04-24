@@ -26,18 +26,33 @@ ExecStart=/usr/local/bin/nexusd --config /etc/nexus/nexus.toml
 Restart=on-failure
 RestartSec=2s
 
-# Run as an unprivileged user. The `nexus-install.sh` script
-# creates this account with no shell and no home.
-User=nexus
-Group=nexus
+# Run as root. Reason: PolicyKit's CheckAuthorization() refuses
+# requests from non-root callers "for subjects belonging to other
+# identities" — see the error surfaced in our journal when running
+# as uid 999:
+#   Only trusted callers (e.g. uid 0 or an action owner) can use
+#   CheckAuthorization() for subjects belonging to other identities
+# The daemon calls CheckAuthorization on every mutating D-Bus
+# method (DD-006 §10) to authorize the client, so we need root
+# trust to make that work. Matches the pattern systemd-networkd,
+# systemd-resolved, and NetworkManager use.
+#
+# The unprivileged `nexus` user created by nexus-install.sh is kept
+# around for future work — when we ship a design that routes authz
+# through a SUID helper or an alternate model (e.g. client-side
+# pkexec), the unit can switch back to `User=nexus` + the capability
+# set previously pinned here.
+User=root
+Group=root
 
-# Capabilities required by the subsystems we ship:
+# Capabilities the daemon actually uses — documented for the
+# eventual return to non-root operation:
 #   CAP_NET_ADMIN — rtnetlink / nl80211 / sysfs interface mutation
 #                   (Interface Monitor + Wi-Fi + Ethernet backends).
 #   CAP_NET_RAW   — raw sockets for EAPOL (wired 802.1X path).
-# No other capabilities are needed, so we drop everything else.
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# Under root these are implied; we still bound the set so a
+# compromised process doesn't escalate beyond networking.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID
 
 # Tighten the sandbox. These match the systemd "exec" hardening
 # recommendations and are safe because Nexus itself only writes to

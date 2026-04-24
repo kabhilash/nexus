@@ -52,7 +52,7 @@ async fn main() {
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
     };
-    let handle = match spawn_dbus_service(event_tx.clone(), store, config).await {
+    let handle = match spawn_dbus_service(event_tx.subscribe(), store, config).await {
         Ok(h) => h,
         Err(e) => {
             eprintln!("could not register on session bus: {e}");
