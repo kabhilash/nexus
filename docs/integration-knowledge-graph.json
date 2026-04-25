@@ -90,7 +90,8 @@
       "attrs": {
         "concrete": false,
         "ifname_escape": "Replace '-' with '_' and percent-escape any non-[A-Za-z0-9_] as _XX (lowercase hex). Example: wlan-foo -> wlan_foo, eth0:1 -> eth0_3a1.",
-        "covers": ["ethernet", "wifi", "bluetooth (adapter)", "gnss"]
+        "covers": ["ethernet", "wifi", "bluetooth (adapter)", "gnss"],
+        "rename_behavior": "A kernel rename (RTM_NEWLINK with same ifindex but new IFLA_IFNAME — typically systemd's predictable-name renamer at boot, or 'ip link set name …') surfaces as InterfacesRemoved on the old path followed by InterfacesAdded on the new path. The interface keeps the same Ifindex but every cached property is re-read at the new path. Subscribers should track interfaces by ObjectManager events rather than caching the path string."
       } },
     { "id": "obj:/fi/nexus1/interface/<ifname>/scan_result/<bssid>", "type": "ObjectPath", "label": "Wi-Fi scan result",
       "attrs": {
@@ -218,8 +219,13 @@
     { "id": "kind:credentials_invalid", "type": "NotificationKind", "label": "credentials_invalid",
       "attrs": { "data_keys": { "profile": "o", "ssid (wifi only)": "ay" },
                  "remediation": "Profile.Update with new credential field; backend clears CredentialsInvalid and retries on next auto-connect cycle." } },
+    { "id": "kind:eth_credentials_invalid", "type": "NotificationKind", "label": "eth_credentials_invalid",
+      "attrs": { "data_keys": { "ifname": "s", "reason": "s (bad_credentials|certificate_rejected)" },
+                 "fires_on": "DD-002 §9.3 fail-fast 802.1X failure (BadCredentials, CertificateRejected). Retriable failures stay silent and just go through Interface.StateChanged.",
+                 "remediation": "Update the per-interface profile (Profile.Ethernet.Update with new client_cert/private_key/password). Profile-store credentials_invalid flag for ethernet is not yet wired (EthernetProfile schema lacks the field); this notification is the only operator-facing surface today." } },
     { "id": "kind:auth_backend_unavailable", "type": "NotificationKind", "label": "auth_backend_unavailable",
-      "attrs": { "data_keys": { "backend": "s", "affected_interfaces": "ao" } } },
+      "attrs": { "data_keys": { "backend": "s", "affected_interfaces": "ao" },
+                 "note": "Reserved kind; not currently emitted. Ethernet uses the lifecycle path instead — when wpa_supplicant disappears, every in-flight Authenticating/Authenticated interface drops to auth_failed via Interface.StateChanged with details.reason='server_unreachable', and EthLinkLost tears IP down via systemd-networkd." } },
     { "id": "kind:subsystem_unavailable", "type": "NotificationKind", "label": "subsystem_unavailable",
       "attrs": { "data_keys": { "subsystem": "s", "duration_s": "u" } } },
     { "id": "kind:subsystem_recovered", "type": "NotificationKind", "label": "subsystem_recovered",
@@ -247,16 +253,16 @@
     { "id": "sig:fi.nexus.Interface.StateChanged", "type": "Signal", "label": "Interface.StateChanged",
       "attrs": { "args": "new_state:s, details:a{sv}",
                  "details_keys": {
-                   "reason": "s — credentials_invalid|server_unreachable|handshake_timeout|rf_killed|supplicant_unavailable|...",
+                   "reason": "s — Wi-Fi: credentials_invalid|server_unreachable|handshake_timeout|rf_killed|supplicant_unavailable|… ; Ethernet (state=auth_failed): bad_credentials|server_unreachable|certificate_rejected|timeout|other",
                    "bssid": "ay (Wi-Fi Connecting/Authenticating/Handshaking/Connected/Roaming)",
                    "ssid_bytes": "ay (Wi-Fi Connecting onwards)",
                    "frequency": "u (Wi-Fi Connected)",
                    "signal_dbm": "i (Wi-Fi Connected)",
                    "security": "s (Wi-Fi Connected)",
                    "profile": "o (any technology, when a stored profile drove the transition)",
-                   "eap_method": "s (Ethernet Authenticating)"
+                   "eap_method": "s (Ethernet Authenticating; matches Ethernet.EapMethod values e.g. PEAP, TLS)"
                  },
-                 "note": "Object path of the emitting interface identifies which device. Match by interface+member, filter by path." } },
+                 "note": "Object path of the emitting interface identifies which device. Match by interface+member, filter by path. Ethernet fires this on every EthInterfaceState transition (waiting_carrier ↔ link_ready, authenticating ↔ authenticated ↔ auth_failed)." } },
 
     { "id": "prop:fi.nexus.Ethernet.State", "type": "Property", "label": "Ethernet.State",
       "attrs": { "sig": "s", "access": "read", "values": ["waiting_carrier", "link_ready", "authenticating", "authenticated", "auth_failed"] } },
@@ -596,7 +602,8 @@
     { "id": "prop:fi.nexus.Profile.Ethernet.Ifname", "type": "Property", "label": "Profile.Ethernet.Ifname",
       "attrs": { "sig": "s", "access": "read/write" } },
     { "id": "prop:fi.nexus.Profile.Ethernet.AutoConnect", "type": "Property", "label": "Profile.Ethernet.AutoConnect",
-      "attrs": { "sig": "b", "access": "read/write" } },
+      "attrs": { "sig": "b", "access": "read/write",
+                 "note": "Currently a no-op for ethernet — DD-002 §3 has no Connect() method, so the carrier-up path always proceeds to LinkReady regardless of this flag. Wi-Fi consults the analogous flag during scan-result selection; ethernet has no equivalent gating point. Persisted but not consulted by the lifecycle today." } },
     { "id": "prop:fi.nexus.Profile.Ethernet.Dot1xEnabled", "type": "Property", "label": "Profile.Ethernet.Dot1xEnabled",
       "attrs": { "sig": "b", "access": "read/write" } },
     { "id": "prop:fi.nexus.Profile.Ethernet.Dot1xEap", "type": "Property", "label": "Profile.Ethernet.Dot1xEap",
@@ -1199,6 +1206,29 @@
         { "do": "Backend automatically clears CredentialsInvalid and retries on next auto-connect cycle. Watch CredentialsInvalidChanged(false) to confirm.",
           "node": "sig:fi.nexus.Profile.CredentialsInvalidChanged" }
       ]
+    },
+
+    {
+      "id": "flow:recover-eth-credentials-invalid",
+      "name": "Recover from a fail-fast 802.1X failure on ethernet",
+      "audience": ["ui builder"],
+      "trigger": "Manager.NotificationEvent kind=eth_credentials_invalid",
+      "preconditions": ["Ethernet interface has dot1x.enabled=true and 802.1X authentication failed with bad_credentials or certificate_rejected (DD-002 §9.3 fail-fast)"],
+      "steps": [
+        { "do": "Observe NotificationEvent",
+          "node": "kind:eth_credentials_invalid",
+          "data_keys": ["ifname:s", "reason:s (bad_credentials|certificate_rejected)"] },
+        { "do": "Look up the profile path for this interface via Interface.ManagedProfile or Manager.EthernetProfiles.",
+          "node": "prop:fi.nexus.Interface.ManagedProfile" },
+        { "do": "Prompt the operator for the new credential. EAP-TLS profiles need a fresh client_cert / private_key / private_key_passwd; PEAP/TTLS profiles need a fresh password.",
+          "ref": "prop:fi.nexus.Profile.Ethernet.HasCredentials" },
+        { "do": "Profile.Update(settings) on the profile path with the new credential field.",
+          "node": "method:fi.nexus.Profile.Update",
+          "polkit": "polkit:fi.nexus.profile.modify" },
+        { "do": "Carrier cycle (or wait for natural recovery) re-runs the auth on the next link-up. Watch Interface.StateChanged on the interface path for state=authenticating then authenticated.",
+          "node": "sig:fi.nexus.Interface.StateChanged" }
+      ],
+      "note": "EthernetProfile does not yet carry a CredentialsInvalid flag (the on-disk schema lacks the field), so there is no Profile.CredentialsInvalidChanged signal to confirm the recovery. The Manager.NotificationEvent above is the only authoritative event for ethernet credentials-invalid; the recovery-confirmation signal is Interface.StateChanged transitioning to authenticated."
     },
 
     {
