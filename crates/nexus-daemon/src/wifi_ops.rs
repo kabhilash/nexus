@@ -72,6 +72,7 @@ fn convert_params(p: ScanParams) -> wifi_types::ScanParams {
 fn map_wifi_error(e: WifiError) -> DbusError {
     match e {
         WifiError::NotAttached { .. } => DbusError::NotFound(e.to_string()),
+        WifiError::UnknownInterface { .. } => DbusError::NotFound(e.to_string()),
         WifiError::NoProfileMatch { .. } => DbusError::NotFound(e.to_string()),
         WifiError::ProfileNotFound { .. } => DbusError::NotFound(e.to_string()),
         // Supplicant-layer failures manifest as transient (busy) at
@@ -183,6 +184,27 @@ impl BackendOps for WifiBackendOps {
         dispatch(&self.commands, |tx| WifiCommand::SetPowered {
             ifname,
             on,
+            reply: tx,
+        })
+        .await
+    }
+
+    async fn wifi_provide_credential(
+        &self,
+        ifname: &str,
+        network: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<()> {
+        let ifname = ifname.to_owned();
+        let network = network.to_owned();
+        let field = field.to_owned();
+        let value = value.to_owned();
+        dispatch(&self.commands, |tx| WifiCommand::ProvideCredential {
+            ifname,
+            network,
+            field,
+            value,
             reply: tx,
         })
         .await

@@ -113,6 +113,16 @@ impl BssCache {
             .unwrap_or_default()
     }
 
+    /// Look up a single BSS by its `(ifindex, bssid)` key. Used by
+    /// the state machine to enrich `WifiState::Connected` with the
+    /// BSS's advertised security modes (DD-003 §3.1).
+    pub fn lookup(&self, ifindex: u32, bssid: MacAddr) -> Option<BssInfo> {
+        self.per_interface
+            .get(&ifindex)
+            .and_then(|m| m.get(&bssid))
+            .cloned()
+    }
+
     pub fn len(&self, ifindex: u32) -> usize {
         self.per_interface
             .get(&ifindex)

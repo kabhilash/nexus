@@ -16,7 +16,9 @@ async fn main() -> std::result::Result<(), Box<dyn Error>> {
     let shutdown = CancellationToken::new();
 
     println!("starting interface monitor; Ctrl-C to stop");
-    let monitor_handle = spawn_interface_monitor(tx, shutdown.clone()).await?;
+    let (_cmd_tx, cmd_rx) = nexus_interface_monitor::command_channel();
+    let monitor_handle =
+        spawn_interface_monitor(tx, shutdown.clone(), cmd_rx).await?;
 
     let printer = {
         let shutdown = shutdown.clone();

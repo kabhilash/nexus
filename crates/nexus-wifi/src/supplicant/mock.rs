@@ -30,6 +30,31 @@ struct MockState {
     signal_info: HashMap<u32, SignalInfo>,
     daemon_up: bool,
     handle_counter: u64,
+    /// Append-log of every `scan(ifindex, params)` call. Tests for
+    /// the C8 directed-roam-scan trigger and K5 metric classifier
+    /// inspect this.
+    scan_calls: Vec<(u32, ScanParams)>,
+    /// Append-log of every `roam(ifindex, target)` call. Tests for
+    /// C9 (Roaming + outcome) inspect this.
+    roam_calls: Vec<(u32, RoamTarget)>,
+    /// Append-log of every `provide_network_credential` call. Tests
+    /// for C10 inspect this.
+    credential_replies: Vec<CredentialReply>,
+    /// When `true`, the next `signal_info` call returns
+    /// `WifiError::NotAttached { ifindex }`. Used by the C6
+    /// wake-from-sleep test to drive the post-wake probe failure
+    /// path. Sticky: tests reset it explicitly.
+    fail_signal_info: bool,
+}
+
+/// Recorded shape of a `provide_network_credential` invocation.
+/// The mock doesn't otherwise interpret the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialReply {
+    pub ifindex: u32,
+    pub network: String,
+    pub field: String,
+    pub value: String,
 }
 
 /// Scripted outcome for the next `connect` call on a given ifindex.
@@ -85,6 +110,32 @@ impl MockSupplicantHandle {
 
     fn daemon_up(&self) -> bool {
         self.inner.lock().unwrap().daemon_up
+    }
+
+    /// Snapshot every recorded `scan(ifindex, params)` call. Tests
+    /// for C8 / K5 inspect this.
+    pub fn scan_calls(&self) -> Vec<(u32, ScanParams)> {
+        self.inner.lock().unwrap().scan_calls.clone()
+    }
+
+    /// Snapshot every recorded `roam(ifindex, target)` call. Tests
+    /// for C9 inspect this.
+    pub fn roam_calls(&self) -> Vec<(u32, RoamTarget)> {
+        self.inner.lock().unwrap().roam_calls.clone()
+    }
+
+    /// Snapshot every recorded `provide_network_credential` call.
+    /// Tests for C10 inspect this.
+    pub fn credential_replies(&self) -> Vec<CredentialReply> {
+        self.inner.lock().unwrap().credential_replies.clone()
+    }
+
+    /// When `true`, the next `signal_info` call returns
+    /// `WifiError::NotAttached { ifindex }` regardless of the
+    /// scripted `set_signal` value. C6 uses this to make the
+    /// post-wake probe fail.
+    pub fn set_signal_info_fails(&self, fail: bool) {
+        self.inner.lock().unwrap().fail_signal_info = fail;
     }
 
     fn fresh_handle(&self) -> NetworkHandle {
@@ -226,14 +277,24 @@ impl WifiSupplicantBackend for MockSupplicant {
         Ok(())
     }
 
-    async fn scan(&mut self, ifindex: u32, _params: ScanParams) -> Result<()> {
+    async fn scan(&mut self, ifindex: u32, params: ScanParams) -> Result<()> {
         if !self.attached.contains_key(&ifindex) {
             return Err(WifiError::NotAttached { ifindex });
         }
+        // Record the call so tests can assert on params (C8 / K5).
+        self.state
+            .inner
+            .lock()
+            .unwrap()
+            .scan_calls
+            .push((ifindex, params));
         // Immediately complete. Real supplicants take 3-5 seconds
         // for a full-spectrum scan; tests that need timing can sleep
         // after `scan()` returns.
-        self.send(SupplicantEvent::ScanComplete { ifindex });
+        self.send(SupplicantEvent::ScanComplete {
+            ifindex,
+            success: true,
+        });
         Ok(())
     }
 
@@ -276,6 +337,14 @@ impl WifiSupplicantBackend for MockSupplicant {
     }
 
     async fn roam(&mut self, ifindex: u32, target: RoamTarget) -> Result<()> {
+        // Record before consuming the target so the assertion log
+        // sees it verbatim (C9).
+        self.state
+            .inner
+            .lock()
+            .unwrap()
+            .roam_calls
+            .push((ifindex, target.clone()));
         let bssid = match target {
             RoamTarget::Auto => MacAddr([0x55; 6]),
             RoamTarget::Bss(b) => b,
@@ -305,14 +374,36 @@ impl WifiSupplicantBackend for MockSupplicant {
     }
 
     async fn signal_info(&self, ifindex: u32) -> Result<SignalInfo> {
-        self.state
-            .inner
-            .lock()
-            .unwrap()
+        let state = self.state.inner.lock().unwrap();
+        if state.fail_signal_info {
+            return Err(WifiError::NotAttached { ifindex });
+        }
+        state
             .signal_info
             .get(&ifindex)
             .cloned()
             .ok_or(WifiError::NotAttached { ifindex })
+    }
+
+    async fn provide_network_credential(
+        &mut self,
+        ifindex: u32,
+        network: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.state
+            .inner
+            .lock()
+            .unwrap()
+            .credential_replies
+            .push(CredentialReply {
+                ifindex,
+                network: network.to_owned(),
+                field: field.to_owned(),
+                value: value.to_owned(),
+            });
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -412,7 +503,10 @@ mod tests {
         let event = rx.try_recv().unwrap();
         assert!(matches!(
             event,
-            SupplicantEvent::ScanComplete { ifindex: 2 }
+            SupplicantEvent::ScanComplete {
+                ifindex: 2,
+                success: true,
+            }
         ));
     }
 

@@ -101,6 +101,18 @@ pub trait BackendOps: Send + Sync {
     async fn wifi_set_roaming_mode(&self, _ifname: &str, _mode: RoamingMode) -> Result<()> {
         Err(DbusError::Unsupported("wifi_set_roaming_mode".into()))
     }
+    /// `Wifi.ProvideCredential` — DD-006 §6.3, DD-003 §9.2. Hands
+    /// an operator-supplied credential back to the supplicant as
+    /// the reply to a prior `NetworkRequest` signal.
+    async fn wifi_provide_credential(
+        &self,
+        _ifname: &str,
+        _network: &str,
+        _field: &str,
+        _value: &str,
+    ) -> Result<()> {
+        Err(DbusError::Unsupported("wifi_provide_credential".into()))
+    }
 
     // ---- Manager-level (DD-006 §5) ----
     async fn set_power_state(&self, _state: PowerState) -> Result<()> {
@@ -152,6 +164,12 @@ pub enum RecordedCall {
     WifiRoam { ifname: String, bssid: MacAddr },
     WifiSetPowered { ifname: String, on: bool },
     WifiSetRoamingMode { ifname: String, mode: RoamingMode },
+    WifiProvideCredential {
+        ifname: String,
+        network: String,
+        field: String,
+        value: String,
+    },
     SetPowerState(PowerState),
 }
 
@@ -235,6 +253,24 @@ impl BackendOps for RecordingOps {
         self.record(RecordedCall::WifiSetRoamingMode {
             ifname: ifname.to_owned(),
             mode,
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn wifi_provide_credential(
+        &self,
+        ifname: &str,
+        network: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<()> {
+        self.record(RecordedCall::WifiProvideCredential {
+            ifname: ifname.to_owned(),
+            network: network.to_owned(),
+            field: field.to_owned(),
+            value: value.to_owned(),
         });
         if let Some(e) = self.consume_error() {
             return Err(e);

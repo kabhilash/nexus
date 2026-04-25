@@ -49,6 +49,14 @@ pub struct WifiInterfaceEntry {
 }
 
 impl WifiInterfaceEntry {
+    /// Construct in [`WifiState::Idle`]. After this, the only place
+    /// `Idle` is set again is the disconnect-cooldown sweep in
+    /// `WifiBackend::process_disconnect_cooldowns` (DD-003 §3.2 /
+    /// §6.4): non-permanent `Disconnected` reasons cool back into
+    /// `Idle` after `WifiConfig::disconnect_cool_down`. K8 also
+    /// clobbers `Idle` to `Disconnected{SupplicantUnavailable}`
+    /// when the post-construction `attach()` fails. Anyone else
+    /// touching `state = Idle` is suspect.
     pub fn new(info: InterfaceInfo) -> Self {
         Self {
             info,

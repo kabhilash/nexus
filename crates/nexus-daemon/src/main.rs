@@ -387,8 +387,15 @@ async fn spawn_all(
 ) -> Result<Vec<(SubsystemName, tokio::task::JoinHandle<()>)>> {
     let mut out = Vec::new();
 
+    // MonitorCommand channel — lives at daemon scope so the wifi
+    // backend's sender survives monitor-supervisor restarts. See
+    // DD-003 §12.4 / DD-001 §8 command channel.
+    let (monitor_cmd_tx, monitor_cmd_rx) = nexus_interface_monitor::command_channel();
+    let monitor_cmd_rx_slot = Arc::new(tokio::sync::Mutex::new(Some(monitor_cmd_rx)));
+
     if config.interface_monitor.enabled {
         let ev = event_tx.clone();
+        let monitor_cmd_rx_slot = Arc::clone(&monitor_cmd_rx_slot);
         out.push((
             SubsystemName::InterfaceMonitor,
             spawn_supervised(
@@ -398,8 +405,17 @@ async fn spawn_all(
                 shutdown.clone(),
                 move |cancel| {
                     let ev = ev.clone();
+                    let monitor_cmd_rx_slot = Arc::clone(&monitor_cmd_rx_slot);
                     async move {
-                        let join = spawn_interface_monitor(ev, cancel).await?;
+                        // The receiver is !Clone. On the first
+                        // (and typically only) run we take it;
+                        // restart supervisors after a crash lose
+                        // the command path — see DD-003 §12.4's
+                        // note that wedge recovery is best-effort.
+                        let cmd_rx = monitor_cmd_rx_slot.lock().await.take().ok_or_else(
+                            || anyhow!("interface-monitor cmd_rx already consumed"),
+                        )?;
+                        let join = spawn_interface_monitor(ev, cancel, cmd_rx).await?;
                         let res = join.await?;
                         res.map_err(|e| anyhow!("{e}"))
                     }
@@ -459,6 +475,28 @@ async fn spawn_all(
         // closure can `take()` it on first call. The supervisor
         // only invokes the closure once per lifecycle start.
         let cmd_rx = Arc::new(tokio::sync::Mutex::new(Some(cmd_rx)));
+        // Clone of the MonitorCommand sender from the shared
+        // channel up top, handed to the wifi backend for the
+        // driver-wedge recovery path (DD-003 §12.4).
+        //
+        // **Lifetime (S6).** The outer `monitor_cmd_tx` lives for
+        // the rest of `spawn_all` and survives every supervisor
+        // restart of *both* subsystems — the monitor task takes
+        // its receiver from `monitor_cmd_rx_slot`, never the
+        // sender. The closure below captures the per-spawn
+        // `monitor_cmd_tx` Option (move semantics) and clones it
+        // again on each restart attempt; the chain of `Sender`
+        // clones therefore exactly matches the number of running
+        // wifi-task instances, with no leaked clones.
+        //
+        // When the monitor subsystem is disabled there's no
+        // receiver, so pass `None` instead of a sender whose
+        // `send()` would silently buffer and degrade.
+        let monitor_cmd_tx = if config.interface_monitor.enabled {
+            Some(monitor_cmd_tx.clone())
+        } else {
+            None
+        };
         out.push((
             SubsystemName::Wifi,
             spawn_supervised(
@@ -471,6 +509,7 @@ async fn spawn_all(
                     let store = Arc::clone(&store);
                     let backend_kind = backend_kind.clone();
                     let cmd_rx = Arc::clone(&cmd_rx);
+                    let monitor_cmd_tx = monitor_cmd_tx.clone();
                     async move {
                         let (sup_tx, _sup_rx) = broadcast::channel(supplicant_cap);
                         let supplicant: Box<dyn WifiSupplicantBackend> =
@@ -481,7 +520,13 @@ async fn spawn_all(
                             .take()
                             .ok_or_else(|| anyhow!("wifi cmd_rx already consumed"))?;
                         let handle = nexus_wifi::spawn_wifi_backend(
-                            ev, sup_tx, supplicant, store, wifi_cfg, cmd_rx,
+                            ev,
+                            sup_tx,
+                            supplicant,
+                            store,
+                            wifi_cfg,
+                            cmd_rx,
+                            monitor_cmd_tx,
                         );
                         let mut join = handle.join;
                         let inner = handle.shutdown;

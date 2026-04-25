@@ -88,22 +88,41 @@ impl From<&str> for NetworkHandle {
 /// Target for [`crate::supplicant::WifiSupplicantBackend::roam`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoamTarget {
-    /// Let the supplicant pick the next BSS.
+    /// Best-effort delegation to the supplicant. wpa_supplicant has
+    /// no "auto-pick best BSS now" primitive — the closest single
+    /// call is `Reassociate`, which only changes BSS if the
+    /// supplicant's `bg_scan` has populated a different candidate.
+    /// In `roaming_mode = "supplicant"` this is the right shape;
+    /// in `roaming_mode = "nexus"` callers should always use
+    /// [`Bss`](Self::Bss) with a target chosen by `pick_roam_target`
+    /// and avoid `Auto` — the latter risks bouncing back to the
+    /// current AP. DD-003 §7.1 / §10 (iwd handles this more
+    /// faithfully via the Station's own roam-on-Reattach loop).
     Auto,
-    /// Explicitly roam to this BSSID.
+    /// Explicitly roam to this BSSID. Always preferred for
+    /// `roaming_mode = "nexus"`.
     Bss(MacAddr),
 }
 
 /// Signal quality snapshot from `NL80211_CMD_GET_STATION`. See
 /// DD-003 §7.2.
+///
+/// **Bitrate.** wpa_supplicant's `SignalPoll` only publishes one
+/// `linkspeed` value, so this struct exposes a single
+/// `bitrate_mbps` field rather than the separate `tx` / `rx`
+/// pair the DD originally sketched. iwd surfaces `RxBitrate` /
+/// `TxBitrate` separately on `Station`; if/when that backend
+/// lands the asymmetry can be re-introduced (the field name
+/// stays — `bitrate_mbps` becomes the average / advertised rate
+/// and the iwd branch can populate it from the larger of the
+/// two as a conservative default).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SignalInfo {
     pub bssid: MacAddr,
     pub rssi_dbm: i32,
     pub noise_dbm: Option<i32>,
     pub snr_db: Option<i32>,
-    pub tx_bitrate_mbps: f32,
-    pub rx_bitrate_mbps: f32,
+    pub bitrate_mbps: f32,
     pub frequency: u32,
 }
 
@@ -130,10 +149,3 @@ impl RoamMode {
     }
 }
 
-/// Convert the profile-store security config to this crate's alias.
-/// Kept as a one-liner helper so the rest of the codebase doesn't
-/// have to reach into nexus-profile-store directly for the variant
-/// names.
-pub fn profile_security(config: &SecurityConfig) -> SecurityConfig {
-    config.clone()
-}

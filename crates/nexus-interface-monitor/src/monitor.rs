@@ -11,11 +11,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexus_core::{InterfaceInfo, InterfaceKind, NexusEvent, OperState, PhyCapabilities};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::MonitorError;
 use crate::classify::{ClassifyOutcome, ClassifyTracker};
+use crate::command::MonitorCommand;
 use crate::enumerate::{
     ColdBoot, Nl80211InterfaceInfo, classify_link, cold_boot_enumerate, dump_nl80211_interfaces,
     dump_nl80211_wiphys, parse_nl80211_interface_attrs, resolve_nl80211,
@@ -27,11 +28,12 @@ use crate::netlink::nl80211::{
     NL80211_MCAST_GROUP_MLME, NL80211_MCAST_GROUP_SCAN,
 };
 use crate::netlink::parser::{
-    MessageIter, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NLMSG_HDRLEN, NetlinkMessageHeader,
-    encode_attribute, finalize_message_length, parse_nlmsgerr,
+    MessageIter, NLM_F_ACK, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, NLMSG_HDRLEN,
+    NetlinkMessageHeader, encode_attribute, finalize_message_length, parse_nlmsgerr,
 };
 use crate::netlink::rtnl::{
-    ARPHRD_ETHER, LinkMessage, RTM_DELLINK, RTM_NEWLINK, RTMGRP_LINK, parse_link_message,
+    ARPHRD_ETHER, IFF_UP, IFINFOMSG_SIZE, IfInfoHeader, LinkMessage, RTM_DELLINK, RTM_NEWLINK,
+    RTMGRP_LINK, parse_link_message,
 };
 use crate::netlink::socket::{NETLINK_GENERIC, NETLINK_ROUTE, NetlinkSocket};
 use crate::recover::{Nl80211RetryTimer, compute_registry_diff, is_enobufs};
@@ -98,7 +100,11 @@ impl MonitorTask {
         })
     }
 
-    pub async fn run(mut self, shutdown: CancellationToken) -> Result<(), MonitorError> {
+    pub async fn run(
+        mut self,
+        shutdown: CancellationToken,
+        mut commands: mpsc::Receiver<MonitorCommand>,
+    ) -> Result<(), MonitorError> {
         let cold_boot_started = Instant::now();
 
         let outcome = cold_boot_enumerate(
@@ -316,6 +322,32 @@ impl MonitorTask {
                     }
                     m::refresh_interface_counts(registry.iter());
                 }
+                Some(cmd) = commands.recv() => {
+                    handle_monitor_command(&rtnl, cmd).await;
+                }
+            }
+        }
+    }
+}
+
+/// Dispatch a [`MonitorCommand`]. Lives here rather than on
+/// [`MonitorTask`] because by the time the `select!` loop runs the
+/// task has been destructured into disjoint borrows.
+async fn handle_monitor_command(rtnl: &NetlinkSocket, cmd: MonitorCommand) {
+    match cmd {
+        MonitorCommand::SetAdminUp {
+            ifindex,
+            up,
+            reply,
+        } => {
+            let result = set_admin_up(rtnl, ifindex, up).await;
+            if let Err(ref e) = result {
+                tracing::warn!(ifindex, up, error = %e, "SetAdminUp failed");
+            } else {
+                tracing::debug!(ifindex, up, "SetAdminUp dispatched");
+            }
+            if let Some(tx) = reply {
+                let _ = tx.send(result);
             }
         }
     }
@@ -887,6 +919,36 @@ async fn optional_recv(socket: Option<&NetlinkSocket>, buf: &mut [u8]) -> io::Re
         Some(s) => s.recv(buf).await,
         None => pending().await,
     }
+}
+
+/// Build and send an `RTM_NEWLINK` that flips `IFF_UP` on `ifindex`.
+/// `ifi_change = IFF_UP` so the kernel only touches that one flag;
+/// every other flag on the interface is preserved. Matches what
+/// `ip link set dev X up/down` emits on the wire. DD-003 §12.4.
+async fn set_admin_up(
+    rtnl: &NetlinkSocket,
+    ifindex: u32,
+    up: bool,
+) -> Result<(), String> {
+    let flags = if up { IFF_UP } else { 0 };
+    let ifi = IfInfoHeader {
+        family: libc::AF_UNSPEC as u8,
+        ifi_type: 0,
+        index: ifindex as i32,
+        flags,
+        change: IFF_UP,
+    };
+    let hdr = rtnl.fresh_header(RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK);
+    let mut buf = Vec::with_capacity(NLMSG_HDRLEN + IFINFOMSG_SIZE);
+    buf.extend_from_slice(&hdr.to_bytes());
+    buf.extend_from_slice(&ifi.to_bytes());
+    finalize_message_length(&mut buf);
+    rtnl.send(&buf).await.map_err(|e| e.to_string())?;
+    // Fire-and-forget for now — the next RTM_NEWLINK multicast that
+    // lands in the regular rtnl loop is the behavioural confirmation
+    // Nexus cares about. Draining the ACK here without coordinating
+    // with the main recv loop would race that loop for the reply.
+    Ok(())
 }
 
 async fn optional_udev(udev: Option<&mut UdevMonitorHandle>) -> Option<UdevAction> {

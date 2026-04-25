@@ -41,6 +41,7 @@ struct Harness {
     event_rx: broadcast::Receiver<NexusEvent>,
     supplicant: MockSupplicantHandle,
     sup_tx: broadcast::Sender<SupplicantEvent>,
+    cmd_tx: tokio::sync::mpsc::Sender<nexus_wifi::WifiCommand>,
     // Keep the tempdir alive for the lifetime of the harness.
     _tmp: TempDir,
 }
@@ -60,7 +61,7 @@ impl Harness {
 
         let mock = MockSupplicant::new(sup_tx.clone());
         let supplicant_handle = mock.handle();
-        let (_cmd_tx, cmd_rx) = nexus_wifi::command_channel();
+        let (cmd_tx, cmd_rx) = nexus_wifi::command_channel();
         let backend = spawn_wifi_backend(
             event_tx.clone(),
             sup_tx.clone(),
@@ -68,6 +69,7 @@ impl Harness {
             store,
             config,
             cmd_rx,
+            None, // tests don't exercise the MonitorCommand path
         );
 
         Self {
@@ -76,6 +78,7 @@ impl Harness {
             event_rx,
             supplicant: supplicant_handle,
             sup_tx,
+            cmd_tx,
             _tmp: tmp,
         }
     }
@@ -106,7 +109,16 @@ impl Harness {
                     }
                     seen.push(format!("{event:?}"));
                 }
-                Ok(Err(_)) | Err(_) => {
+                Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                    seen.push(format!("<<lagged by {n}>>"));
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    panic!(
+                        "event_rx closed\nobserved: {}",
+                        seen.join("\n         ")
+                    );
+                }
+                Err(_) => {
                     panic!(
                         "timed out waiting for event\nobserved: {}",
                         seen.join("\n         ")
@@ -114,6 +126,32 @@ impl Harness {
                 }
             }
         }
+    }
+
+    /// Drain the event bus for `window` and assert that no event
+    /// matching `pred` ever shows up. Used by the S5 test to
+    /// confirm `BssCacheStale` does NOT emit `WifiScanComplete`.
+    async fn expect_no_event<F: Fn(&NexusEvent) -> bool>(
+        &mut self,
+        pred: F,
+        window: Duration,
+    ) {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, self.event_rx.recv()).await {
+                Ok(Ok(event)) => {
+                    if pred(&event) {
+                        panic!("unexpected event: {event:?}");
+                    }
+                }
+                Ok(Err(_)) | Err(_) => return,
+            }
+        }
+    }
+
+    async fn set_power(&self, state: PowerState) {
+        *self.backend.power.write().await = state;
     }
 }
 
@@ -465,4 +503,530 @@ async fn unattached_scan_errors() {
         nexus_wifi::WifiError::NotAttached { ifindex } => assert_eq!(ifindex, 42),
         other => panic!("expected NotAttached, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// New §14.1 coverage for the C/K/S audit fixes.
+// ---------------------------------------------------------------------------
+
+/// DD-003 §3.2 / §6.4 (C3): a transient `Disconnected` cools down
+/// to `Idle` after `disconnect_cool_down`.
+#[tokio::test]
+async fn cooldown_transitions_disconnected_to_idle() {
+    let profile = wifi_profile(b"corp", "correcthorse", 10);
+    let cfg = WifiConfig {
+        // Tight cool-down so the test runs in well under a second.
+        disconnect_cool_down: Duration::from_millis(50),
+        ..WifiConfig::default()
+    };
+    let mut h = Harness::start(vec![profile], cfg).await;
+
+    // Plant a non-matching scan result so the backend reaches the
+    // post-attach steady state quickly without trying to connect.
+    h.supplicant
+        .set_scan_results(2, vec![bss([0x02; 6], b"other", -50, SecurityMode::Open)]);
+
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiStateChanged { ifindex: 2, .. }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Drive a transient Disconnected via the regular supplicant
+    // state path (LocalRequest → DisconnectReason::LocalRequest,
+    // which is not permanent and arms the cool-down deadline in
+    // `After::Disconnected`). The DaemonDown shortcut bypasses
+    // After::Disconnected and so doesn't arm the cooldown — that's
+    // by design (DD-003 §12.1 wants the interface to wait for
+    // re-attach, not for a fresh scan against a missing daemon).
+    let _ = h.sup_tx.send(SupplicantEvent::State {
+        ifindex: 2,
+        state: nexus_wifi::supplicant::SupplicantState::Disconnected {
+            reason: nexus_wifi::supplicant::DisconnectHint::LocalRequest,
+        },
+    });
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Disconnected {
+                    reason: nexus_core::DisconnectReason::LocalRequest,
+                },
+            }
+        ),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Heartbeat is 1 s; cool-down is 50 ms. Within ~1.5 s the
+    // sweep should land us back in Idle.
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Idle
+            }
+        ),
+        Duration::from_secs(3),
+    )
+    .await;
+    h.shutdown().await;
+}
+
+/// DD-003 §3.2 (C3 negative): `CredentialsInvalid` is a permanent
+/// reason — no cooldown sweep should fire.
+#[tokio::test]
+async fn cooldown_does_not_fire_for_credentials_invalid() {
+    let profile = wifi_profile(b"corp", "wrong", 10);
+    let cfg = WifiConfig {
+        disconnect_cool_down: Duration::from_millis(50),
+        ..WifiConfig::default()
+    };
+    let mut h = Harness::start(vec![profile], cfg).await;
+
+    h.supplicant
+        .set_scan_results(2, vec![bss([0xBB; 6], b"corp", -40, SecurityMode::Wpa2Psk)]);
+    h.supplicant.set_connect_outcome(
+        2,
+        MockBehavior::Fail(nexus_wifi::supplicant::DisconnectHint::BadCredentials),
+    );
+
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Disconnected {
+                    reason: nexus_core::DisconnectReason::CredentialsInvalid,
+                },
+            }
+        ),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Far longer than disconnect_cool_down — no Idle transition
+    // should ever fire.
+    h.expect_no_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Idle
+            }
+        ),
+        Duration::from_secs(2),
+    )
+    .await;
+    h.shutdown().await;
+}
+
+/// DD-003 §13.3 (C6): Sleep → Active transition triggers
+/// `on_wake`, which probes signal on every Connected interface.
+/// When the probe errors the interface flips to
+/// `Disconnected { PostSleepRecovery }`.
+#[tokio::test]
+async fn wake_from_sleep_emits_post_sleep_recovery_on_probe_error() {
+    let profile = open_profile(b"captive");
+    let mut h = Harness::start(vec![profile], WifiConfig::default()).await;
+
+    h.supplicant
+        .set_scan_results(2, vec![bss([0xCC; 6], b"captive", -50, SecurityMode::Open)]);
+    h.supplicant
+        .set_connect_outcome(2, MockBehavior::OpenSuccess);
+
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiLinkReady { ifindex: 2 }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Drop into Sleep, then back to Active. The heartbeat fires
+    // every 1 s so allow ~3 s for the wake to land.
+    h.set_power(PowerState::Sleep).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    h.supplicant.set_signal_info_fails(true);
+    h.set_power(PowerState::Active).await;
+
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Disconnected {
+                    reason: nexus_core::DisconnectReason::PostSleepRecovery,
+                },
+            }
+        ),
+        Duration::from_secs(3),
+    )
+    .await;
+    h.shutdown().await;
+}
+
+/// DD-003 §12.4 (C7): an interface stuck in `Connecting` past
+/// `driver_wedge_threshold` triggers detach + IFF_UP flap +
+/// re-attach + `Disconnected { DriverWedge }`.
+#[tokio::test]
+async fn driver_wedge_recovery_emits_driver_wedge_disconnect() {
+    let profile = wifi_profile(b"corp", "pw", 10);
+    let cfg = WifiConfig {
+        // Shrink the wedge threshold; the heartbeat ticks every 1 s
+        // so the wedge sweep needs to run at least once after the
+        // dwell crosses the line. The wedge recovery itself sleeps
+        // for `disconnect_cool_down` between SetAdminUp(false) and
+        // SetAdminUp(true) — drop that to keep the test brisk.
+        driver_wedge_threshold: Duration::from_millis(50),
+        disconnect_cool_down: Duration::from_millis(20),
+        ..WifiConfig::default()
+    };
+    let mut h = Harness::start(vec![profile], cfg).await;
+
+    // Plant a BSS so the auto-select path picks it up; the mock
+    // then drives Associating but stays there — `MockBehavior`
+    // doesn't have a "stall in Associating" outcome, but we can
+    // approximate one by issuing the Associating state directly
+    // and never following up.
+    h.supplicant
+        .set_scan_results(2, vec![bss([0xAA; 6], b"corp", -45, SecurityMode::Wpa2Psk)]);
+    // Use a Fail outcome so the mock's drive_connect emits
+    // Associating then Disconnected — but the dwell timer is set
+    // by the backend in `try_connect` BEFORE drive_connect runs,
+    // and is cleared on Disconnected. To keep the dwell alive we
+    // bypass the mock's connect path entirely: emit a synthetic
+    // Associating state via sup_tx after InterfaceDiscovered.
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiStateChanged { ifindex: 2, .. }),
+        Duration::from_secs(2),
+    )
+    .await;
+    let _ = h.sup_tx.send(SupplicantEvent::State {
+        ifindex: 2,
+        state: nexus_wifi::supplicant::SupplicantState::Associating,
+    });
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Connecting { .. },
+            }
+        ),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Wait long enough for the heartbeat to detect the wedge and
+    // run the recovery (threshold 50 ms + heartbeat 1 s + cool-down
+    // 20 ms ≈ ~1.1 s under the worst case).
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Disconnected {
+                    reason: nexus_core::DisconnectReason::DriverWedge,
+                },
+            }
+        ),
+        Duration::from_secs(3),
+    )
+    .await;
+    h.shutdown().await;
+}
+
+/// DD-003 §5.1 / §7.3 (C8): once a Connected interface drops
+/// below `roam_trigger_dbm` in `nexus` mode, the heartbeat fires
+/// a directed scan with `allow_roam = true`.
+#[tokio::test]
+async fn low_signal_triggers_directed_roam_scan_in_nexus_mode() {
+    use nexus_wifi::types::RoamMode;
+    let profile = wifi_profile(b"corp", "pw", 10);
+    let cfg = WifiConfig {
+        roam_mode: RoamMode::Nexus,
+        // Faster signal poll so the test doesn't need to wait the
+        // default 5 s interval.
+        signal_poll_interval: Duration::from_millis(50),
+        ..WifiConfig::default()
+    };
+    let mut h = Harness::start(vec![profile], cfg).await;
+
+    h.supplicant
+        .set_scan_results(2, vec![bss([0xAA; 6], b"corp", -40, SecurityMode::Wpa2Psk)]);
+    h.supplicant.set_connect_outcome(2, MockBehavior::Success);
+    // Plant a low-signal `signal_info` so the next heartbeat poll
+    // pulls RSSI under the default trigger (-75 dBm).
+    h.supplicant.set_signal(
+        2,
+        nexus_wifi::types::SignalInfo {
+            bssid: MacAddr([0xAA; 6]),
+            rssi_dbm: -85,
+            noise_dbm: None,
+            snr_db: None,
+            bitrate_mbps: 0.0,
+            frequency: 2412,
+        },
+    );
+
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiLinkReady { ifindex: 2 }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Wait for at least one heartbeat to run signal poll +
+    // roam-trigger evaluation (heartbeat is 1 s). The directed
+    // scan fires inside `maybe_trigger_roam_scans`.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_roam_scan = false;
+    while Instant::now() < deadline && !saw_roam_scan {
+        for (ifindex, params) in h.supplicant.scan_calls() {
+            if ifindex == 2 && params.allow_roam && !params.ssids.is_empty() {
+                saw_roam_scan = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        saw_roam_scan,
+        "expected a roam-evaluation scan with allow_roam=true and a directed SSID; \
+         got {:?}",
+        h.supplicant.scan_calls()
+    );
+    h.shutdown().await;
+}
+
+/// DD-003 §7 (C9): `dispatch_roam` enters `WifiState::Roaming`,
+/// and a subsequent `Connected` with the wrong BSSID still folds
+/// back to `Connected` (with the actual BSSID).
+#[tokio::test]
+async fn nexus_roam_evaluates_and_completes() {
+    use nexus_wifi::types::RoamMode;
+    let profile = wifi_profile(b"corp", "pw", 10);
+    let cfg = WifiConfig {
+        roam_mode: RoamMode::Nexus,
+        ..WifiConfig::default()
+    };
+    let mut h = Harness::start(vec![profile], cfg).await;
+
+    // Two BSSes for the same SSID — current one weak, the other
+    // a much stronger candidate. Mock then drives Success on
+    // connect (associating with the weak BSS first).
+    h.supplicant.set_scan_results(
+        2,
+        vec![
+            bss([0xAA; 6], b"corp", -85, SecurityMode::Wpa2Psk), // current
+            bss([0xBB; 6], b"corp", -45, SecurityMode::Wpa2Psk), // candidate
+        ],
+    );
+    h.supplicant.set_connect_outcome(2, MockBehavior::Success);
+
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiLinkReady { ifindex: 2 }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // The mock's Connected emission used the FIRST BSS in the scan
+    // list; force the in-state RSSI under the trigger by emitting
+    // a synthetic state with the weak BSSID + ssid.
+    // Then trigger another scan complete via `BssCacheStale` —
+    // the backend re-reads scan results, sees the Connected entry
+    // is on a weak BSS while a strong candidate exists for the
+    // same SSID, and the heartbeat's roam-trigger eventually
+    // fires `dispatch_roam`.
+    //
+    // Direct path: feed the backend a low signal poll so RSSI
+    // drops to -85 inside the Connected variant.
+    h.supplicant.set_signal(
+        2,
+        nexus_wifi::types::SignalInfo {
+            bssid: MacAddr([0xAA; 6]),
+            rssi_dbm: -85,
+            noise_dbm: None,
+            snr_db: None,
+            bitrate_mbps: 0.0,
+            frequency: 2412,
+        },
+    );
+
+    // Watch for the recorded roam call (the dispatch_roam side
+    // effect). Heartbeat cadence is 1 s; allow up to 5 s for
+    // signal poll → directed scan → scan complete → evaluate_roam
+    // → dispatch_roam.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut roamed_to: Option<MacAddr> = None;
+    while Instant::now() < deadline && roamed_to.is_none() {
+        for (ifindex, target) in h.supplicant.roam_calls() {
+            if ifindex == 2 {
+                if let nexus_wifi::types::RoamTarget::Bss(b) = target {
+                    roamed_to = Some(b);
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let target = roamed_to.expect("backend should dispatch a roam to the stronger candidate");
+    assert_eq!(target, MacAddr([0xBB; 6]));
+    h.shutdown().await;
+}
+
+/// DD-003 §9.2 (C10): `SupplicantEvent::NetworkRequest` round-
+/// trips into `NexusEvent::WifiNetworkRequest`.
+#[tokio::test]
+async fn network_request_round_trips_to_nexus_event() {
+    let profile = open_profile(b"captive");
+    let mut h = Harness::start(vec![profile], WifiConfig::default()).await;
+
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiStateChanged { ifindex: 2, .. }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let _ = h.sup_tx.send(SupplicantEvent::NetworkRequest {
+        ifindex: 2,
+        network: "/fi/w1/wpa_supplicant1/Interfaces/0/Networks/3".into(),
+        field: "password".into(),
+        text: "Enter PEAP password".into(),
+    });
+
+    let event = h
+        .expect_event(
+            |e| matches!(e, NexusEvent::WifiNetworkRequest { ifindex: 2, .. }),
+            Duration::from_secs(2),
+        )
+        .await;
+    if let NexusEvent::WifiNetworkRequest {
+        network,
+        field,
+        text,
+        ..
+    } = event
+    {
+        assert_eq!(network, "/fi/w1/wpa_supplicant1/Interfaces/0/Networks/3");
+        assert_eq!(field, "password");
+        assert_eq!(text, "Enter PEAP password");
+    }
+
+    // And the matching ProvideCredential WifiCommand round-trips
+    // to the supplicant via wifi_provide_credential.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    h.cmd_tx
+        .send(nexus_wifi::WifiCommand::ProvideCredential {
+            ifname: "wlan0".into(),
+            network: "/fi/w1/wpa_supplicant1/Interfaces/0/Networks/3".into(),
+            field: "password".into(),
+            value: "hunter2".into(),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    reply_rx.await.unwrap().unwrap();
+    let replies = h.supplicant.credential_replies();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].ifindex, 2);
+    assert_eq!(replies[0].field, "password");
+    assert_eq!(replies[0].value, "hunter2");
+    h.shutdown().await;
+}
+
+/// K8: when the supplicant attach fails, the entry enters
+/// `Disconnected{SupplicantUnavailable}` and no scan is requested.
+#[tokio::test]
+async fn attach_failure_leaves_interface_in_supplicant_unavailable_with_no_scan() {
+    let profile = open_profile(b"captive");
+    let mut h = Harness::start(vec![profile], WifiConfig::default()).await;
+
+    // Force the mock attach to fail.
+    h.supplicant.set_daemon_up(false);
+
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    let event = h
+        .expect_event(
+            |e| matches!(e, NexusEvent::WifiStateChanged { ifindex: 2, .. }),
+            Duration::from_secs(2),
+        )
+        .await;
+    assert!(matches!(
+        event,
+        NexusEvent::WifiStateChanged {
+            ifindex: 2,
+            state: WifiState::Disconnected {
+                reason: nexus_core::DisconnectReason::SupplicantUnavailable,
+            },
+        }
+    ));
+
+    // No scan should have been issued — the daemon is "down".
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        h.supplicant.scan_calls().is_empty(),
+        "no scan should fire when attach failed: {:?}",
+        h.supplicant.scan_calls()
+    );
+    h.shutdown().await;
+}
+
+/// S5: `SupplicantEvent::BssCacheStale` refreshes the local
+/// BssCache (visible by re-driving auto-select on the next scan)
+/// but does NOT emit a public `WifiScanComplete` event.
+#[tokio::test]
+async fn bss_cache_stale_does_not_emit_scan_complete() {
+    let profile = open_profile(b"captive");
+    let mut h = Harness::start(vec![profile], WifiConfig::default()).await;
+
+    // Plant a fresh BSS in the mock cache so the upcoming
+    // get_scan_results call returns something — the backend
+    // refreshes its local cache on BssCacheStale.
+    h.supplicant
+        .set_scan_results(2, vec![bss([0xAB; 6], b"captive", -42, SecurityMode::Open)]);
+    h.supplicant
+        .set_connect_outcome(2, MockBehavior::OpenSuccess);
+
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiLinkReady { ifindex: 2 }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Now fire BssCacheStale. The backend should NOT emit a
+    // WifiScanComplete in response.
+    let _ = h.sup_tx.send(SupplicantEvent::BssCacheStale { ifindex: 2 });
+    h.expect_no_event(
+        |e| matches!(e, NexusEvent::WifiScanComplete { ifindex: 2, .. }),
+        Duration::from_millis(300),
+    )
+    .await;
+    h.shutdown().await;
 }

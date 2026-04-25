@@ -134,6 +134,19 @@ pub enum WifiCommand {
         on: bool,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Reply to a [`nexus_core::NexusEvent::WifiNetworkRequest`].
+    /// `network` round-trips the opaque supplicant-side network
+    /// object path from the original event. Routes through
+    /// [`WifiSupplicantBackend::provide_network_credential`] so
+    /// wpa_supplicant's `NetworkReply` gets the credential. DD-003
+    /// §9.2 / DD-006 §9.
+    ProvideCredential {
+        ifname: String,
+        network: String,
+        field: String,
+        value: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Handle returned by [`spawn_wifi_backend`]. Drop the handle to
@@ -173,6 +186,7 @@ pub fn spawn_wifi_backend(
     profile_store: Arc<dyn ProfileStore>,
     config: WifiConfig,
     commands: mpsc::Receiver<WifiCommand>,
+    monitor_commands: Option<mpsc::Sender<nexus_interface_monitor::MonitorCommand>>,
 ) -> WifiBackendHandle {
     metrics::register();
     let shutdown = CancellationToken::new();
@@ -202,6 +216,9 @@ pub fn spawn_wifi_backend(
     );
     if let (Some(rx), Some(w)) = (rfkill_rx, rfkill_writer) {
         backend = backend.with_rfkill(rx, w);
+    }
+    if let Some(tx) = monitor_commands {
+        backend = backend.with_monitor_commands(tx);
     }
     let power = backend.power_handle();
     let shutdown_child = shutdown.clone();

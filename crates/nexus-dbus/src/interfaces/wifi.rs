@@ -258,6 +258,35 @@ impl WifiIface {
             .map_err(fdo::Error::from)
     }
 
+    /// `ProvideCredential(network: o, field: s, value: s) -> ()` —
+    /// DD-006 §6.3 / DD-003 §9.2. Echoes the operator's reply back
+    /// into wpa_supplicant's `NetworkReply`.
+    async fn provide_credential(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        network: OwnedObjectPath,
+        field: String,
+        value: String,
+    ) -> fdo::Result<()> {
+        self.check_feature()?;
+        // Same op-class as Connect — credential replies are
+        // operator-driven and infrequent. Reusing the bucket keeps
+        // an interactive flow (Connect → NetworkRequest → reply →
+        // Connect) under a single rate-limit budget.
+        self.check_rate(&hdr, OpClass::ConnectDisconnect)?;
+        self.require_auth(&hdr, actions::CONNECT).await?;
+        if field.is_empty() {
+            return Err(fdo::Error::from(DbusError::InvalidArgument(
+                "credential field must be non-empty".into(),
+            )));
+        }
+        self.services
+            .ops
+            .wifi_provide_credential(&self.ifname, network.as_str(), &field, &value)
+            .await
+            .map_err(fdo::Error::from)
+    }
+
     /// `Powered` writeable property — `fi.nexus.set_power`.
     /// zbus threads the request `Header` through property setters
     /// as `#[zbus(header)]`, so the PolicyKit check gets the real

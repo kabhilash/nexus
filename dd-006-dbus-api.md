@@ -461,6 +461,20 @@ Disconnect() -> ()
 Roam(bssid: ay) -> ()
     Request a roam to the given BSSID. Only valid in RoamingMode == "nexus".
     Errors: fi.nexus.Error.InvalidState, fi.nexus.Error.AuthFailed
+
+ProvideCredential(network: o, field: s, value: s) -> ()
+    Reply to an outstanding `NetworkRequest` (§9). `network` is the
+    opaque supplicant-side network object path the request carried;
+    clients pass it back verbatim so the supplicant can match the
+    reply to the prompt. `field` is the credential the supplicant
+    asked for (e.g. `"password"`, `"passphrase"`, `"otp"`,
+    `"pin"`); `value` is the operator-supplied secret. The daemon
+    forwards the call into the supplicant's `NetworkReply` method;
+    the connection attempt resumes if the credential is accepted
+    or transitions to Disconnected{CredentialsInvalid} if not.
+    See DD-003 §9.2.
+    Errors: fi.nexus.Error.AuthFailed, fi.nexus.Error.NotFound,
+            fi.nexus.Error.InvalidArgument
 ```
 
 To update credentials on an existing profile (for credentials-invalid recovery flows), use `fi.nexus.Profile.Update` on the profile object with the new credential fields in the settings dict. When `Update` changes a credential field on a profile with `CredentialsInvalid = true`, the backend clears the flag and the next auto-connect cycle retries the connection.
@@ -837,6 +851,17 @@ SignalLevel(rssi: i, frequency: u)
 
 RoamStarted(from_bssid: ay, to_bssid: ay)
 RoamCompleted(bssid: ay, success: b)
+
+NetworkRequest(network: o, field: s, text: s)
+    wpa_supplicant is asking for an out-of-band credential to
+    complete an ongoing authentication (OTP, smart-card PIN,
+    `ext_password`-marked field, …). `network` is the opaque
+    supplicant-side network object path; clients echo it back
+    verbatim via `Wifi.ProvideCredential` (§6.3) so the supplicant
+    can correlate the reply. `field` names the credential
+    (`"password"`, `"passphrase"`, `"otp"`, `"pin"`, …); `text`
+    is the human-readable prompt the supplicant suggests showing
+    the operator. See DD-003 §9.2.
 ```
 
 **Ethernet (`fi.nexus.Ethernet`):**

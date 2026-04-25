@@ -467,6 +467,48 @@ async fn handle_event(
                 services.batcher.mark(&path, "fi.nexus.Wifi", "Frequency");
             }
         }
+        NexusEvent::WifiNetworkRequest {
+            ifindex,
+            network,
+            field,
+            text,
+        } => {
+            // DD-006 §9 wifi `NetworkRequest` signal. We don't
+            // cache the request — clients answer once and the
+            // supplicant resumes the auth flow; a stale request
+            // is on its own retry path. The signal payload is
+            // (network: o, field: s, text: s).
+            if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
+                let path = interface_path(&ifname);
+                let Ok(obj_path) = zbus::zvariant::ObjectPath::try_from(path.clone()) else {
+                    return Ok(());
+                };
+                let Ok(network_path) = zbus::zvariant::ObjectPath::try_from(network.clone()) else {
+                    tracing::warn!(
+                        ifname = %ifname,
+                        network = %network,
+                        "wifi NetworkRequest: bad supplicant path; dropping"
+                    );
+                    return Ok(());
+                };
+                if let Err(e) = connection
+                    .emit_signal(
+                        None::<&str>,
+                        obj_path,
+                        "fi.nexus.Wifi",
+                        "NetworkRequest",
+                        &(network_path, field, text),
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        error = ?e,
+                        %path,
+                        "wifi NetworkRequest emit failed"
+                    );
+                }
+            }
+        }
         NexusEvent::WifiScanComplete { ifindex, results } => {
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
                 let mut to_register: Vec<nexus_core::MacAddr> = Vec::new();

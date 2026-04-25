@@ -11,6 +11,17 @@ pub enum WifiError {
     #[error("ifindex {ifindex} is not attached to the supplicant")]
     NotAttached { ifindex: u32 },
 
+    /// An operator-facing call (Connect / Disconnect / Roam /
+    /// SetPowered / ProvideCredential) referenced an ifname the
+    /// backend doesn't track. Distinct from
+    /// [`NotAttached`](Self::NotAttached) — that's for known
+    /// interfaces whose supplicant attach is in flight or failed;
+    /// `UnknownInterface` is "no such interface" full-stop. S2
+    /// replaces the prior `NotAttached { ifindex: 0 }` sentinel,
+    /// which collided with real ifindex 0 (`lo`).
+    #[error("interface '{ifname}' is not known to the wifi backend")]
+    UnknownInterface { ifname: String },
+
     /// No visible BSS matched any loaded profile.
     #[error("no profile matches the scan results on ifindex {ifindex}")]
     NoProfileMatch { ifindex: u32 },

@@ -1,6 +1,6 @@
 [package]
 name = "nexus-wifi"
-version = "0.8.0"
+version = "0.13.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,6 +17,7 @@ integration-linux = []
 
 [dependencies]
 nexus-core = { path = "../nexus-core" }
+nexus-interface-monitor = { path = "../nexus-interface-monitor" }
 nexus-profile-store = { path = "../nexus-profile-store" }
 
 async-trait = { workspace = true }

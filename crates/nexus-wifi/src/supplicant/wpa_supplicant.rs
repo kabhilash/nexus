@@ -92,6 +92,17 @@ trait WpaInterface {
     /// field.
     fn signal_poll(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
 
+    /// Reply to a `NetworkRequest` signal. `path` is the network
+    /// object path from the request; `field` is echoed so the
+    /// supplicant can match the reply to the outstanding prompt;
+    /// `value` is the credential. DD-003 §9.2.
+    fn network_reply(
+        &self,
+        path: &OwnedObjectPath,
+        field: &str,
+        value: &str,
+    ) -> zbus::Result<()>;
+
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
 
@@ -118,6 +129,33 @@ trait WpaInterface {
 
     #[zbus(signal)]
     fn scan_done(&self, success: bool) -> zbus::Result<()>;
+
+    /// `NetworkRequest(network: o, field: s, text: s)` — emitted by
+    /// wpa_supplicant when it needs an out-of-band credential such
+    /// as an OTP or a password for `ext_password=1` fields.
+    #[zbus(signal)]
+    fn network_request(
+        &self,
+        network: OwnedObjectPath,
+        field: String,
+        text: String,
+    ) -> zbus::Result<()>;
+
+    /// `BSSAdded(path: o, properties: a{sv})` — fires whenever the
+    /// supplicant adds an entry to its BSS cache outside of a
+    /// driven `Scan()` call (e.g. a passive Beacon update). S5 /
+    /// DD-003 §9.2.
+    #[zbus(signal)]
+    fn bss_added(
+        &self,
+        path: OwnedObjectPath,
+        properties: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<()>;
+
+    /// `BSSRemoved(path: o)` — fires when an aged-out BSS leaves
+    /// the supplicant's cache. S5 / DD-003 §9.2.
+    #[zbus(signal)]
+    fn bss_removed(&self, path: OwnedObjectPath) -> zbus::Result<()>;
 }
 
 /// A single BSS seen by the supplicant scan cache. Properties only —
@@ -133,8 +171,14 @@ trait Bss {
     #[zbus(property, name = "BSSID")]
     fn bssid(&self) -> zbus::Result<Vec<u8>>;
 
+    /// Returned by wpa_supplicant as `q` (uint16) today; declared
+    /// here as [`OwnedValue`] so a future kernel/supplicant change
+    /// to `u` (uint32) — necessary if 6 GHz extensions push past
+    /// 65535 MHz — doesn't break the BSS read path. The K7
+    /// `bss_frequency_mhz` helper widens whichever wire type
+    /// shows up.
     #[zbus(property)]
-    fn frequency(&self) -> zbus::Result<u16>;
+    fn frequency(&self) -> zbus::Result<OwnedValue>;
 
     #[zbus(property)]
     fn signal(&self) -> zbus::Result<i16>;
@@ -147,6 +191,14 @@ trait Bss {
 
     #[zbus(property, name = "RSN")]
     fn rsn(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
+
+    /// Raw 802.11 Information Elements concatenation as it
+    /// appeared in the most recent Beacon / Probe Response. K2:
+    /// parsed for HT (45) / VHT (191) / HE (255+ext 35) /
+    /// EHT (255+ext 108) / WPS (221 vendor-specific) presence,
+    /// and the RSN element (48) for the PMF capability byte.
+    #[zbus(property, name = "IEs")]
+    fn ies(&self) -> zbus::Result<Vec<u8>>;
 }
 
 // ---- network-dict builder (DD-003 §9.4) ---------------------------------
@@ -402,6 +454,8 @@ struct AttachedInterface {
     path: OwnedObjectPath,
     state_watcher: JoinHandle<()>,
     scan_watcher: JoinHandle<()>,
+    request_watcher: JoinHandle<()>,
+    bss_watcher: JoinHandle<()>,
 }
 
 pub struct WpaSupplicantBackend {
@@ -434,6 +488,8 @@ impl Drop for WpaSupplicantBackend {
         for (_, iface) in self.interfaces.drain() {
             iface.state_watcher.abort();
             iface.scan_watcher.abort();
+            iface.request_watcher.abort();
+            iface.bss_watcher.abort();
         }
     }
 }
@@ -495,18 +551,14 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
         // freshly-attached interface in e.g. `disconnected` — or in
         // `completed`, if we re-attached to an already-associated
         // interface across a nexusd restart — emits one event
-        // immediately.
-        if let Ok(s) = iface_proxy.state().await {
-            let state_opt = if s == "completed" {
-                resolve_completed(&self.connection, &iface_proxy).await
-            } else {
-                translate_wpa_state(&s)
-            };
-            if let Some(state) = state_opt {
-                let _ = self
-                    .event_tx
-                    .send(SupplicantEvent::State { ifindex, state });
-            }
+        // immediately. The snapshot goes through the same resolver
+        // the watcher uses so `disconnected` carries a real reason
+        // (read from `DisconnectReason`) rather than a stock
+        // `Unspecified`.
+        if let Some(state) = resolve_state(&self.connection, &iface_proxy).await {
+            let _ = self
+                .event_tx
+                .send(SupplicantEvent::State { ifindex, state });
         }
 
         // Subscribe to PropertiesChanged on the interface object
@@ -552,12 +604,42 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
                 .map_err(zbus_err)?;
         let scan_watcher = spawn_scan_watcher(iface_for_scan, ifindex, self.event_tx.clone());
 
+        // `NetworkRequest` gets its own watcher — DD-003 §9.2. The
+        // request stream is low-volume (fires only on OTP /
+        // ext-password prompts) but its latency matters when it
+        // does; bundling with the state watcher would delay
+        // credential prompts behind property-read syscalls.
+        let iface_for_request: WpaInterfaceProxy<'static> =
+            WpaInterfaceProxy::builder(&self.connection)
+                .path(path.clone())
+                .map_err(zbus_err)?
+                .build()
+                .await
+                .map_err(zbus_err)?;
+        let request_watcher =
+            spawn_request_watcher(iface_for_request, ifindex, self.event_tx.clone());
+
+        // `BSSAdded` / `BSSRemoved` watcher (S5). Both signals
+        // funnel into `SupplicantEvent::BssCacheStale` so the
+        // backend re-reads the BSS list without emitting a public
+        // `WifiScanComplete` event for every Beacon-driven update.
+        let iface_for_bss: WpaInterfaceProxy<'static> =
+            WpaInterfaceProxy::builder(&self.connection)
+                .path(path.clone())
+                .map_err(zbus_err)?
+                .build()
+                .await
+                .map_err(zbus_err)?;
+        let bss_watcher = spawn_bss_watcher(iface_for_bss, ifindex, self.event_tx.clone());
+
         self.interfaces.insert(
             ifindex,
             AttachedInterface {
                 path,
                 state_watcher,
                 scan_watcher,
+                request_watcher,
+                bss_watcher,
             },
         );
         Ok(())
@@ -568,12 +650,16 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
             path,
             state_watcher,
             scan_watcher,
+            request_watcher,
+            bss_watcher,
         }) = self.interfaces.remove(&ifindex)
         else {
             return Ok(());
         };
         state_watcher.abort();
         scan_watcher.abort();
+        request_watcher.abort();
+        bss_watcher.abort();
         let root = WpaSupplicantProxy::new(&self.connection)
             .await
             .map_err(zbus_err)?;
@@ -613,6 +699,12 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
             params.frequencies.iter().map(|f| (*f, 0u32)).collect();
         let mut args: HashMap<&str, Value<'_>> = HashMap::new();
         args.insert("Type", Value::from(type_str));
+        // `AllowRoam` controls whether wpa_supplicant may use this
+        // scan's results to autonomously switch BSSes. Nexus is the
+        // authority in `off` / `nexus` modes; only hand the decision
+        // to the supplicant when `allow_roam` is set. DD-003 §4.1 /
+        // §9.3.
+        args.insert("AllowRoam", Value::from(params.allow_roam));
         if !ssids_owned.is_empty() {
             // aay — each SSID is itself an array of bytes.
             let arr = zbus::zvariant::Array::from(&ssids_owned[..]);
@@ -695,6 +787,12 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
     async fn roam(&mut self, ifindex: u32, target: RoamTarget) -> Result<()> {
         let iface = self.iface_proxy(ifindex).await?;
         match target {
+            // `Reassociate` is the closest single-call wpa_supplicant
+            // primitive; it does NOT pick a different BSS unless
+            // `bg_scan` has stashed a fresher candidate. See the
+            // RoamTarget::Auto rustdoc for the K3 caveats — the
+            // backend nudges callers toward `Bss(...)` for
+            // `roaming_mode = "nexus"`.
             RoamTarget::Auto => iface.reassociate().await.map_err(zbus_err)?,
             RoamTarget::Bss(mac) => {
                 // wpa_supplicant wants the BSSID as a formatted
@@ -716,10 +814,7 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
         let snr_db = noise_dbm.map(|n| rssi_dbm - n);
         let frequency = signal_u32(&dict, "frequency").unwrap_or(0);
         let linkspeed = signal_i32(&dict, "linkspeed").unwrap_or(0);
-        // wpa_supplicant only publishes one rate value; we expose
-        // the same number as both tx and rx until the supplicant
-        // grows separate counters.
-        let rate = linkspeed.max(0) as f32;
+        let bitrate_mbps = linkspeed.max(0) as f32;
         // `SignalInfo::bssid` is required. Pull it from the live
         // association; fall back to zero MAC when we're not
         // currently associated (the caller treats that as stale).
@@ -732,10 +827,27 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
             rssi_dbm,
             noise_dbm,
             snr_db,
-            tx_bitrate_mbps: rate,
-            rx_bitrate_mbps: rate,
+            bitrate_mbps,
             frequency,
         })
+    }
+
+    async fn provide_network_credential(
+        &mut self,
+        ifindex: u32,
+        network: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<()> {
+        let iface = self.iface_proxy(ifindex).await?;
+        let path = OwnedObjectPath::try_from(network.to_owned()).map_err(|e| {
+            WifiError::Supplicant {
+                backend: "wpa_supplicant",
+                source: format!("bad network path: {e}").into(),
+            }
+        })?;
+        iface.network_reply(&path, field, value).await.map_err(zbus_err)?;
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
@@ -823,15 +935,96 @@ fn spawn_scan_watcher(
             // but no new results were written to the BSS cache —
             // driver busy, radar-induced NOP, concurrent scan
             // conflict, etc. We still forward `ScanComplete` so
-            // the scheduler's post-scan hook runs, but log the
-            // failure at debug so repeated driver problems are
-            // visible in steady-state traces.
-            if let Ok(args) = sig.args() {
-                if !args.success {
-                    tracing::debug!(ifindex, "wpa_supplicant: ScanDone success=false");
+            // the scheduler's post-scan hook runs; the success bit
+            // is forwarded so the backend can label the metric
+            // outcome (K5).
+            let success = sig.args().map(|a| a.success).unwrap_or(true);
+            if !success {
+                tracing::debug!(ifindex, "wpa_supplicant: ScanDone success=false");
+            }
+            let _ = event_tx.send(SupplicantEvent::ScanComplete { ifindex, success });
+        }
+    })
+}
+
+/// Spawn a task that watches the interface's `NetworkRequest`
+/// signal and converts each into [`SupplicantEvent::NetworkRequest`].
+/// See DD-003 §9.2.
+fn spawn_request_watcher(
+    iface: WpaInterfaceProxy<'static>,
+    ifindex: u32,
+    event_tx: broadcast::Sender<SupplicantEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut stream = match iface.receive_network_request().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    ifindex,
+                    error = %e,
+                    "wpa_supplicant: NetworkRequest subscribe failed"
+                );
+                return;
+            }
+        };
+        while let Some(sig) = stream.next().await {
+            let Ok(args) = sig.args() else { continue };
+            let _ = event_tx.send(SupplicantEvent::NetworkRequest {
+                ifindex,
+                network: args.network.as_str().to_owned(),
+                field: args.field.clone(),
+                text: args.text.clone(),
+            });
+        }
+    })
+}
+
+/// Spawn a task that watches `BSSAdded` and `BSSRemoved` and
+/// folds both into [`SupplicantEvent::BssCacheStale`]. The
+/// backend re-reads the BSS list on each — cheap, and
+/// continuous-freshness updates shouldn't masquerade as
+/// `WifiScanComplete` to operator clients. S5.
+fn spawn_bss_watcher(
+    iface: WpaInterfaceProxy<'static>,
+    ifindex: u32,
+    event_tx: broadcast::Sender<SupplicantEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let added = match iface.receive_bss_added().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    ifindex,
+                    error = %e,
+                    "wpa_supplicant: BSSAdded subscribe failed"
+                );
+                return;
+            }
+        };
+        let removed = match iface.receive_bss_removed().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    ifindex,
+                    error = %e,
+                    "wpa_supplicant: BSSRemoved subscribe failed"
+                );
+                return;
+            }
+        };
+        let mut added = added;
+        let mut removed = removed;
+        loop {
+            tokio::select! {
+                a = added.next() => {
+                    if a.is_none() { return; }
+                    let _ = event_tx.send(SupplicantEvent::BssCacheStale { ifindex });
+                }
+                r = removed.next() => {
+                    if r.is_none() { return; }
+                    let _ = event_tx.send(SupplicantEvent::BssCacheStale { ifindex });
                 }
             }
-            let _ = event_tx.send(SupplicantEvent::ScanComplete { ifindex });
         }
     })
 }
@@ -873,22 +1066,150 @@ async fn read_bss(
         bssid_bytes[4],
         bssid_bytes[5],
     ]);
-    let frequency = bss.frequency().await.map_err(zbus_err)? as u32;
+    let frequency = bss
+        .frequency()
+        .await
+        .map_err(zbus_err)
+        .ok()
+        .and_then(|v| bss_frequency_mhz(&v))
+        .unwrap_or(0);
     let signal_dbm = bss.signal().await.map_err(zbus_err)? as i32;
     let age_s = bss.age().await.unwrap_or(0);
     let wpa = bss.wpa().await.unwrap_or_default();
     let rsn = bss.rsn().await.unwrap_or_default();
     let security = detect_security(&wpa, &rsn);
+    // K2: parse the raw IE blob for HT/VHT/HE/EHT/WPS presence and
+    // the RSN cap byte. Skipping the call (or a parse failure)
+    // leaves capabilities at default — the security match still
+    // works off `KeyMgmt`.
+    let ies = bss.ies().await.unwrap_or_default();
+    let capabilities = parse_bss_capabilities(&ies, &rsn);
 
     Ok(Some(crate::types::BssInfo {
         bssid,
         ssid,
         frequency,
         signal_dbm,
-        capabilities: crate::types::BssCapabilities::default(),
+        capabilities,
         security,
         age_ms: (age_s as u64).saturating_mul(1000),
     }))
+}
+
+/// Walk the raw 802.11 IE chain in `ies` and the parsed RSN dict
+/// to populate every `BssCapabilities` flag the rest of Nexus
+/// cares about. K2 / DD-003 §4.2.
+fn parse_bss_capabilities(
+    ies: &[u8],
+    rsn: &HashMap<String, OwnedValue>,
+) -> crate::types::BssCapabilities {
+    let mut caps = crate::types::BssCapabilities::default();
+    let mut rsn_payload: Option<&[u8]> = None;
+    let mut i = 0;
+    while i + 2 <= ies.len() {
+        let id = ies[i];
+        let len = ies[i + 1] as usize;
+        let body_start = i + 2;
+        let body_end = body_start.saturating_add(len);
+        if body_end > ies.len() {
+            break;
+        }
+        let body = &ies[body_start..body_end];
+        match id {
+            45 => caps.ht = true,         // HT Capabilities
+            191 => caps.vht = true,       // VHT Capabilities
+            48 => rsn_payload = Some(body), // RSN
+            // Vendor-Specific: WPS uses Microsoft OUI
+            // 00:50:F2 + type 04. The first 4 body bytes are
+            // OUI (3) + type (1).
+            221 if matches!(body, [0x00, 0x50, 0xF2, 0x04, ..]) => {
+                caps.wps = true;
+            }
+            255 => {
+                // Element-extension: the first body byte is the
+                // ext-tag.
+                if let Some(ext_tag) = body.first() {
+                    match *ext_tag {
+                        35 => caps.he = true,  // HE Capabilities
+                        108 => caps.eht = true, // EHT Capabilities
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        i = body_end;
+    }
+
+    // RSN gives us PMF (capable + required) directly via the
+    // capabilities byte and FT via the AKM suite list. Walk the
+    // RSN payload up to the cap bytes.
+    if let Some(payload) = rsn_payload {
+        if let Some((cap_lo, cap_hi)) = rsn_capability_bytes(payload) {
+            // 802.11-2020 9.4.2.24.4: bit 6 = MFPC, bit 7 = MFPR
+            // in the low byte of the RSN Capabilities field.
+            caps.pmf_capable = (cap_lo & 0b0100_0000) != 0;
+            caps.pmf_required = (cap_lo & 0b1000_0000) != 0;
+            // The high byte carries PTKSA / GTKSA replay-counter
+            // counts and SPP-A-MSDU bits; nothing we surface.
+            let _ = cap_hi;
+        }
+    }
+    // FT: any FT-* AKM in RSN.KeyMgmt → caps.ft. extract_key_mgmt
+    // already lowercases.
+    let mgmt = extract_key_mgmt(rsn);
+    if mgmt.iter().any(|s| s.starts_with("ft-")) {
+        caps.ft = true;
+    }
+    // Fallback PMF detection from the RSN dict's `MgmtGroup`
+    // field — wpa_supplicant publishes a non-empty group cipher
+    // name (e.g. "ccmp", "bip-cmac-128") iff PMF is supported.
+    // Useful when the IEs blob isn't available (very rare on
+    // current wpa_supplicant, but cheap belt-and-braces).
+    if !caps.pmf_capable {
+        if let Some(v) = rsn.get("MgmtGroup") {
+            if let Ok(cloned) = v.try_clone() {
+                if let Ok(s) = String::try_from(cloned) {
+                    if !s.is_empty() {
+                        caps.pmf_capable = true;
+                    }
+                }
+            }
+        }
+    }
+    caps
+}
+
+/// Walk the RSN element body to the (optional) two-byte
+/// Capabilities field. Returns `(low, high)` if present, `None`
+/// when the AP omits it (legacy WPA2-only deployments often do).
+fn rsn_capability_bytes(rsn: &[u8]) -> Option<(u8, u8)> {
+    // Layout per 802.11-2020 9.4.2.24:
+    //   2 bytes Version
+    //   4 bytes Group Data Cipher Suite
+    //   2 bytes Pairwise Cipher Suite Count (n)
+    //   4*n bytes Pairwise Cipher Suite List
+    //   2 bytes AKM Suite Count (m)
+    //   4*m bytes AKM Suite List
+    //   2 bytes RSN Capabilities  ← what we want
+    if rsn.len() < 8 {
+        return None;
+    }
+    let mut idx = 6; // skip Version + Group cipher
+    if rsn.len() < idx + 2 {
+        return None;
+    }
+    let pairwise_count = u16::from_le_bytes([rsn[idx], rsn[idx + 1]]) as usize;
+    idx += 2 + 4 * pairwise_count;
+    if rsn.len() < idx + 2 {
+        return None;
+    }
+    let akm_count = u16::from_le_bytes([rsn[idx], rsn[idx + 1]]) as usize;
+    idx += 2 + 4 * akm_count;
+    if rsn.len() < idx + 2 {
+        return None;
+    }
+    Some((rsn[idx], rsn[idx + 1]))
 }
 
 /// Convert wpa_supplicant's `WPA` and `RSN` a{sv} dicts into the
@@ -1016,8 +1337,8 @@ fn spawn_state_watcher(
     })
 }
 
-/// Read the interface's current State (and for `completed`,
-/// `CurrentBSS` via [`resolve_completed`]) and broadcast the
+/// Read the interface's current State (and the supporting
+/// properties for `completed` / `disconnected`) and broadcast the
 /// resulting [`SupplicantEvent::State`]. Shared by the signal path
 /// and the reconciliation tick in [`spawn_state_watcher`].
 async fn evaluate_and_emit(
@@ -1026,21 +1347,45 @@ async fn evaluate_and_emit(
     ifindex: u32,
     event_tx: &broadcast::Sender<SupplicantEvent>,
 ) {
+    if let Some(state) = resolve_state(connection, iface).await {
+        let _ = event_tx.send(SupplicantEvent::State { ifindex, state });
+    }
+}
+
+/// Read `State` from the supplicant and, when needed, the
+/// supporting properties (`CurrentBSS` for `completed`,
+/// `DisconnectReason` for `disconnected`) to build a fully-populated
+/// [`super::SupplicantState`]. Returns `None` when the read itself
+/// fails or when `State` is a value the pure translator can't
+/// classify yet (e.g. a completed→associating flicker where
+/// `CurrentBSS == "/"`).
+async fn resolve_state(
+    connection: &Connection,
+    iface: &WpaInterfaceProxy<'_>,
+) -> Option<super::SupplicantState> {
     let state_str = match iface.state().await {
         Ok(s) => s,
         Err(e) => {
-            tracing::debug!(ifindex, error = %e, "wpa_supplicant: State read failed");
-            return;
+            tracing::debug!(error = %e, "wpa_supplicant: State read failed");
+            return None;
         }
     };
-    let state_opt = if state_str == "completed" {
-        resolve_completed(connection, iface).await
-    } else {
-        translate_wpa_state(&state_str)
-    };
-    if let Some(state) = state_opt {
-        let _ = event_tx.send(SupplicantEvent::State { ifindex, state });
+    if state_str == "completed" {
+        return resolve_completed(connection, iface).await;
     }
+    if state_str == "disconnected" {
+        // Read `DisconnectReason` so the D-Bus `StateChanged`
+        // payload carries the 802.11 reason code rather than a
+        // stock `Unspecified` (DD-003 §9.6). Property read errors
+        // fall through to `Unspecified` — losing fidelity on an
+        // already-degenerate path is better than dropping the
+        // Disconnected event entirely.
+        let code = iface.disconnect_reason().await.unwrap_or(0);
+        return Some(super::SupplicantState::Disconnected {
+            reason: translate_disconnect_reason(code),
+        });
+    }
+    translate_wpa_state(&state_str)
 }
 
 // ---- error helpers -------------------------------------------------------
@@ -1068,6 +1413,20 @@ fn signal_i32(dict: &HashMap<String, OwnedValue>, key: &str) -> Option<i32> {
     }
     if let Ok(n) = u16::try_from(v) {
         return Some(n as i32);
+    }
+    None
+}
+
+/// Decode `BSS.Frequency` regardless of whether the supplicant
+/// publishes it as `q` (uint16, current behaviour) or `u` (uint32,
+/// the shape needed once 6 GHz channels exceed 65535 MHz). Both
+/// widen cleanly to `u32`. K7.
+fn bss_frequency_mhz(value: &OwnedValue) -> Option<u32> {
+    if let Ok(n) = u32::try_from(value) {
+        return Some(n);
+    }
+    if let Ok(n) = u16::try_from(value) {
+        return Some(n as u32);
     }
     None
 }
@@ -1148,11 +1507,9 @@ fn is_network_unknown(e: &zbus::Error) -> bool {
 /// Translate wpa_supplicant's `State` property string into a
 /// [`super::SupplicantState`] shape per DD-003 §9.5.
 ///
-/// Every state except `completed` maps cleanly to a single variant
-/// here. `completed` carries BSSID / SSID / frequency fields that
-/// can only be populated by reading `CurrentBSS`, so it returns
-/// `None` from the pure translator — see [`resolve_completed`] for
-/// the IO-bound path the watcher uses.
+/// Pure translator for the states that don't need an extra property
+/// read. `completed` needs `CurrentBSS`; `disconnected` needs
+/// `DisconnectReason`. Both are resolved by [`resolve_state`].
 pub fn translate_wpa_state(state_str: &str) -> Option<super::SupplicantState> {
     use super::{DisconnectHint, SupplicantState};
     match state_str {
@@ -1161,14 +1518,11 @@ pub fn translate_wpa_state(state_str: &str) -> Option<super::SupplicantState> {
         }),
         "scanning" => Some(SupplicantState::Scanning),
         "authenticating" => Some(SupplicantState::Authenticating),
-        "associating" | "associated" => Some(SupplicantState::Associating),
+        "associating" => Some(SupplicantState::Associating),
+        "associated" => Some(SupplicantState::Associated),
         "4way_handshake" | "group_handshake" => Some(SupplicantState::FourWayHandshake),
-        "disconnected" => Some(SupplicantState::Disconnected {
-            reason: DisconnectHint::Unspecified,
-        }),
-        // `completed` is resolved by `resolve_completed` — we
-        // can't build the `Connected` variant without a D-Bus read
-        // of `CurrentBSS`.
+        // `completed` and `disconnected` are resolved by
+        // `resolve_state` with a supporting property read.
         _ => None,
     }
 }
@@ -1207,7 +1561,7 @@ async fn resolve_completed(
         bssid_bytes[4],
         bssid_bytes[5],
     ]);
-    let frequency = bss.frequency().await.ok()? as u32;
+    let frequency = bss_frequency_mhz(&bss.frequency().await.ok()?)?;
     Some(SupplicantState::Connected {
         bssid,
         ssid,
@@ -1230,23 +1584,20 @@ pub fn translate_disconnect_reason(code: i32) -> super::DisconnectHint {
         // station voluntarily leaving (802.11 reason 3).
         -3 | 3 => DisconnectHint::LocalRequest,
         // AP-initiated deauth with "unspecified reason" — AP still
-        // reachable but no longer willing to talk. Treated like a
-        // plain disconnect with hope of reassoc.
-        1 => DisconnectHint::Unspecified,
-        // Previous authentication no longer valid (802.11 reason 2)
-        // and 802.1X EAP failure (reason 23): both indicate the
-        // credentials the supplicant presented are stale / wrong.
-        2 | 13 | 23 => DisconnectHint::AuthFailure,
-        // 802.1X-wrapped handshake timeout.
+        // reachable but no longer willing to talk.
+        1 => DisconnectHint::ApInitiated,
+        // "Previous authentication no longer valid" (reason 2) and
+        // "Invalid IE" (reason 13) — the pre-4way auth exchange
+        // itself went sideways. Distinct from the 4-way handshake
+        // timeout path below.
+        2 | 13 => DisconnectHint::AuthFailure,
+        4 => DisconnectHint::Inactivity,
+        6 | 7 => DisconnectHint::ProtocolError,
         15 => DisconnectHint::HandshakeTimeout,
-        // Association / driver timeout: reason 17 is
-        // "association timeout from AP".
         17 => DisconnectHint::AssociationTimeout,
-        // Inactivity deauth (reason 4) and class-2-frame
-        // protocol glitches (6, 7): AP still reachable; no
-        // credential change needed; typically retriable.
-        4 | 6 | 7 => DisconnectHint::Unspecified,
-        // 0 / unmapped positive codes → unspecified.
+        // 802.1X EAP failure has its own bucket so Enterprise auth
+        // failures don't look like stale-key deauths.
+        23 => DisconnectHint::EapFailure,
         _ => DisconnectHint::Unspecified,
     }
 }
@@ -1635,6 +1986,103 @@ mod tests {
         assert!(extract_key_mgmt(&bogus).is_empty());
     }
 
+    // ---- K2 BssCapabilities parser --------------------------------------
+
+    /// Build a single-IE blob: id, length, payload.
+    fn ie(id: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(2 + body.len());
+        v.push(id);
+        v.push(body.len() as u8);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// Glue several IEs together.
+    fn ies(parts: &[Vec<u8>]) -> Vec<u8> {
+        parts.iter().flatten().copied().collect()
+    }
+
+    #[test]
+    fn caps_parser_detects_ht_vht_he_eht_wps() {
+        let ht = ie(45, &[0; 26]);
+        let vht = ie(191, &[0; 12]);
+        let he = ie(255, &[35]); // ext-tag 35 = HE
+        let eht = ie(255, &[108]); // ext-tag 108 = EHT
+        let wps = ie(221, &[0x00, 0x50, 0xF2, 0x04]);
+        let blob = ies(&[ht, vht, he, eht, wps]);
+        let caps = parse_bss_capabilities(&blob, &HashMap::new());
+        assert!(caps.ht);
+        assert!(caps.vht);
+        assert!(caps.he);
+        assert!(caps.eht);
+        assert!(caps.wps);
+    }
+
+    #[test]
+    fn caps_parser_skips_truncated_tail_without_panic() {
+        // Last IE claims length 5 but only 2 bytes follow — must
+        // bail cleanly.
+        let mut blob = ie(45, &[0; 26]);
+        blob.extend_from_slice(&[191, 5, 0, 0]);
+        let caps = parse_bss_capabilities(&blob, &HashMap::new());
+        assert!(caps.ht);
+        assert!(!caps.vht); // truncated, ignored
+    }
+
+    #[test]
+    fn rsn_parser_extracts_pmf_required_bit() {
+        // RSN element body for WPA2-PSK with PMF required + capable:
+        //   version 0x0001, group ccmp, pairwise count 1 + ccmp,
+        //   akm count 1 + psk, capabilities 0xC0 0x00.
+        let rsn_body = vec![
+            0x01, 0x00, // version
+            0x00, 0x0F, 0xAC, 0x04, // group cipher CCMP
+            0x01, 0x00, // pairwise count 1
+            0x00, 0x0F, 0xAC, 0x04, // pairwise CCMP
+            0x01, 0x00, // akm count 1
+            0x00, 0x0F, 0xAC, 0x02, // PSK
+            0xC0, 0x00, // RSN caps: MFPR + MFPC
+        ];
+        let blob = ie(48, &rsn_body);
+        let caps = parse_bss_capabilities(&blob, &HashMap::new());
+        assert!(caps.pmf_required);
+        assert!(caps.pmf_capable);
+    }
+
+    #[test]
+    fn rsn_parser_handles_missing_capabilities_byte() {
+        // Legacy RSN element ending right after AKM list — no
+        // capabilities. Should stay default (false).
+        let rsn_body = vec![
+            0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04, 0x01, 0x00,
+            0x00, 0x0F, 0xAC, 0x02,
+        ];
+        let blob = ie(48, &rsn_body);
+        let caps = parse_bss_capabilities(&blob, &HashMap::new());
+        assert!(!caps.pmf_required);
+        assert!(!caps.pmf_capable);
+    }
+
+    #[test]
+    fn caps_parser_picks_up_ft_from_rsn_keymgmt() {
+        let rsn = keymgmt_dict(&["ft-psk", "wpa-psk"]);
+        let caps = parse_bss_capabilities(&[], &rsn);
+        assert!(caps.ft);
+    }
+
+    #[test]
+    fn caps_parser_falls_back_to_mgmtgroup_for_pmf_capable() {
+        // No RSN IE in the blob; rely on the `MgmtGroup` fallback.
+        let mut rsn = HashMap::new();
+        rsn.insert(
+            "MgmtGroup".to_owned(),
+            Value::from("bip-cmac-128").try_into().unwrap(),
+        );
+        let caps = parse_bss_capabilities(&[], &rsn);
+        assert!(caps.pmf_capable);
+        assert!(!caps.pmf_required);
+    }
+
     #[test]
     fn state_table_covers_dd003_section_9_5() {
         use super::super::SupplicantState;
@@ -1650,11 +2098,12 @@ mod tests {
             translate_wpa_state("associating"),
             Some(SupplicantState::Associating)
         ));
-        // `associated` rolls up into Associating — the BSS is
-        // chosen but the 4-way hasn't begun.
+        // K1: `associated` is its own variant — the BSS is chosen
+        // but the 4-way hasn't begun. Backend folds both into
+        // `WifiState::Connecting` per DD-003 §9.5.
         assert!(matches!(
             translate_wpa_state("associated"),
-            Some(SupplicantState::Associating)
+            Some(SupplicantState::Associated)
         ));
         assert!(matches!(
             translate_wpa_state("authenticating"),
@@ -1668,12 +2117,10 @@ mod tests {
             translate_wpa_state("group_handshake"),
             Some(SupplicantState::FourWayHandshake)
         ));
-        assert!(matches!(
-            translate_wpa_state("disconnected"),
-            Some(SupplicantState::Disconnected { .. })
-        ));
-        // `completed` resolves via `resolve_completed` (IO-bound);
-        // the pure translator returns None.
+        // `completed` and `disconnected` both resolve via a
+        // property read (IO-bound); the pure translator returns
+        // None for them.
+        assert!(translate_wpa_state("disconnected").is_none());
         assert!(translate_wpa_state("completed").is_none());
         assert!(translate_wpa_state("unknown_future").is_none());
     }
@@ -1681,37 +2128,30 @@ mod tests {
     #[test]
     fn disconnect_reasons_cover_dd003_section_9_6() {
         use super::super::DisconnectHint;
-        // Locally-initiated
         assert_eq!(
             translate_disconnect_reason(-3),
             DisconnectHint::LocalRequest
         );
-        // STA leaving (reason 3)
         assert_eq!(translate_disconnect_reason(3), DisconnectHint::LocalRequest);
-        // AP-initiated unspecified deauth
-        assert_eq!(translate_disconnect_reason(1), DisconnectHint::Unspecified);
-        // Auth-related
+        assert_eq!(translate_disconnect_reason(1), DisconnectHint::ApInitiated);
         assert_eq!(translate_disconnect_reason(2), DisconnectHint::AuthFailure);
-        // 802.1X EAP failure
-        assert_eq!(translate_disconnect_reason(23), DisconnectHint::AuthFailure);
-        // 4-way handshake timeout
+        assert_eq!(translate_disconnect_reason(13), DisconnectHint::AuthFailure);
+        assert_eq!(translate_disconnect_reason(4), DisconnectHint::Inactivity);
+        assert_eq!(translate_disconnect_reason(6), DisconnectHint::ProtocolError);
+        assert_eq!(translate_disconnect_reason(7), DisconnectHint::ProtocolError);
         assert_eq!(
             translate_disconnect_reason(15),
             DisconnectHint::HandshakeTimeout
         );
-        // Association timeout
         assert_eq!(
             translate_disconnect_reason(17),
             DisconnectHint::AssociationTimeout
         );
-        // Inactivity deauth — retriable, coarsely unspecified
-        assert_eq!(translate_disconnect_reason(4), DisconnectHint::Unspecified);
-        // Protocol glitches
-        assert_eq!(translate_disconnect_reason(6), DisconnectHint::Unspecified);
-        // Unknown codes
+        assert_eq!(translate_disconnect_reason(23), DisconnectHint::EapFailure);
         assert_eq!(
             translate_disconnect_reason(999),
             DisconnectHint::Unspecified
         );
+        assert_eq!(translate_disconnect_reason(0), DisconnectHint::Unspecified);
     }
 }

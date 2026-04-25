@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexus_core::{DisconnectReason, InterfaceKind, NexusEvent, SecurityMode, WifiState};
-use nexus_profile_store::{ProfileStore, WifiProfile};
+use nexus_interface_monitor::MonitorCommand;
+use nexus_profile_store::{ProfileRef, ProfileStore, SecurityConfig, WifiProfile};
 use tokio::sync::{RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 
@@ -14,7 +15,7 @@ use crate::error::{Result, WifiError};
 use crate::lifecycle::{WifiInterfaceEntry, scans_suspended, state_label};
 use crate::metrics as m;
 use crate::power::PowerState;
-use crate::profile::to_network_config;
+use crate::profile::{profile_key, to_network_config};
 use crate::retry::RetryBook;
 use crate::rfkill::{RfkillState, RfkillWriter};
 use crate::roam::{RoamPolicy, pick_roam_target};
@@ -30,6 +31,11 @@ pub struct WifiConfig {
     pub roam_policy: RoamPolicy,
     pub signal_poll_interval: Duration,
     pub disconnect_cool_down: Duration,
+    /// DD-003 §12.4: how long an interface is allowed to sit in
+    /// `Connecting` / `Authenticating` / `Handshaking` before the
+    /// backend declares a driver wedge and bounces `IFF_UP`.
+    /// Defaults to 30 s; tests shrink it to keep the loop fast.
+    pub driver_wedge_threshold: Duration,
 }
 
 /// Interval of the backend's `select!`-loop heartbeat. Tight enough
@@ -38,6 +44,27 @@ pub struct WifiConfig {
 /// enough that the idle-daemon wakeup rate is negligible.
 const HEARTBEAT: Duration = Duration::from_secs(1);
 
+/// DD-003 §12.4 threshold — how long an interface is allowed to
+/// sit in a pre-connected state (Connecting / Authenticating /
+/// Handshaking) before the backend declares a driver wedge and
+/// toggles the interface admin state.
+const DRIVER_WEDGE_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// DD-003 §12.4 — the short down-window between `SetAdminUp(false)`
+/// and `SetAdminUp(true)` that unsticks most brcmfmac / ath10k
+/// firmwares.
+const DRIVER_WEDGE_DOWN_WINDOW: Duration = Duration::from_secs(2);
+
+/// DD-003 §7.3 — minimum spacing between Nexus-driven roam-
+/// evaluation scans. Keeps a persistently-weak RSSI from blasting
+/// a directed scan on every heartbeat.
+const ROAM_EVAL_MIN_SPACING: Duration = Duration::from_secs(30);
+
+/// Common 2.4 GHz channels (1, 6, 11) the directed roam scan
+/// always includes. Covers the long tail of APs that only operate
+/// on the non-overlapping set.
+const ROAM_EVAL_2GHZ_DEFAULTS: &[u32] = &[2412, 2437, 2462];
+
 impl Default for WifiConfig {
     fn default() -> Self {
         Self {
@@ -45,6 +72,7 @@ impl Default for WifiConfig {
             roam_policy: RoamPolicy::default(),
             signal_poll_interval: Duration::from_secs(5),
             disconnect_cool_down: Duration::from_secs(2),
+            driver_wedge_threshold: DRIVER_WEDGE_THRESHOLD,
         }
     }
 }
@@ -81,6 +109,23 @@ pub struct WifiBackend {
     /// per `WifiConfig::signal_poll_interval`, not every tick.
     last_signal_poll: HashMap<u32, Instant>,
 
+    /// Deadline at which each `Disconnected`-but-not-permanent
+    /// interface transitions to `Idle` and re-scans (DD-003 §3.2
+    /// / §6.4). Entries are inserted on the Disconnected transition
+    /// and removed either on expiry or when the interface moves
+    /// to another state out of band.
+    disconnect_cooldowns: HashMap<u32, Instant>,
+
+    /// Timestamp of the most recent `Connecting` entry per
+    /// interface. Consumed on `Connected` to record
+    /// `nexus_wifi_connect_duration_seconds` (DD-003 §12.5).
+    connect_started_at: HashMap<u32, Instant>,
+
+    /// Last observed [`PowerState`]. Used to detect a Sleep →
+    /// Active / Background edge and run the wake-from-sleep
+    /// recovery (DD-003 §13.3).
+    last_power_state: PowerState,
+
     /// `/dev/rfkill` edges from the watcher task (see
     /// [`crate::rfkill`]). `None` when rfkill couldn't be opened —
     /// tests bypass it and the daemon logs a warning.
@@ -89,6 +134,45 @@ pub struct WifiBackend {
     /// `None` mirrors the read-side; the `SetPowered` command
     /// returns `Unsupported` when the writer isn't wired.
     rfkill_writer: Option<RfkillWriter>,
+
+    /// Sender for [`MonitorCommand`] — `None` when the Interface
+    /// Monitor isn't wired into this backend (tests, or a deployment
+    /// without it). The driver-wedge recovery (DD-003 §12.4) soft-
+    /// fails to a log line when this is absent.
+    monitor_commands: Option<tokio::sync::mpsc::Sender<MonitorCommand>>,
+
+    /// Timestamp at which each interface entered its current
+    /// pre-connected state (`Connecting` / `Authenticating` /
+    /// `Handshaking`). Cleared on transition to `Connected` /
+    /// `Disconnected`. Drives the driver-wedge detector.
+    dwell_since: HashMap<u32, Instant>,
+
+    /// Last time the backend fired a Nexus-mode roam-evaluation
+    /// scan for each interface. Used to rate-limit the trigger in
+    /// [`on_heartbeat`] so a persistently-low RSSI doesn't blast
+    /// a directed scan every tick.
+    last_roam_scan: HashMap<u32, Instant>,
+
+    /// In-flight roam: the target BSSID the backend asked the
+    /// supplicant to roam to. Consumed on the next
+    /// `SupplicantState::Connected` (success = bssid matches, fail
+    /// otherwise) or on a terminal `Disconnected` (always fail).
+    roam_in_flight: HashMap<u32, nexus_core::MacAddr>,
+
+    /// In-flight scan: start timestamp + classified type. Consumed
+    /// on the next `SupplicantEvent::ScanComplete` to emit
+    /// `nexus_wifi_scans_total{outcome}` and
+    /// `nexus_wifi_scan_duration_seconds`. K5 / DD-003 §12.5.
+    scan_in_flight: HashMap<u32, ScanInFlight>,
+}
+
+/// Per-interface scan-tracking record. Cheap (Instant + a label
+/// pointer); cleared on every `ScanComplete`.
+#[derive(Debug, Clone, Copy)]
+struct ScanInFlight {
+    started: Instant,
+    /// `m::scan_type::*` label.
+    scan_type: &'static str,
 }
 
 impl WifiBackend {
@@ -121,9 +205,28 @@ impl WifiBackend {
             config,
             supplicant_up: true,
             last_signal_poll: HashMap::new(),
+            disconnect_cooldowns: HashMap::new(),
+            connect_started_at: HashMap::new(),
+            last_power_state: PowerState::default(),
             rfkill_rx: None,
             rfkill_writer: None,
+            monitor_commands: None,
+            dwell_since: HashMap::new(),
+            last_roam_scan: HashMap::new(),
+            roam_in_flight: HashMap::new(),
+            scan_in_flight: HashMap::new(),
         }
+    }
+
+    /// Wire the Interface Monitor's [`MonitorCommand`] sender into
+    /// the backend. Used by the daemon to give driver-wedge recovery
+    /// a path back to the monitor's rtnetlink socket (DD-003 §12.4).
+    pub fn with_monitor_commands(
+        mut self,
+        tx: tokio::sync::mpsc::Sender<MonitorCommand>,
+    ) -> Self {
+        self.monitor_commands = Some(tx);
+        self
     }
 
     /// Attach the `/dev/rfkill` plumbing. Called from
@@ -223,7 +326,16 @@ impl WifiBackend {
                 }
                 _ = &mut heartbeat => {
                     heartbeat.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT);
+                    let now_power = *self.power.read().await;
+                    if self.last_power_state == PowerState::Sleep
+                        && now_power != PowerState::Sleep
+                    {
+                        self.on_wake().await;
+                    }
+                    self.last_power_state = now_power;
                     self.on_heartbeat().await;
+                    self.process_driver_wedges().await;
+                    self.process_disconnect_cooldowns().await;
                 },
             }
             self.refresh_metrics();
@@ -259,14 +371,22 @@ impl WifiBackend {
     }
 
     /// Tick handler: for each connected interface, if the signal
-    /// poll is due, call the supplicant and emit a
-    /// [`NexusEvent::WifiSignalPoll`]. The dbus layer consumes
-    /// those to refresh the `SignalDbm` / `Frequency` properties.
+    /// poll is due, call the supplicant, update the cached RSSI on
+    /// the `Connected` state, and emit a
+    /// [`NexusEvent::WifiSignalPoll`]. The in-state RSSI is what
+    /// `evaluate_roam` reads for the signal-degradation trigger
+    /// (DD-003 §7.3) — without this refresh the variant's
+    /// `signal_dbm` stays at its connect-time sentinel and the
+    /// Nexus-mode roam path never fires.
     async fn on_heartbeat(&mut self) {
         let now = Instant::now();
-        let interval = self.config.signal_poll_interval;
-        // Collect first; mutating self across the await would
-        // require a split borrow.
+        let power = *self.power.read().await;
+        // DD-003 §13.1: signal polling follows the power state.
+        // `Active` uses the configured interval (default 5 s);
+        // `Background` triples it (~15 s); `Sleep` disables polling.
+        let Some(interval) = signal_poll_interval(self.config.signal_poll_interval, power) else {
+            return;
+        };
         let due: Vec<u32> = self
             .interfaces
             .iter()
@@ -286,6 +406,16 @@ impl WifiBackend {
             match self.supplicant.signal_info(ifindex).await {
                 Ok(info) => {
                     self.last_signal_poll.insert(ifindex, now);
+                    let ifname = self.ifname_of(ifindex);
+                    if let Some(entry) = self.interfaces.get_mut(&ifindex) {
+                        if let WifiState::Connected {
+                            ref mut signal_dbm, ..
+                        } = entry.state
+                        {
+                            *signal_dbm = info.rssi_dbm;
+                        }
+                    }
+                    m::set_signal_dbm(&ifname, info.rssi_dbm);
                     let _ = self.event_tx.send(NexusEvent::WifiSignalPoll {
                         ifindex,
                         rssi: info.rssi_dbm,
@@ -294,6 +424,245 @@ impl WifiBackend {
                 }
                 Err(e) => {
                     tracing::debug!(ifindex, error = %e, "signal_info failed");
+                }
+            }
+        }
+
+        // DD-003 §5.1 (trigger 4) / §7.3: when RSSI has dropped
+        // below `roam_trigger_dbm` and Nexus is the roam authority,
+        // fire a directed scan so the next ScanDone feeds
+        // `evaluate_roam`. Rate-limited to `ROAM_EVAL_MIN_SPACING`
+        // so a persistently-low signal doesn't saturate the radio.
+        self.maybe_trigger_roam_scans(now).await;
+    }
+
+    /// Kick a directed scan on every `Connected` interface whose
+    /// RSSI has dropped past the roam trigger, subject to the
+    /// rate-limit window. No-op when `roam_mode != Nexus` — the
+    /// supplicant owns roam decisions in the other modes.
+    async fn maybe_trigger_roam_scans(&mut self, now: Instant) {
+        if self.config.roam_mode != RoamMode::Nexus {
+            return;
+        }
+        let trigger = self.config.roam_policy.trigger_dbm;
+        // Gather candidates (ifindex, ssid, freqs) up front so we
+        // can release the immutable borrows before calling
+        // `request_scan` (which takes `&mut self`).
+        let mut candidates: Vec<(u32, nexus_core::Ssid, Vec<u32>)> = Vec::new();
+        for (ifindex, entry) in &self.interfaces {
+            let WifiState::Connected {
+                ref ssid,
+                signal_dbm,
+                frequency,
+                ..
+            } = entry.state
+            else {
+                continue;
+            };
+            if signal_dbm > trigger {
+                continue;
+            }
+            if let Some(last) = self.last_roam_scan.get(ifindex) {
+                if now.duration_since(*last) < ROAM_EVAL_MIN_SPACING {
+                    continue;
+                }
+            }
+            let freqs = self.likely_frequencies(*ifindex, ssid, frequency);
+            candidates.push((*ifindex, ssid.clone(), freqs));
+        }
+        for (ifindex, ssid, frequencies) in candidates {
+            self.last_roam_scan.insert(ifindex, now);
+            let params = ScanParams {
+                ssids: vec![ssid],
+                frequencies,
+                active: true,
+                allow_roam: true,
+            };
+            if let Err(e) = self.request_scan(ifindex, params).await {
+                tracing::debug!(ifindex, error = %e, "roam-evaluation scan failed");
+            }
+        }
+    }
+
+    /// DD-003 §7.3 `get_likely_frequencies`: union of (a) every
+    /// frequency on which any BSS with `ssid` has been seen in the
+    /// recent scan cache, (b) the current association's frequency,
+    /// and (c) the common 2.4 GHz channels 1/6/11. A targeted scan
+    /// of this set completes in ~1 s on typical chipsets versus
+    /// 3–5 s for a full-spectrum scan — which matters a lot for
+    /// roaming latency.
+    fn likely_frequencies(
+        &self,
+        ifindex: u32,
+        ssid: &nexus_core::Ssid,
+        current_frequency: u32,
+    ) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .cache
+            .list(ifindex)
+            .into_iter()
+            .filter(|b| &b.ssid == ssid)
+            .map(|b| b.frequency)
+            .collect();
+        if current_frequency != 0 {
+            out.push(current_frequency);
+        }
+        out.extend_from_slice(ROAM_EVAL_2GHZ_DEFAULTS);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// DD-003 §12.4 driver-wedge detector. Walks the dwell map; any
+    /// interface that has been pre-connected for longer than
+    /// `DRIVER_WEDGE_THRESHOLD` is probably stuck in firmware.
+    /// Recovery: detach the supplicant, bounce `IFF_UP` via the
+    /// Interface Monitor's rtnetlink socket, re-attach, and flag
+    /// the interface `Disconnected { DriverWedge }` so the cooldown
+    /// gate rolls it back to `Idle` and the normal retry path
+    /// takes over.
+    async fn process_driver_wedges(&mut self) {
+        let now = Instant::now();
+        let threshold = self.config.driver_wedge_threshold;
+        let wedged: Vec<u32> = self
+            .dwell_since
+            .iter()
+            .filter_map(|(i, since)| (now.duration_since(*since) >= threshold).then_some(*i))
+            .collect();
+        for ifindex in wedged {
+            self.recover_wedged_interface(ifindex).await;
+        }
+    }
+
+    async fn recover_wedged_interface(&mut self, ifindex: u32) {
+        let ifname = self.ifname_of(ifindex);
+        tracing::warn!(
+            ifindex,
+            ifname = %ifname,
+            "wifi: pre-connected state exceeded driver-wedge threshold; recovering"
+        );
+        m::record_driver_wedge_recovery(&ifname);
+
+        // Clear bookkeeping first so state updates from the detach
+        // don't tangle with a second wedge trip.
+        self.dwell_since.remove(&ifindex);
+        self.connect_started_at.remove(&ifindex);
+        self.active_handle.remove(&ifindex);
+
+        // 1. Detach the supplicant so it doesn't fight the flap.
+        if self.supplicant_up {
+            let _ = self.supplicant.detach(ifindex).await;
+        }
+
+        // 2. Bounce IFF_UP via the Interface Monitor. If the monitor
+        // sender isn't wired (tests, config without the monitor),
+        // skip straight to re-attach — the recovery degrades but
+        // the Disconnected transition below still unblocks the
+        // normal retry flow.
+        if let Some(cmd_tx) = self.monitor_commands.clone() {
+            if let Err(e) = cmd_tx
+                .send(MonitorCommand::SetAdminUp {
+                    ifindex,
+                    up: false,
+                    reply: None,
+                })
+                .await
+            {
+                tracing::warn!(ifindex, error = %e, "SetAdminUp(false) send failed");
+            }
+            tokio::time::sleep(DRIVER_WEDGE_DOWN_WINDOW).await;
+            if let Err(e) = cmd_tx
+                .send(MonitorCommand::SetAdminUp {
+                    ifindex,
+                    up: true,
+                    reply: None,
+                })
+                .await
+            {
+                tracing::warn!(ifindex, error = %e, "SetAdminUp(true) send failed");
+            }
+        } else {
+            tracing::debug!(
+                ifindex,
+                "monitor command channel not wired; skipping IFF_UP flap"
+            );
+        }
+
+        // 3. Re-attach the supplicant so it can discover the fresh
+        // interface state.
+        if self.supplicant_up {
+            if let Err(e) = self.supplicant.attach(ifindex, &ifname).await {
+                tracing::warn!(ifindex, error = %e, "post-wedge re-attach failed");
+            }
+        }
+
+        // 4. Mark the interface Disconnected { DriverWedge } and
+        // arm the cooldown — the normal Idle → scan path will pick
+        // it back up.
+        if let Some(entry) = self.interfaces.get_mut(&ifindex) {
+            entry.state = WifiState::Disconnected {
+                reason: DisconnectReason::DriverWedge,
+            };
+        }
+        self.emit_state(ifindex);
+        self.disconnect_cooldowns
+            .insert(ifindex, Instant::now() + self.config.disconnect_cool_down);
+    }
+
+    /// Handle the Sleep → Active / Background edge (DD-003 §13.3).
+    /// Force every scan scheduler to fire immediately, then probe
+    /// each `Connected` interface's signal; if the probe errors the
+    /// link didn't survive suspend, so emit
+    /// `Disconnected { PostSleepRecovery }` and let the normal
+    /// reconnect path take over. `PostSleepRecovery` is a transient
+    /// reason so the cooldown gate rolls the interface back into
+    /// `Idle` on the next tick.
+    async fn on_wake(&mut self) {
+        let now = Instant::now();
+        for sched in self.schedulers.values_mut() {
+            sched.fire_now(now);
+        }
+        let connected: Vec<u32> = self
+            .interfaces
+            .iter()
+            .filter_map(|(ifindex, e)| {
+                matches!(e.state, WifiState::Connected { .. }).then_some(*ifindex)
+            })
+            .collect();
+        for ifindex in connected {
+            match self.supplicant.signal_info(ifindex).await {
+                Ok(info) => {
+                    let ifname = self.ifname_of(ifindex);
+                    if let Some(entry) = self.interfaces.get_mut(&ifindex) {
+                        if let WifiState::Connected {
+                            ref mut signal_dbm, ..
+                        } = entry.state
+                        {
+                            *signal_dbm = info.rssi_dbm;
+                        }
+                    }
+                    m::set_signal_dbm(&ifname, info.rssi_dbm);
+                }
+                Err(e) => {
+                    tracing::info!(
+                        ifindex,
+                        error = %e,
+                        "post-wake signal probe failed; marking link lost"
+                    );
+                    if let Some(entry) = self.interfaces.get_mut(&ifindex) {
+                        entry.state = WifiState::Disconnected {
+                            reason: DisconnectReason::PostSleepRecovery,
+                        };
+                    }
+                    self.emit_state(ifindex);
+                    self.emit_link_lost(ifindex, m::link_lost_reason::CARRIER_DOWN);
+                    self.active_handle.remove(&ifindex);
+                    self.connect_started_at.remove(&ifindex);
+                    // PostSleepRecovery is transient; arm the cooldown
+                    // so the next tick moves the interface to Idle
+                    // and the scheduler (already fired above) runs.
+                    self.disconnect_cooldowns
+                        .insert(ifindex, now + self.config.disconnect_cool_down);
                 }
             }
         }
@@ -312,7 +681,9 @@ impl WifiBackend {
             } => {
                 let result = match self.ifindex_for(&ifname) {
                     Some(ifindex) => self.request_scan(ifindex, params).await,
-                    None => Err(WifiError::NotAttached { ifindex: 0 }),
+                    None => Err(WifiError::UnknownInterface {
+                        ifname: ifname.clone(),
+                    }),
                 };
                 let _ = reply.send(result);
             }
@@ -343,7 +714,34 @@ impl WifiBackend {
             crate::WifiCommand::SetPowered { ifname, on, reply } => {
                 let _ = reply.send(self.operator_set_powered(&ifname, on).await);
             }
+            crate::WifiCommand::ProvideCredential {
+                ifname,
+                network,
+                field,
+                value,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.operator_provide_credential(&ifname, &network, &field, &value)
+                        .await,
+                );
+            }
         }
+    }
+
+    /// Forward a credential reply from the D-Bus layer into the
+    /// supplicant. DD-003 §9.2.
+    async fn operator_provide_credential(
+        &mut self,
+        ifname: &str,
+        network: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<()> {
+        let ifindex = self.require_ifindex(ifname)?;
+        self.supplicant
+            .provide_network_credential(ifindex, network, field, value)
+            .await
     }
 
     /// Toggle soft-rfkill for the named interface. Resolves the
@@ -352,9 +750,7 @@ impl WifiBackend {
     /// the interface isn't registered and `Supplicant` (as a
     /// catch-all for rfkill plumbing errors) on write failure.
     async fn operator_set_powered(&mut self, ifname: &str, on: bool) -> Result<()> {
-        let ifindex = self
-            .ifindex_for(ifname)
-            .ok_or(WifiError::NotAttached { ifindex: 0 })?;
+        let ifindex = self.require_ifindex(ifname)?;
         let wiphy_name = self
             .interfaces
             .get(&ifindex)
@@ -386,9 +782,7 @@ impl WifiBackend {
     /// Does not consult the `retry` book — an explicit operator
     /// action isn't subject to the automatic-selection rate limit.
     async fn operator_connect(&mut self, ifname: &str, profile_id: ulid::Ulid) -> Result<()> {
-        let ifindex = self
-            .ifindex_for(ifname)
-            .ok_or(WifiError::NotAttached { ifindex: 0 })?;
+        let ifindex = self.require_ifindex(ifname)?;
         let profile = self
             .profiles
             .iter()
@@ -425,12 +819,13 @@ impl WifiBackend {
 
         let net = to_network_config(&profile);
         let handle = self.supplicant.connect(ifindex, &net).await?;
+        let now = Instant::now();
         self.active_handle.insert(ifindex, (profile.id, handle));
-        m::record_connect(
-            ifname,
-            security_tag(&profile.network.security),
-            m::connect_outcome::SUCCESS,
-        );
+        self.connect_started_at.insert(ifindex, now);
+        self.dwell_since.insert(ifindex, now);
+        // Success metric is recorded on `SupplicantState::Connected`
+        // (C4). `operator_connect` only dispatches; the handshake
+        // completion — or failure — is what the counter tracks.
         Ok(())
     }
 
@@ -438,9 +833,7 @@ impl WifiBackend {
     /// the association; the in-memory active handle is cleared so a
     /// subsequent auto-select cycle can compete fresh.
     async fn operator_disconnect(&mut self, ifname: &str) -> Result<()> {
-        let ifindex = self
-            .ifindex_for(ifname)
-            .ok_or(WifiError::NotAttached { ifindex: 0 })?;
+        let ifindex = self.require_ifindex(ifname)?;
         self.supplicant.disconnect(ifindex).await?;
         self.active_handle.remove(&ifindex);
         Ok(())
@@ -452,9 +845,7 @@ impl WifiBackend {
     /// config says no, and surfacing that as a plain error is more
     /// useful than us silently no-op'ing here.
     async fn operator_roam(&mut self, ifname: &str, bssid: nexus_core::MacAddr) -> Result<()> {
-        let ifindex = self
-            .ifindex_for(ifname)
-            .ok_or(WifiError::NotAttached { ifindex: 0 })?;
+        let ifindex = self.require_ifindex(ifname)?;
         self.supplicant
             .roam(ifindex, crate::types::RoamTarget::Bss(bssid))
             .await
@@ -470,11 +861,9 @@ impl WifiBackend {
         ifname: &str,
         mode: crate::types::RoamMode,
     ) -> Result<()> {
-        // Validate the ifname so the caller gets `NotAttached`
+        // Validate the ifname so the caller gets `UnknownInterface`
         // rather than a silent config mutation for a bogus iface.
-        let _ifindex = self
-            .ifindex_for(ifname)
-            .ok_or(WifiError::NotAttached { ifindex: 0 })?;
+        let _ifindex = self.require_ifindex(ifname)?;
         self.config.roam_mode = mode;
         Ok(())
     }
@@ -487,6 +876,16 @@ impl WifiBackend {
             .iter()
             .find(|(_, e)| e.info.ifname == ifname)
             .map(|(i, _)| *i)
+    }
+
+    /// `ifindex_for` plus an `UnknownInterface` error on miss. S2:
+    /// every operator-facing path uses this helper instead of the
+    /// `NotAttached { ifindex: 0 }` sentinel that collided with
+    /// real ifindex 0 (`lo`).
+    fn require_ifindex(&self, ifname: &str) -> Result<u32> {
+        self.ifindex_for(ifname).ok_or_else(|| WifiError::UnknownInterface {
+            ifname: ifname.to_owned(),
+        })
     }
 
     // -----------------------------------------------------------------
@@ -504,13 +903,30 @@ impl WifiBackend {
                     InterfaceKind::Wireless { wiphy_name, .. } => Some(wiphy_name.clone()),
                     _ => None,
                 };
-                if self.supplicant_up {
-                    if let Err(e) = self.supplicant.attach(ifindex, &ifname).await {
-                        tracing::warn!(ifname, error = %e, "supplicant attach failed");
+                // Try to attach. The result determines the entry's
+                // initial state — DD-003 §3.1: `Idle` only after a
+                // successful attach. K8: failure puts the interface
+                // in `Disconnected { SupplicantUnavailable }` and
+                // skips the initial scan; the next `DaemonUp`
+                // re-attach attempt will roll it back into Idle.
+                let attach_ok = if self.supplicant_up {
+                    match self.supplicant.attach(ifindex, &ifname).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(ifname, error = %e, "supplicant attach failed");
+                            false
+                        }
                     }
+                } else {
+                    false
+                };
+                let mut entry = WifiInterfaceEntry::new(info);
+                if !attach_ok {
+                    entry.state = WifiState::Disconnected {
+                        reason: DisconnectReason::SupplicantUnavailable,
+                    };
                 }
-                self.interfaces
-                    .insert(ifindex, WifiInterfaceEntry::new(info));
+                self.interfaces.insert(ifindex, entry);
                 self.schedulers
                     .insert(ifindex, ScanScheduler::with_defaults());
                 // Seed the initial Powered state from sysfs: the
@@ -529,8 +945,13 @@ impl WifiBackend {
                         }
                     }
                 }
-                // Kick off an initial scan per DD-003 §5.1.
-                self.request_scan(ifindex, ScanParams::default()).await?;
+                if attach_ok {
+                    // Kick off an initial scan per DD-003 §5.1.
+                    self.request_scan(ifindex, initial_scan_params(&self.profiles))
+                        .await?;
+                } else {
+                    self.emit_state(ifindex);
+                }
             }
             NexusEvent::InterfaceRemoved { ifindex }
                 if self.interfaces.remove(&ifindex).is_some() =>
@@ -539,6 +960,12 @@ impl WifiBackend {
                 self.cache.clear(ifindex);
                 self.active_handle.remove(&ifindex);
                 self.last_signal_poll.remove(&ifindex);
+                self.disconnect_cooldowns.remove(&ifindex);
+                self.connect_started_at.remove(&ifindex);
+                self.dwell_since.remove(&ifindex);
+                self.last_roam_scan.remove(&ifindex);
+                self.roam_in_flight.remove(&ifindex);
+                self.scan_in_flight.remove(&ifindex);
                 if self.supplicant_up {
                     let _ = self.supplicant.detach(ifindex).await;
                 }
@@ -554,6 +981,15 @@ impl WifiBackend {
             } => match self.profile_store.load_wifi().await {
                 Ok(new_profiles) => {
                     tracing::debug!(count = new_profiles.len(), "wifi profile cache reloaded");
+                    // Reconcile the RetryBook with the on-disk flag.
+                    // An operator clearing `credentials_invalid = false`
+                    // in the file (or putting a fresh profile) should
+                    // re-enable auto-select immediately.
+                    for p in &new_profiles {
+                        if !p.network.credentials_invalid && self.retry.credentials_invalid(p.id) {
+                            self.retry.clear_credentials_invalid(p.id);
+                        }
+                    }
                     self.profiles = new_profiles;
                 }
                 Err(e) => {
@@ -574,8 +1010,40 @@ impl WifiBackend {
             SupplicantEvent::State { ifindex, state } => {
                 self.on_supplicant_state(ifindex, state).await?;
             }
-            SupplicantEvent::ScanComplete { ifindex } => {
-                self.on_scan_complete(ifindex).await?;
+            SupplicantEvent::ScanComplete { ifindex, success } => {
+                self.on_scan_complete(ifindex, success).await?;
+            }
+            SupplicantEvent::BssCacheStale { ifindex } => {
+                // S5: refresh the local BSS cache without emitting
+                // a public WifiScanComplete event. Drop a debug
+                // log on read failures (the next driven scan will
+                // re-populate the cache anyway).
+                match self.supplicant.get_scan_results(ifindex).await {
+                    Ok(results) => self.cache.replace(ifindex, results),
+                    Err(e) => {
+                        tracing::debug!(
+                            ifindex,
+                            error = %e,
+                            "BssCacheStale refresh failed"
+                        );
+                    }
+                }
+            }
+            SupplicantEvent::NetworkRequest {
+                ifindex,
+                network,
+                field,
+                text,
+            } => {
+                // Just relay to the D-Bus layer; the operator side
+                // responds via `WifiCommand::ProvideCredential`.
+                // DD-003 §9.2 / DD-006 §9.
+                let _ = self.event_tx.send(NexusEvent::WifiNetworkRequest {
+                    ifindex,
+                    network,
+                    field,
+                    text,
+                });
             }
             SupplicantEvent::DaemonUp => {
                 self.supplicant_up = true;
@@ -587,11 +1055,12 @@ impl WifiBackend {
                     .iter()
                     .map(|(i, e)| (*i, e.info.ifname.clone()))
                     .collect();
+                let scan_params = initial_scan_params(&self.profiles);
                 for (ifindex, ifname) in ifindices {
                     if let Err(e) = self.supplicant.attach(ifindex, &ifname).await {
                         tracing::warn!(ifname, error = %e, "re-attach after daemon up failed");
                     }
-                    let _ = self.request_scan(ifindex, ScanParams::default()).await;
+                    let _ = self.request_scan(ifindex, scan_params.clone()).await;
                 }
             }
             SupplicantEvent::DaemonDown => {
@@ -623,6 +1092,7 @@ impl WifiBackend {
         // borrow releases.
         enum After {
             None,
+            DwellStart,
             LinkReady {
                 bssid: nexus_core::MacAddr,
             },
@@ -633,6 +1103,24 @@ impl WifiBackend {
                 bssid: nexus_core::MacAddr,
             },
         }
+
+        // Pre-compute the security-mode lookup that `Connected` needs
+        // — it reaches into `self.cache` and `self.profiles`, which
+        // conflict with the `&mut entry` borrow below.
+        let precomputed_security = if let SupplicantState::Connected { bssid, .. } = &state {
+            let bssid = *bssid;
+            let active_security = self
+                .active_handle
+                .get(&ifindex)
+                .and_then(|(id, _)| self.profiles.iter().find(|p| p.id == *id))
+                .map(|p| p.network.security.clone());
+            Some(resolve_connected_security(
+                self.cache.lookup(ifindex, bssid).as_ref(),
+                active_security.as_ref(),
+            ))
+        } else {
+            None
+        };
 
         let (ifname, after) = {
             let Some(entry) = self.interfaces.get_mut(&ifindex) else {
@@ -646,39 +1134,56 @@ impl WifiBackend {
                     entry.state = WifiState::Scanning;
                     After::None
                 }
-                SupplicantState::Associating => {
-                    let (bssid, ssid) = extract_bssid_ssid(&entry.state);
+                SupplicantState::Associating | SupplicantState::Associated => {
+                    // DD-003 §9.5 collapses both into Connecting at
+                    // the public layer; the SupplicantState split
+                    // exists for internal observability (K1). S4:
+                    // when there's no prior context (the supplicant
+                    // moved the interface unilaterally — typical
+                    // after a nexusd restart with a stale config),
+                    // emit Connecting with synthetic placeholders
+                    // that the next `Connected` event will overwrite.
+                    let (bssid, ssid) = extract_bssid_ssid(&entry.state)
+                        .unwrap_or_else(placeholder_assoc);
                     entry.state = WifiState::Connecting { bssid, ssid };
-                    After::None
+                    After::DwellStart
                 }
                 SupplicantState::Authenticating => {
-                    let (bssid, ssid) = extract_bssid_ssid(&entry.state);
+                    let (bssid, ssid) = extract_bssid_ssid(&entry.state)
+                        .unwrap_or_else(placeholder_assoc);
                     entry.state = WifiState::Authenticating { bssid, ssid };
-                    After::None
+                    After::DwellStart
                 }
                 SupplicantState::FourWayHandshake => {
-                    let (bssid, ssid) = extract_bssid_ssid(&entry.state);
+                    let (bssid, ssid) = extract_bssid_ssid(&entry.state)
+                        .unwrap_or_else(placeholder_assoc);
                     entry.state = WifiState::Handshaking { bssid, ssid };
-                    After::None
+                    After::DwellStart
                 }
                 SupplicantState::Connected {
                     bssid,
                     ssid,
                     frequency,
                 } => {
-                    let security = guess_security_mode(entry);
                     entry.state = WifiState::Connected {
                         bssid,
                         ssid,
                         frequency,
                         signal_dbm: -50, // filled in by next signal poll
-                        security,
+                        security: precomputed_security
+                            .expect("precomputed for Connected arm above"),
                     };
                     After::LinkReady { bssid }
                 }
                 SupplicantState::Disconnected { reason } => {
                     let mapped = map_disconnect(reason.clone());
-                    let bssid = extract_bssid_ssid(&entry.state).0;
+                    // BSSID is only meaningful when the prior state
+                    // carried one; zero MAC means "no association
+                    // context" and the retry book skips its
+                    // record_failure step.
+                    let bssid = extract_bssid_ssid(&entry.state)
+                        .map(|(b, _)| b)
+                        .unwrap_or(nexus_core::MacAddr([0; 6]));
                     entry.state = WifiState::Disconnected {
                         reason: mapped.clone(),
                     };
@@ -693,12 +1198,63 @@ impl WifiBackend {
             (ifname, after)
         };
 
+        // Any state transition out of `Disconnected` cancels a
+        // pending cooldown. Re-armed below on re-entry.
+        if !matches!(after, After::Disconnected { .. }) {
+            self.disconnect_cooldowns.remove(&ifindex);
+        }
+
         match after {
             After::None => {}
+            After::DwellStart => {
+                // First entry into a pre-connected state arms the
+                // dwell timer that the driver-wedge detector
+                // consults. Subsequent transitions inside the
+                // pre-connected window (Associating → Auth → 4-way)
+                // refresh it so only genuine sticking counts.
+                self.dwell_since.insert(ifindex, Instant::now());
+            }
             After::LinkReady { bssid } => {
-                m::record_link_ready(&ifname);
-                let _ = self.event_tx.send(NexusEvent::WifiLinkReady { ifindex });
-                self.retry.record_success(ifindex, bssid);
+                self.dwell_since.remove(&ifindex);
+                // Resolve any in-flight roam: this `Connected`
+                // transition is the answer to the roam dispatch.
+                // Success means the reported BSSID matches the
+                // target; a mismatch means the supplicant fell back
+                // to another BSS (e.g. FT rejected, scan picked a
+                // different candidate). DD-003 §7 / §12.5.
+                if let Some(target) = self.roam_in_flight.remove(&ifindex) {
+                    let outcome = if bssid == target { "success" } else { "fail" };
+                    m::record_roam(&ifname, self.config.roam_mode.as_str(), outcome);
+                    // A roam completion isn't a fresh
+                    // `LinkReady` — we were already connected —
+                    // so skip the link-ready counter and the
+                    // connect-attempt metrics for this path.
+                    let _ = self.event_tx.send(NexusEvent::WifiLinkReady { ifindex });
+                    self.retry.record_success(ifindex, bssid);
+                    // Drop the connect-started stamp if one was
+                    // somehow still around; a roam-born Connected
+                    // doesn't belong in the connect_duration
+                    // histogram.
+                    self.connect_started_at.remove(&ifindex);
+                } else {
+                    m::record_link_ready(&ifname);
+                    let _ = self.event_tx.send(NexusEvent::WifiLinkReady { ifindex });
+                    self.retry.record_success(ifindex, bssid);
+                    // Emit the success counter + duration histogram
+                    // now that the handshake actually completed.
+                    // DD-003 §12.5.
+                    let security = self
+                        .active_handle
+                        .get(&ifindex)
+                        .and_then(|(id, _)| self.profiles.iter().find(|p| p.id == *id))
+                        .map(|p| security_tag(&p.network.security))
+                        .unwrap_or("unknown");
+                    m::record_connect(&ifname, security, m::connect_outcome::SUCCESS);
+                    if let Some(started) = self.connect_started_at.remove(&ifindex) {
+                        let secs = started.elapsed().as_secs_f64();
+                        m::record_connect_duration(&ifname, security, secs);
+                    }
+                }
             }
             After::Disconnected {
                 reason,
@@ -706,14 +1262,46 @@ impl WifiBackend {
                 was_connected,
                 bssid,
             } => {
+                let active_profile = self.active_handle.get(&ifindex).map(|(id, _)| *id);
+                // A `BadCredentials` hint is already a definitive
+                // auth failure (mock path, or future wpa_supplicant
+                // paths that learn to distinguish wrong-key from
+                // generic handshake timeout). Promote the profile
+                // straight away.
                 if matches!(mapped, DisconnectReason::CredentialsInvalid) {
-                    if let Some((profile_id, _)) = self.active_handle.get(&ifindex) {
-                        self.retry
-                            .mark_credentials_invalid(*profile_id, "wifi auth failure");
+                    if let Some(profile_id) = active_profile {
+                        self.promote_credentials_invalid(profile_id, "wifi auth failure")
+                            .await;
                     }
                 }
-                if bssid.0 != [0; 6] {
-                    let _ = self.retry.record_failure(ifindex, bssid, Instant::now());
+                // Record the BSSID failure and check whether this
+                // one tripped the blacklist. For WPA2/WPA3-Personal
+                // a 4-way handshake timeout that recurs past the
+                // retry threshold is, in practice, almost always a
+                // wrong passphrase — promote to CredentialsInvalid
+                // per DD-003 §6.3's "Authentication failure (bad
+                // PSK)" row, which the blunt DisconnectReason code
+                // alone can't distinguish.
+                let just_blacklisted = if bssid.0 != [0; 6] {
+                    self.retry.record_failure(ifindex, bssid, Instant::now())
+                } else {
+                    false
+                };
+                if just_blacklisted
+                    && matches!(reason, DisconnectHint::HandshakeTimeout)
+                    && !matches!(mapped, DisconnectReason::CredentialsInvalid)
+                {
+                    if let Some(profile_id) = active_profile {
+                        if self.profiles.iter().any(|p| {
+                            p.id == profile_id && is_psk_like(&p.network.security)
+                        }) {
+                            self.promote_credentials_invalid(
+                                profile_id,
+                                "4-way handshake timeouts past retry threshold",
+                            )
+                            .await;
+                        }
+                    }
                 }
                 if was_connected {
                     self.emit_link_lost(ifindex, reason_label(&reason));
@@ -736,33 +1324,148 @@ impl WifiBackend {
                         DisconnectHint::BadCredentials => m::connect_outcome::CREDENTIALS_INVALID,
                         DisconnectHint::AssociationTimeout => m::connect_outcome::ASSOC_TIMEOUT,
                         DisconnectHint::HandshakeTimeout => m::connect_outcome::HANDSHAKE_TIMEOUT,
-                        DisconnectHint::AuthFailure => m::connect_outcome::AUTH_FAILURE,
+                        DisconnectHint::AuthFailure | DisconnectHint::EapFailure => {
+                            m::connect_outcome::AUTH_FAILURE
+                        }
                         _ => m::connect_outcome::OTHER,
                     },
                 );
+
+                // Drop the connect-started stamp — this attempt
+                // ended without reaching `Connected`. No duration
+                // is emitted for failed attempts.
+                self.connect_started_at.remove(&ifindex);
+                // Clear the dwell timer: the pre-connected window
+                // ended (cleanly or otherwise). Wedge detection
+                // only looks at live pre-connected states.
+                self.dwell_since.remove(&ifindex);
+                // An in-flight roam that ended in Disconnected is a
+                // fail. DD-003 §12.5.
+                if self.roam_in_flight.remove(&ifindex).is_some() {
+                    m::record_roam(&ifname, self.config.roam_mode.as_str(), "fail");
+                }
+
+                // Arm the cooldown unless the reason is permanent
+                // (CredentialsInvalid). Permanent reasons keep the
+                // interface in `Disconnected` until the operator
+                // updates the profile — DD-003 §3.2 / §6.4.
+                if !mapped.is_permanent() {
+                    self.disconnect_cooldowns.insert(
+                        ifindex,
+                        Instant::now() + self.config.disconnect_cool_down,
+                    );
+                } else {
+                    self.disconnect_cooldowns.remove(&ifindex);
+                }
             }
         }
         self.emit_state(ifindex);
         Ok(())
     }
 
+    /// Walk pending cooldowns; for each interface whose deadline
+    /// has elapsed, transition out of `Disconnected { .. }` back to
+    /// `Idle` and kick a fresh scan. Safe to call on every
+    /// heartbeat — it's O(interfaces) with tiny constants.
+    async fn process_disconnect_cooldowns(&mut self) {
+        let now = Instant::now();
+        let due: Vec<u32> = self
+            .disconnect_cooldowns
+            .iter()
+            .filter_map(|(i, t)| (*t <= now).then_some(*i))
+            .collect();
+        for ifindex in due {
+            self.disconnect_cooldowns.remove(&ifindex);
+            let should_transition = matches!(
+                self.interfaces.get(&ifindex).map(|e| &e.state),
+                Some(WifiState::Disconnected { .. })
+            );
+            if !should_transition {
+                continue;
+            }
+            if let Some(entry) = self.interfaces.get_mut(&ifindex) {
+                entry.state = WifiState::Idle;
+            }
+            self.emit_state(ifindex);
+            if let Some(sched) = self.schedulers.get_mut(&ifindex) {
+                sched.fire_now(now);
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // Scan flow
     // -----------------------------------------------------------------
 
-    async fn request_scan(&mut self, ifindex: u32, params: ScanParams) -> Result<()> {
+    async fn request_scan(&mut self, ifindex: u32, mut params: ScanParams) -> Result<()> {
         if !self.supplicant_up {
             return Ok(());
+        }
+        // Only let wpa_supplicant act on scan results autonomously
+        // when the operator has explicitly delegated roaming to it.
+        // Callers that already set `allow_roam = true` (roam-
+        // evaluation scans in `nexus` mode) keep their flag. DD-003
+        // §4.1 / §9.3.
+        if !params.allow_roam && self.config.roam_mode == RoamMode::Supplicant {
+            params.allow_roam = true;
         }
         let Some(entry) = self.interfaces.get_mut(&ifindex) else {
             return Err(WifiError::NotAttached { ifindex });
         };
-        entry.state = WifiState::Scanning;
-        self.emit_state(ifindex);
-        self.supplicant.scan(ifindex, params).await
+        // Only fold to `Scanning` when the interface isn't
+        // already in an association — DD-003 §3.1 has no
+        // `Connected → Scanning` edge, and overwriting Connected
+        // here would make the post-scan `evaluate_roam` path miss
+        // the `currently_connected` check (C8 directed roam-eval
+        // scans fire while the link is up).
+        if matches!(
+            entry.state,
+            WifiState::Idle | WifiState::Disconnected { .. } | WifiState::Gone
+        ) {
+            entry.state = WifiState::Scanning;
+            self.emit_state(ifindex);
+        }
+        let scan_type = classify_scan(&params);
+        self.scan_in_flight.insert(
+            ifindex,
+            ScanInFlight {
+                started: Instant::now(),
+                scan_type,
+            },
+        );
+        // Forward the request; on failure, retire the in-flight
+        // record immediately and label the metric `failed` —
+        // there will be no `ScanComplete` to roll it through.
+        if let Err(e) = self.supplicant.scan(ifindex, params).await {
+            let ifname = self.ifname_of(ifindex);
+            if self.scan_in_flight.remove(&ifindex).is_some() {
+                m::record_scan(&ifname, scan_type, m::scan_outcome::FAILED);
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
-    async fn on_scan_complete(&mut self, ifindex: u32) -> Result<()> {
+    async fn on_scan_complete(&mut self, ifindex: u32, success: bool) -> Result<()> {
+        // Roll up the in-flight record into the metric. K5 / DD-003
+        // §12.5 — duration is meaningful even on `aborted`; the
+        // outcome label disambiguates.
+        let now = Instant::now();
+        if let Some(record) = self.scan_in_flight.remove(&ifindex) {
+            let ifname = self.ifname_of(ifindex);
+            let outcome = if success {
+                m::scan_outcome::SUCCESS
+            } else {
+                m::scan_outcome::ABORTED
+            };
+            m::record_scan(&ifname, record.scan_type, outcome);
+            m::record_scan_duration(
+                &ifname,
+                record.scan_type,
+                now.duration_since(record.started).as_secs_f64(),
+            );
+        }
+
         let results = self.supplicant.get_scan_results(ifindex).await?;
         self.cache.replace(ifindex, results.clone());
 
@@ -782,12 +1485,7 @@ impl WifiBackend {
             // Roam evaluation per §7.3.
             if let Some(target) = self.evaluate_roam(ifindex, &results).await {
                 matched = true;
-                let ifname = self.ifname_of(ifindex);
-                m::record_roam(&ifname, self.config.roam_mode.as_str(), "attempted");
-                let _ = self
-                    .supplicant
-                    .roam(ifindex, crate::types::RoamTarget::Bss(target))
-                    .await;
+                self.dispatch_roam(ifindex, target).await;
             }
         } else if let Some((profile, bss)) = select_network(&self.profiles, &results) {
             matched = true;
@@ -795,9 +1493,56 @@ impl WifiBackend {
         }
 
         if let Some(sched) = self.schedulers.get_mut(&ifindex) {
-            sched.on_scan_complete(matched, Instant::now());
+            sched.on_scan_complete(matched, now);
         }
         Ok(())
+    }
+
+    /// Dispatch a roam toward `target`. Snapshots the current
+    /// `(from, ssid)` so the backend can transition into
+    /// [`WifiState::Roaming`] while the supplicant runs the
+    /// 802.11r / reassociation dance; the matching `Connected`
+    /// transition in `on_supplicant_state` emits the
+    /// `roams_total{outcome=success|fail}` counter and folds the
+    /// state back to `Connected`. DD-003 §7 / §12.5.
+    async fn dispatch_roam(&mut self, ifindex: u32, target: nexus_core::MacAddr) {
+        let ifname = self.ifname_of(ifindex);
+        let (from, ssid) = match self.interfaces.get(&ifindex).map(|e| &e.state) {
+            Some(WifiState::Connected { bssid, ssid, .. }) => (*bssid, ssid.clone()),
+            _ => {
+                // Not currently connected — operator-initiated roam
+                // outside a live association. Send the command
+                // through anyway so the supplicant's error surfaces
+                // to the caller, but skip the state transition.
+                m::record_roam(&ifname, self.config.roam_mode.as_str(), "attempted");
+                let _ = self
+                    .supplicant
+                    .roam(ifindex, crate::types::RoamTarget::Bss(target))
+                    .await;
+                return;
+            }
+        };
+        if let Some(entry) = self.interfaces.get_mut(&ifindex) {
+            entry.state = WifiState::Roaming {
+                from,
+                to: target,
+                ssid,
+            };
+        }
+        self.emit_state(ifindex);
+        self.roam_in_flight.insert(ifindex, target);
+        m::record_roam(&ifname, self.config.roam_mode.as_str(), "attempted");
+        if let Err(e) = self
+            .supplicant
+            .roam(ifindex, crate::types::RoamTarget::Bss(target))
+            .await
+        {
+            // Supplicant rejected the dispatch outright — record
+            // the failure now rather than waiting for a timeout.
+            tracing::warn!(ifindex, error = %e, "roam dispatch failed");
+            m::record_roam(&ifname, self.config.roam_mode.as_str(), "fail");
+            self.roam_in_flight.remove(&ifindex);
+        }
     }
 
     async fn fire_scheduled_scans(&mut self) -> Result<()> {
@@ -815,8 +1560,9 @@ impl WifiBackend {
             })
             .map(|(i, _)| *i)
             .collect();
+        let scan_params = initial_scan_params(&self.profiles);
         for ifindex in ifindices {
-            let _ = self.request_scan(ifindex, ScanParams::default()).await;
+            let _ = self.request_scan(ifindex, scan_params.clone()).await;
         }
         Ok(())
     }
@@ -858,12 +1604,14 @@ impl WifiBackend {
 
         let net = to_network_config(&profile);
         let handle = self.supplicant.connect(ifindex, &net).await?;
+        let now = Instant::now();
         self.active_handle.insert(ifindex, (profile.id, handle));
-        m::record_connect(
-            &self.ifname_of(ifindex),
-            security_tag(&profile.network.security),
-            m::connect_outcome::SUCCESS,
-        );
+        self.connect_started_at.insert(ifindex, now);
+        self.dwell_since.insert(ifindex, now);
+        // Success metric is recorded on `SupplicantState::Connected`
+        // (C4) — a successful `AddNetwork + SelectNetwork` just
+        // means the supplicant accepted the config, not that the
+        // handshake will land.
         Ok(())
     }
 
@@ -896,6 +1644,54 @@ impl WifiBackend {
             current_rssi,
             &candidates,
         )
+    }
+
+    /// DD-003 §6.3 / §12.3: mark a profile as having invalid
+    /// credentials in all three places that need to agree — the
+    /// [`RetryBook`] (which accounts the per-session block), the
+    /// in-memory [`WifiProfile`] cache (which [`select_network`]
+    /// filters on), and the Profile Store on disk (which survives
+    /// a restart). Idempotent.
+    async fn promote_credentials_invalid(
+        &mut self,
+        profile_id: ulid::Ulid,
+        reason: &'static str,
+    ) {
+        self.retry.mark_credentials_invalid(profile_id, reason);
+        let ssid_hash = {
+            let Some(profile) = self.profiles.iter_mut().find(|p| p.id == profile_id) else {
+                return;
+            };
+            if profile.network.credentials_invalid {
+                return;
+            }
+            profile.network.credentials_invalid = true;
+            profile_key(profile)
+        };
+        tracing::warn!(
+            profile_id = %profile_id,
+            reason,
+            "wifi profile marked credentials_invalid"
+        );
+        if let Err(e) = self
+            .profile_store
+            .set_credentials_invalid(
+                ProfileRef::Wifi {
+                    ssid_hash: &ssid_hash,
+                },
+                true,
+            )
+            .await
+        {
+            // Non-fatal: the in-memory flag still blocks auto-select
+            // this session; the store will catch up on next put or
+            // manual edit.
+            tracing::warn!(
+                profile_id = %profile_id,
+                error = %e,
+                "persisting credentials_invalid to profile store failed"
+            );
+        }
     }
 
     // -----------------------------------------------------------------
@@ -997,37 +1793,95 @@ async fn recv_rfkill(
     }
 }
 
-fn extract_bssid_ssid(state: &WifiState) -> (nexus_core::MacAddr, nexus_core::Ssid) {
+/// Synthetic `(zero_mac, "?")` returned when a state transition
+/// arrives with no prior association context — usually because
+/// the supplicant moved the interface unilaterally (e.g. after
+/// a nexusd restart with a stale wpa_supplicant config). The
+/// `?` SSID byte is deliberately printable so the placeholder is
+/// obvious in logs; it gets overwritten by the next `Connected`
+/// event. S4.
+fn placeholder_assoc() -> (nexus_core::MacAddr, nexus_core::Ssid) {
+    (
+        nexus_core::MacAddr([0; 6]),
+        nexus_core::Ssid::new(b"?".to_vec()).expect("single-byte ssid is valid"),
+    )
+}
+
+/// Pull `(bssid, ssid)` out of any state that carries them.
+/// Returns `None` for states with no association context (`Idle`,
+/// `Scanning`, `Disconnected`, `Roaming`, `Gone`). S4: previously
+/// fell back to a synthetic `\0` SSID, which leaked into
+/// `WifiStateChanged.Connecting { ssid: "\0" }` when a transition
+/// arrived without an intervening event. Callers now thread the
+/// `None` case explicitly.
+fn extract_bssid_ssid(state: &WifiState) -> Option<(nexus_core::MacAddr, nexus_core::Ssid)> {
     match state {
         WifiState::Connecting { bssid, ssid }
         | WifiState::Authenticating { bssid, ssid }
-        | WifiState::Handshaking { bssid, ssid } => (*bssid, ssid.clone()),
-        WifiState::Connected { bssid, ssid, .. } => (*bssid, ssid.clone()),
-        _ => (
-            nexus_core::MacAddr([0; 6]),
-            nexus_core::Ssid::new(b"\0".to_vec())
-                .unwrap_or_else(|_| nexus_core::Ssid::new(b"x".to_vec()).unwrap()),
-        ),
+        | WifiState::Handshaking { bssid, ssid } => Some((*bssid, ssid.clone())),
+        WifiState::Connected { bssid, ssid, .. } => Some((*bssid, ssid.clone())),
+        WifiState::Roaming { to, ssid, .. } => Some((*to, ssid.clone())),
+        _ => None,
     }
 }
 
-fn guess_security_mode(entry: &WifiInterfaceEntry) -> SecurityMode {
-    // Without a live BSS cache lookup we default to Wpa2Psk; the
-    // backend refines via scan cache when real implementations
-    // arrive.
-    entry
-        .current_bss_capabilities
-        .as_ref()
-        .map(|_| SecurityMode::Wpa2Psk)
-        .unwrap_or(SecurityMode::Wpa2Psk)
+/// Pick the `SecurityMode` to report on the `WifiState::Connected`
+/// payload. When a BSS entry is available, prefer the first mode
+/// the profile is compatible with — that's the mode the 4-way /
+/// EAP exchange actually used. Fall back to the profile's intrinsic
+/// mode when the BSS cache is cold (e.g. after a supplicant
+/// restart), and to `Wpa2Psk` only when we have neither signal
+/// (startup race; supplicant reports Connected before the first
+/// ScanDone has populated the cache).
+fn resolve_connected_security(
+    bss: Option<&crate::types::BssInfo>,
+    profile_security: Option<&SecurityConfig>,
+) -> SecurityMode {
+    if let (Some(bss), Some(sec)) = (bss, profile_security) {
+        if let Some(mode) = bss
+            .security
+            .iter()
+            .find(|m| crate::select::security_compatible(sec, std::slice::from_ref(*m)))
+        {
+            return *mode;
+        }
+    }
+    if let Some(sec) = profile_security {
+        return intrinsic_security_mode(sec);
+    }
+    if let Some(bss) = bss {
+        if let Some(mode) = bss.security.first() {
+            return *mode;
+        }
+    }
+    SecurityMode::Wpa2Psk
+}
+
+/// The default `SecurityMode` a profile configures when the BSS
+/// cache has no better info. Mirrors the `SecurityConfig ↔
+/// SecurityMode` correspondence in DD-003 §8.1.
+fn intrinsic_security_mode(security: &SecurityConfig) -> SecurityMode {
+    match security {
+        SecurityConfig::Open => SecurityMode::Open,
+        SecurityConfig::Owe => SecurityMode::Owe,
+        SecurityConfig::Wpa2Personal { .. } => SecurityMode::Wpa2Psk,
+        SecurityConfig::Wpa3Personal { .. } => SecurityMode::Wpa3Sae,
+        SecurityConfig::Wpa2Wpa3Personal { .. } => SecurityMode::Wpa2Wpa3Transition,
+        SecurityConfig::Wpa2Enterprise(_) => SecurityMode::Wpa2Eap,
+        SecurityConfig::Wpa3Enterprise(_) => SecurityMode::Wpa3Eap,
+    }
 }
 
 fn map_disconnect(hint: DisconnectHint) -> DisconnectReason {
     match hint {
         DisconnectHint::Unspecified => DisconnectReason::Unspecified,
-        DisconnectHint::AssociationTimeout => DisconnectReason::ApInitiated,
+        DisconnectHint::AssociationTimeout => DisconnectReason::Other("assoc_timeout".into()),
         DisconnectHint::AuthFailure => DisconnectReason::AuthExpired,
         DisconnectHint::HandshakeTimeout => DisconnectReason::HandshakeTimeout,
+        DisconnectHint::EapFailure => DisconnectReason::EapFailure,
+        DisconnectHint::ApInitiated => DisconnectReason::ApInitiated,
+        DisconnectHint::Inactivity => DisconnectReason::Inactivity,
+        DisconnectHint::ProtocolError => DisconnectReason::ProtocolError,
         DisconnectHint::BadCredentials => DisconnectReason::CredentialsInvalid,
         DisconnectHint::LocalRequest => DisconnectReason::LocalRequest,
         DisconnectHint::DaemonUnavailable => DisconnectReason::SupplicantUnavailable,
@@ -1054,6 +1908,72 @@ fn security_tag(security: &nexus_profile_store::SecurityConfig) -> &'static str 
     }
 }
 
+/// Pick the `nexus_wifi_scans_total{type=…}` label for a scan.
+/// Closer-to-`roam`-shaped configs win over closer-to-`hidden`
+/// shapes; broadcast is the catch-all. K5 / DD-003 §12.5.
+fn classify_scan(params: &ScanParams) -> &'static str {
+    if params.allow_roam && !params.ssids.is_empty() {
+        return m::scan_type::ROAM;
+    }
+    if !params.ssids.is_empty() {
+        return m::scan_type::HIDDEN;
+    }
+    if !params.frequencies.is_empty() {
+        return m::scan_type::DIRECTED;
+    }
+    m::scan_type::BROADCAST
+}
+
+/// Build the [`ScanParams`] used for the startup / scheduled /
+/// post-DaemonUp scans. DD-003 §5.1 trigger #1 specifies an
+/// active broadcast; §5.1 trigger #5 says profiles with
+/// `hidden = true` should be probed with a directed SSID. wpa_supplicant's
+/// `Scan(SSIDs=…, Type=active)` accepts both — a non-empty SSID
+/// list adds named probes alongside the broadcast probe in the
+/// same dwell, so one scan covers both triggers.
+fn initial_scan_params(profiles: &[WifiProfile]) -> ScanParams {
+    let ssids = profiles
+        .iter()
+        .filter(|p| p.network.hidden)
+        .map(|p| p.network.ssid.clone())
+        .collect();
+    ScanParams {
+        ssids,
+        frequencies: Vec::new(),
+        active: true,
+        // `request_scan` flips `allow_roam = true` when the roam
+        // mode is `Supplicant`; default to false here so the
+        // intent of this call (steady-state scan, not a roam
+        // evaluation) is explicit.
+        allow_roam: false,
+    }
+}
+
+/// Dilate the base signal-poll interval by the current power
+/// state. Returns `None` in `Sleep` to suspend polling entirely.
+/// DD-003 §13.1: `Active` = base, `Background` ≈ ×3 (15 s when
+/// base is 5 s), `Sleep` = paused.
+fn signal_poll_interval(base: Duration, power: PowerState) -> Option<Duration> {
+    match power {
+        PowerState::Active => Some(base),
+        PowerState::Background => Some(base * 3),
+        PowerState::Sleep => None,
+    }
+}
+
+/// True for security modes that use a preshared passphrase / PSK
+/// (WPA2-PSK, SAE, transition). The 4-way-handshake timeout is
+/// almost always a wrong passphrase on these modes; Enterprise
+/// flows go through EAP and need different handling (DD-003 §6.3).
+fn is_psk_like(security: &SecurityConfig) -> bool {
+    matches!(
+        security,
+        SecurityConfig::Wpa2Personal { .. }
+            | SecurityConfig::Wpa3Personal { .. }
+            | SecurityConfig::Wpa2Wpa3Personal { .. }
+    )
+}
+
 /// `NexusEvent::WifiScanComplete.results` is `Vec<BssInfo>` from
 /// nexus-core; we keep our own local BSS type (§4.1) for richer
 /// fields and translate at the emission boundary.
@@ -1075,5 +1995,284 @@ fn to_nexus_bss_info(bss: BssInfo) -> nexus_core::BssInfo {
         },
         security: bss.security,
         age_ms: bss.age_ms,
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    //! Pure-helper coverage for the §14.1 audit gaps that don't
+    //! need a running backend (K5 classifier, S4 placeholder,
+    //! C5 power-state dilation, security-mode resolver, PSK
+    //! classifier). The end-to-end behaviour tests live in
+    //! `tests/backend_tests.rs`.
+    use super::*;
+    use nexus_core::{MacAddr, SecurityMode, Ssid};
+    use nexus_profile_store::{SecurityConfig, WpaPsk};
+
+    fn passphrase(s: &str) -> nexus_profile_store::SecretString {
+        nexus_profile_store::SecretString::from(s)
+    }
+
+    fn bss(bssid: [u8; 6], ssid: &[u8], modes: Vec<SecurityMode>) -> BssInfo {
+        BssInfo {
+            bssid: MacAddr(bssid),
+            ssid: Ssid::new(ssid.to_vec()).unwrap(),
+            frequency: 2412,
+            signal_dbm: -50,
+            capabilities: crate::types::BssCapabilities::default(),
+            security: modes,
+            age_ms: 0,
+        }
+    }
+
+    // ---- K5 classify_scan ------------------------------------------------
+
+    #[test]
+    fn classify_scan_broadcast_for_default_params() {
+        assert_eq!(
+            classify_scan(&ScanParams::default()),
+            m::scan_type::BROADCAST
+        );
+    }
+
+    #[test]
+    fn classify_scan_directed_for_frequency_restricted_only() {
+        let p = ScanParams {
+            frequencies: vec![2412, 2437],
+            active: true,
+            ..Default::default()
+        };
+        assert_eq!(classify_scan(&p), m::scan_type::DIRECTED);
+    }
+
+    #[test]
+    fn classify_scan_hidden_for_named_ssids_without_allow_roam() {
+        let p = ScanParams {
+            ssids: vec![Ssid::new(b"corp".to_vec()).unwrap()],
+            active: true,
+            ..Default::default()
+        };
+        assert_eq!(classify_scan(&p), m::scan_type::HIDDEN);
+    }
+
+    #[test]
+    fn classify_scan_roam_when_ssids_and_allow_roam_both_set() {
+        let p = ScanParams {
+            ssids: vec![Ssid::new(b"corp".to_vec()).unwrap()],
+            frequencies: vec![2412],
+            active: true,
+            allow_roam: true,
+        };
+        assert_eq!(classify_scan(&p), m::scan_type::ROAM);
+    }
+
+    // ---- S4 placeholder_assoc -------------------------------------------
+
+    #[test]
+    fn placeholder_assoc_uses_zero_mac_and_question_mark_ssid() {
+        let (mac, ssid) = placeholder_assoc();
+        assert_eq!(mac, MacAddr([0; 6]));
+        assert_eq!(ssid.as_bytes(), b"?");
+    }
+
+    // ---- extract_bssid_ssid (S4) ----------------------------------------
+
+    #[test]
+    fn extract_bssid_ssid_returns_none_for_idle_and_disconnected() {
+        assert!(extract_bssid_ssid(&WifiState::Idle).is_none());
+        assert!(extract_bssid_ssid(&WifiState::Scanning).is_none());
+        assert!(extract_bssid_ssid(&WifiState::Gone).is_none());
+        assert!(
+            extract_bssid_ssid(&WifiState::Disconnected {
+                reason: DisconnectReason::Unspecified,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_bssid_ssid_pulls_from_connected_and_roaming() {
+        let connected = WifiState::Connected {
+            bssid: MacAddr([0xAA; 6]),
+            ssid: Ssid::new(b"corp".to_vec()).unwrap(),
+            frequency: 5180,
+            signal_dbm: -55,
+            security: SecurityMode::Wpa2Psk,
+        };
+        let (bssid, ssid) = extract_bssid_ssid(&connected).unwrap();
+        assert_eq!(bssid, MacAddr([0xAA; 6]));
+        assert_eq!(ssid.as_bytes(), b"corp");
+
+        let roaming = WifiState::Roaming {
+            from: MacAddr([0x01; 6]),
+            to: MacAddr([0x02; 6]),
+            ssid: Ssid::new(b"corp".to_vec()).unwrap(),
+        };
+        let (bssid, _) = extract_bssid_ssid(&roaming).unwrap();
+        assert_eq!(bssid, MacAddr([0x02; 6])); // returns the *target* BSSID
+    }
+
+    // ---- C5 signal_poll_interval ----------------------------------------
+
+    #[test]
+    fn signal_poll_interval_dilates_with_power_state() {
+        let base = Duration::from_secs(5);
+        assert_eq!(signal_poll_interval(base, PowerState::Active), Some(base));
+        assert_eq!(
+            signal_poll_interval(base, PowerState::Background),
+            Some(base * 3)
+        );
+        assert_eq!(signal_poll_interval(base, PowerState::Sleep), None);
+    }
+
+    // ---- is_psk_like ----------------------------------------------------
+
+    #[test]
+    fn is_psk_like_covers_personal_modes_only() {
+        assert!(is_psk_like(&SecurityConfig::Wpa2Personal {
+            psk: WpaPsk::Passphrase(passphrase("p")),
+        }));
+        assert!(is_psk_like(&SecurityConfig::Wpa3Personal {
+            passphrase: passphrase("p"),
+        }));
+        assert!(is_psk_like(&SecurityConfig::Wpa2Wpa3Personal {
+            passphrase: passphrase("p"),
+        }));
+        assert!(!is_psk_like(&SecurityConfig::Open));
+        assert!(!is_psk_like(&SecurityConfig::Owe));
+        // Enterprise has its own EAP-failure path; not PSK-like.
+        let eap = nexus_profile_store::Dot1xEapConfig {
+            eap: nexus_profile_store::EapMethod::Peap,
+            identity: "u".into(),
+            anonymous_identity: None,
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
+            client_key_password: None,
+            phase2: None,
+            domain_suffix_match: None,
+            password: Some(passphrase("p")),
+        };
+        assert!(!is_psk_like(&SecurityConfig::Wpa2Enterprise(eap.clone())));
+        assert!(!is_psk_like(&SecurityConfig::Wpa3Enterprise(eap)));
+    }
+
+    // ---- intrinsic_security_mode ----------------------------------------
+
+    #[test]
+    fn intrinsic_security_mode_matches_dd003_section_8_1() {
+        assert_eq!(intrinsic_security_mode(&SecurityConfig::Open), SecurityMode::Open);
+        assert_eq!(intrinsic_security_mode(&SecurityConfig::Owe), SecurityMode::Owe);
+        assert_eq!(
+            intrinsic_security_mode(&SecurityConfig::Wpa2Personal {
+                psk: WpaPsk::Passphrase(passphrase("p")),
+            }),
+            SecurityMode::Wpa2Psk,
+        );
+        assert_eq!(
+            intrinsic_security_mode(&SecurityConfig::Wpa3Personal {
+                passphrase: passphrase("p"),
+            }),
+            SecurityMode::Wpa3Sae,
+        );
+        assert_eq!(
+            intrinsic_security_mode(&SecurityConfig::Wpa2Wpa3Personal {
+                passphrase: passphrase("p"),
+            }),
+            SecurityMode::Wpa2Wpa3Transition,
+        );
+    }
+
+    // ---- resolve_connected_security (C1) --------------------------------
+
+    #[test]
+    fn resolve_security_prefers_bss_advertised_compatible_mode() {
+        // Profile says WPA2-Personal; BSS advertises both
+        // transition mode and SAE — resolver should pick the
+        // first compatible advertised mode (transition is
+        // accepted by Wpa2Personal).
+        let bss = bss(
+            [0xAA; 6],
+            b"corp",
+            vec![SecurityMode::Wpa2Wpa3Transition, SecurityMode::Wpa3Sae],
+        );
+        let profile_security = SecurityConfig::Wpa2Personal {
+            psk: WpaPsk::Passphrase(passphrase("p")),
+        };
+        assert_eq!(
+            resolve_connected_security(Some(&bss), Some(&profile_security)),
+            SecurityMode::Wpa2Wpa3Transition,
+        );
+    }
+
+    #[test]
+    fn resolve_security_falls_back_to_intrinsic_when_cache_cold() {
+        // No BSS in cache yet; rely on the profile.
+        let profile_security = SecurityConfig::Wpa3Personal {
+            passphrase: passphrase("p"),
+        };
+        assert_eq!(
+            resolve_connected_security(None, Some(&profile_security)),
+            SecurityMode::Wpa3Sae,
+        );
+    }
+
+    #[test]
+    fn resolve_security_defaults_to_wpa2_psk_when_neither_signal() {
+        assert_eq!(
+            resolve_connected_security(None, None),
+            SecurityMode::Wpa2Psk,
+        );
+    }
+
+    // ---- map_disconnect (covers every DisconnectHint variant) -----------
+
+    #[test]
+    fn map_disconnect_covers_every_hint_variant() {
+        use crate::supplicant::DisconnectHint as H;
+        assert!(matches!(
+            map_disconnect(H::Unspecified),
+            DisconnectReason::Unspecified
+        ));
+        assert!(matches!(
+            map_disconnect(H::AuthFailure),
+            DisconnectReason::AuthExpired
+        ));
+        assert!(matches!(
+            map_disconnect(H::HandshakeTimeout),
+            DisconnectReason::HandshakeTimeout
+        ));
+        assert!(matches!(
+            map_disconnect(H::EapFailure),
+            DisconnectReason::EapFailure
+        ));
+        assert!(matches!(
+            map_disconnect(H::ApInitiated),
+            DisconnectReason::ApInitiated
+        ));
+        assert!(matches!(
+            map_disconnect(H::Inactivity),
+            DisconnectReason::Inactivity
+        ));
+        assert!(matches!(
+            map_disconnect(H::ProtocolError),
+            DisconnectReason::ProtocolError
+        ));
+        assert!(matches!(
+            map_disconnect(H::BadCredentials),
+            DisconnectReason::CredentialsInvalid
+        ));
+        assert!(matches!(
+            map_disconnect(H::LocalRequest),
+            DisconnectReason::LocalRequest
+        ));
+        assert!(matches!(
+            map_disconnect(H::DaemonUnavailable),
+            DisconnectReason::SupplicantUnavailable
+        ));
+        // Sanity: the only reason that's_permanent across the
+        // map is BadCredentials → CredentialsInvalid.
+        assert!(map_disconnect(H::BadCredentials).is_permanent());
+        assert!(!map_disconnect(H::HandshakeTimeout).is_permanent());
     }
 }

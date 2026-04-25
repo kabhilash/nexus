@@ -94,6 +94,21 @@ pub enum NexusEvent {
         ifindex: u32,
         powered: bool,
     },
+    /// wpa_supplicant asked for a credential (OTP, password,
+    /// passphrase, smartcard PIN) to complete an ongoing
+    /// authentication. The D-Bus layer surfaces this to operators
+    /// so they can reply via a matching `WifiCommand::ProvideCredential`.
+    /// See DD-003 §9.2 and DD-006 §9.
+    WifiNetworkRequest {
+        ifindex: u32,
+        /// Opaque supplicant-side network path. Required round-trip
+        /// payload for the reply command.
+        network: String,
+        /// Credential the supplicant wants (`password` / `otp` / …).
+        field: String,
+        /// Operator-facing prompt text.
+        text: String,
+    },
 
     // --- Bluetooth Backend ---
     /// Fires in two cases: (1) an adapter first becomes visible via

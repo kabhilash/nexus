@@ -2,6 +2,7 @@
 //! lifecycle events for the rest of Nexus. See DD-001.
 
 pub mod classify;
+pub mod command;
 pub mod enumerate;
 pub mod metrics;
 pub mod monitor;
@@ -12,11 +13,19 @@ pub mod udev;
 
 use nexus_core::NexusEvent;
 use thiserror::Error;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+pub use command::MonitorCommand;
 pub use monitor::MonitorTask;
+
+/// Default depth of the command channel returned by
+/// [`spawn_interface_monitor`]. Sized so a burst of wedge-recovery
+/// requests from multiple Wi-Fi interfaces doesn't block, but a
+/// stuck monitor task is eventually visible as a `TrySendError::Full`
+/// rather than silent backpressure.
+pub const COMMAND_CHANNEL_DEPTH: usize = 16;
 
 /// Result alias used across the crate. The single error type below
 /// covers netlink I/O, parse failures, and genl resolution.
@@ -48,12 +57,31 @@ pub enum MonitorError {
 /// processing the event loop. Setup errors are returned directly;
 /// runtime errors propagate through the task's result.
 ///
+/// `commands` is the receiver side of the [`MonitorCommand`]
+/// channel — the Wi-Fi backend holds a matching sender so its
+/// driver-wedge recovery (DD-003 §12.4) can dispatch
+/// `SetAdminUp` through the monitor's rtnetlink socket. Callers
+/// that don't need the channel can build it with
+/// [`command_channel`] and drop the sender.
+///
 /// The task exits cleanly when `shutdown` is cancelled.
 pub async fn spawn_interface_monitor(
     event_tx: broadcast::Sender<NexusEvent>,
     shutdown: CancellationToken,
+    commands: mpsc::Receiver<MonitorCommand>,
 ) -> Result<JoinHandle<Result<()>>> {
     metrics::register();
     let task = MonitorTask::bootstrap(event_tx).await?;
-    Ok(tokio::spawn(task.run(shutdown)))
+    Ok(tokio::spawn(task.run(shutdown, commands)))
+}
+
+/// Convenience constructor for the [`MonitorCommand`] channel.
+/// Callers that outlive the monitor task itself — daemons that
+/// supervise the monitor through restarts, for example — should
+/// build the channel here so the sender survives re-spawns.
+pub fn command_channel() -> (
+    mpsc::Sender<MonitorCommand>,
+    mpsc::Receiver<MonitorCommand>,
+) {
+    mpsc::channel(COMMAND_CHANNEL_DEPTH)
 }
