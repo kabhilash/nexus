@@ -408,6 +408,39 @@ pub fn diff_config(old: &Config, new: &Config, log_setter: &LogLevelSetter) -> R
     if old.gnss.gpsd_outage_notify_s != new.gnss.gpsd_outage_notify_s {
         report.deferred.push("gnss.gpsd_outage_notify_s".into());
     }
+    let (od, nd) = (&old.gnss.defaults, &new.gnss.defaults);
+    if od.min_fix_mode != nd.min_fix_mode {
+        report.deferred.push("gnss.defaults.min_fix_mode".into());
+    }
+    if od.min_satellites != nd.min_satellites {
+        report.deferred.push("gnss.defaults.min_satellites".into());
+    }
+    if od.max_horizontal_error_m != nd.max_horizontal_error_m {
+        report
+            .deferred
+            .push("gnss.defaults.max_horizontal_error_m".into());
+    }
+    if od.strict_quality != nd.strict_quality {
+        report.deferred.push("gnss.defaults.strict_quality".into());
+    }
+    if od.max_update_hz != nd.max_update_hz {
+        report.deferred.push("gnss.defaults.max_update_hz".into());
+    }
+    if od.report_movement_only != nd.report_movement_only {
+        report
+            .deferred
+            .push("gnss.defaults.report_movement_only".into());
+    }
+    if od.movement_threshold_m != nd.movement_threshold_m {
+        report
+            .deferred
+            .push("gnss.defaults.movement_threshold_m".into());
+    }
+    if od.heartbeat_interval_s != nd.heartbeat_interval_s {
+        report
+            .deferred
+            .push("gnss.defaults.heartbeat_interval_s".into());
+    }
 
     report
 }

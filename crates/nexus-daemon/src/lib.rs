@@ -22,8 +22,8 @@ pub mod wifi_ops;
 
 pub use bus::spawn_bus;
 pub use config::{
-    BluetoothSection, Config, ConfigError, DbusSection, EthernetSection, GnssSection,
-    InterfaceMonitorSection, ProfileStoreSection, SupervisionSection, WifiSection,
+    BluetoothSection, Config, ConfigError, DbusSection, EthernetSection, GnssDefaultsSection,
+    GnssSection, InterfaceMonitorSection, ProfileStoreSection, SupervisionSection, WifiSection,
 };
 pub use reload::{LogLevelSetter, ReloadCoordinator, ReloadError, ReloadOps, diff_config};
 pub use supervision::{SubsystemName, SupervisionError, spawn_supervised};

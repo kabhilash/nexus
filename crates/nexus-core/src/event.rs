@@ -182,6 +182,17 @@ pub enum NexusEvent {
     GnssGpsdDisconnected,
     /// The gpsd client has (re)connected to gpsd.
     GnssGpsdConnected,
+    /// Per-device lifecycle state transition (DD-005 §3.1). The
+    /// `state` field carries the lower-case state name
+    /// (`acquiring`, `tracking`, `degraded`, `gone`); the `reason`
+    /// field captures the trigger (`fix_passed`, `fix_failed`,
+    /// `timeout`, …) for diagnostic logs and tests.
+    GnssStateChanged {
+        device: String,
+        from: &'static str,
+        to: &'static str,
+        reason: &'static str,
+    },
 
     // --- Profile Store ---
     /// Put or remove completed.

@@ -32,7 +32,7 @@ pub use types::{
         Dot1xSettings, Dot1xSettingsOnDisk, EthInterfaceSettings, EthernetProfile,
         EthernetProfileOnDisk, decrypt_ethernet, encrypt_ethernet,
     },
-    gnss::GnssDeviceProfile,
+    gnss::{FixModeOnDisk, GnssDeviceProfile},
     wifi::{
         SecurityConfig, SecurityConfigOnDisk, WifiNetworkSettings, WifiNetworkSettingsOnDisk,
         WifiProfile, WifiProfileOnDisk, WpaPsk, WpaPskOnDisk, decrypt_wifi, encrypt_wifi,

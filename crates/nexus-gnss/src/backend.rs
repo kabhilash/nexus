@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{GnssConfig, PowerState};
 use crate::errors::Result;
-use crate::fix::{EffectiveProfile, GnssFix, fix_quality_ok};
+use crate::fix::{GnssFix, fix_quality_ok};
 use crate::gpsd::GpsdClient;
 use crate::lifecycle::{GnssDeviceEntry, Outcome, check_timeouts, should_emit, tpv_next_state};
 use crate::metrics as m;
@@ -39,11 +39,6 @@ pub enum GnssCommand {
         state: PowerState,
         responder: oneshot::Sender<Result<()>>,
     },
-    /// Diagnostic — return the current fix as cached by the client.
-    CurrentFix {
-        device_path: String,
-        responder: oneshot::Sender<Result<Option<GnssFix>>>,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +47,10 @@ pub enum GnssCommand {
 
 pub struct GnssBackend {
     devices: HashMap<u32, GnssDeviceEntry>,
+    /// Secondary index `device_path → ifindex`. Maintained on
+    /// discover / remove so per-TPV `device_by_path[_mut]` lookups
+    /// are O(1) instead of scanning every entry.
+    path_index: HashMap<String, u32>,
     gpsd: Arc<dyn GpsdClient>,
     profile_store: Arc<dyn ProfileStore>,
     event_tx: broadcast::Sender<NexusEvent>,
@@ -78,6 +77,7 @@ impl GnssBackend {
         let event_rx = event_tx.subscribe();
         Self {
             devices: HashMap::new(),
+            path_index: HashMap::new(),
             gpsd,
             profile_store,
             event_tx,
@@ -195,6 +195,7 @@ impl GnssBackend {
         let ifindex = info.ifindex;
         let entry = GnssDeviceEntry::new(info, profile.clone(), Instant::now());
         self.devices.insert(ifindex, entry);
+        self.path_index.insert(device_path.clone(), ifindex);
         info!(ifindex, %device_path, profiled = stored.is_some(), "gnss device discovered");
 
         // Ask gpsd to watch the device if the effective profile
@@ -212,6 +213,7 @@ impl GnssBackend {
             return;
         };
         let device_path = entry.device_path().to_owned();
+        self.path_index.remove(&device_path);
         if self.gpsd.is_connected() {
             let _ = self.gpsd.remove_device(&device_path).await;
         }
@@ -223,11 +225,15 @@ impl GnssBackend {
         // timer stays frozen so a long sleep doesn't degrade a
         // tracking device on wake. DD-005 §10.
         let suspended = matches!(self.power_state, PowerState::Sleep);
+        // Capture before the mutable borrow of self.devices below,
+        // so should_emit can see the active power state.
+        let power_state = self.power_state;
 
         let mut emit_payload: Option<GnssFix> = None;
         let mut stall_transition = false;
         let mut filter_reason: Option<&'static str> = None;
         let mut suppress_reason: Option<&'static str> = None;
+        let mut state_change: Option<(&'static str, &'static str, &'static str)> = None;
         let device_for_metrics;
         let mode_label;
 
@@ -255,23 +261,26 @@ impl GnssBackend {
 
             let previous_label = entry.state.label();
             entry.state = tpv_next_state(&entry.state, &fix, passes, now);
-            if previous_label == "tracking" && entry.state.label() == "degraded" {
+            let new_label = entry.state.label();
+            if previous_label == "tracking" && new_label == "degraded" {
                 stall_transition = true;
             }
-            if previous_label != entry.state.label() {
+            if previous_label != new_label {
+                let reason = if passes { "fix_passed" } else { "fix_failed" };
                 info!(
                     device = %device_for_metrics,
                     from = previous_label,
-                    to = entry.state.label(),
-                    reason = if passes { "fix_passed" } else { "fix_failed" },
+                    to = new_label,
+                    reason,
                     "gnss transition"
                 );
+                state_change = Some((previous_label, new_label, reason));
             }
 
             if !passes {
                 // Quality-failing fixes never emit.
             } else {
-                match should_emit(entry, &fix, now) {
+                match should_emit(entry, &fix, now, power_state) {
                     Outcome::Emit => {
                         entry.last_fix_emit_at = Some(now);
                         entry.last_emitted_fix = Some(fix.clone());
@@ -298,6 +307,15 @@ impl GnssBackend {
         }
         if stall_transition {
             m::record_tpv_stall(&device_for_metrics);
+        }
+
+        if let Some((from, to, reason)) = state_change {
+            let _ = self.event_tx.send(NexusEvent::GnssStateChanged {
+                device: device_for_metrics.clone(),
+                from,
+                to,
+                reason,
+            });
         }
 
         if let Some(fix) = emit_payload {
@@ -356,21 +374,14 @@ impl GnssBackend {
             GnssCommand::SetPowerState { state, responder } => {
                 let _ = responder.send(self.apply_power_state(state));
             }
-            GnssCommand::CurrentFix {
-                device_path,
-                responder,
-            } => {
-                let _ = responder.send(self.gpsd.current_fix(&device_path).await);
-            }
         }
     }
 
     /// DD-005 §10. Sleep suspends TPV-stall detection + emission;
-    /// Background clamps `max_update_hz` to 1 (effectively 1 s
-    /// emission cap since the DD calls for 0.2 Hz = 5 s, but the
-    /// integer-hertz profile here keeps 1 as the safer floor; the
-    /// D-Bus layer coalesces further). Active restores profile
-    /// values.
+    /// Background applies a 5 s emission floor on top of the
+    /// per-device profile's `max_update_hz` (enforced inside
+    /// `should_emit` via the `power_state` argument). Active
+    /// restores profile values.
     fn apply_power_state(&mut self, next: PowerState) -> Result<()> {
         if self.power_state == next {
             return Ok(());
@@ -445,6 +456,7 @@ impl GnssBackend {
     fn check_all_timeouts(&mut self, now: Instant) {
         let acq = Duration::from_secs(self.config.acquisition_timeout_s as u64);
         let stall = Duration::from_secs(self.config.tpv_stall_timeout_s as u64);
+        let mut transitions: Vec<(String, &'static str, &'static str)> = Vec::new();
         for entry in self.devices.values_mut() {
             if let Some(next) = check_timeouts(&entry.state, entry.last_tpv_at, acq, stall, now) {
                 let previous = entry.state.label();
@@ -461,7 +473,16 @@ impl GnssBackend {
                 if stalled {
                     m::record_tpv_stall(entry.device_path());
                 }
+                transitions.push((entry.device_path().to_owned(), previous, to_label));
             }
+        }
+        for (device, from, to) in transitions {
+            let _ = self.event_tx.send(NexusEvent::GnssStateChanged {
+                device,
+                from,
+                to,
+                reason: "timeout",
+            });
         }
     }
 
@@ -470,18 +491,16 @@ impl GnssBackend {
     // -----------------------------------------------------------------
 
     fn device_by_path_mut(&mut self, device_path: &str) -> Option<&mut GnssDeviceEntry> {
-        self.devices
-            .values_mut()
-            .find(|e| e.device_path() == device_path)
+        let ifindex = *self.path_index.get(device_path)?;
+        self.devices.get_mut(&ifindex)
     }
 
     /// Immutable variant — used by tests (and future diagnostic
     /// paths).
     #[allow(dead_code)]
     fn device_by_path(&self, device_path: &str) -> Option<&GnssDeviceEntry> {
-        self.devices
-            .values()
-            .find(|e| e.device_path() == device_path)
+        let ifindex = *self.path_index.get(device_path)?;
+        self.devices.get(&ifindex)
     }
 
     fn emit_notification(&self, kind: &str, fields: &[(&str, &str)]) {
@@ -504,10 +523,3 @@ impl GnssBackend {
         }
     }
 }
-
-// Silence the unused-import warning that pops up when EffectiveProfile
-// isn't referenced in this crate's top level. The type is public via
-// `crate::fix::EffectiveProfile`; the import above is load-bearing for
-// the hydration path.
-#[allow(dead_code)]
-fn _touch(_p: EffectiveProfile) {}

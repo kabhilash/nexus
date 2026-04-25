@@ -30,8 +30,10 @@ pub enum MockCall {
 struct MockState {
     connected: bool,
     calls: Vec<MockCall>,
-    canned_errors: Vec<(String, GnssError)>,
-    current_fix: std::collections::HashMap<String, GnssFix>,
+    /// Number of subsequent `connect()` calls that should fail with
+    /// `GnssError::NotConnected`. Decremented on each failure;
+    /// callers use `fail_next_connect(n)` to set up.
+    pending_connect_failures: u32,
 }
 
 /// Shareable mock. Every method is `&self`; internal state is
@@ -55,24 +57,11 @@ impl MockGpsdClient {
         self.state.lock().unwrap().calls.clone()
     }
 
-    /// Queue an error for the next call of the given name
-    /// (`"connect"`, `"add_device"`, `"remove_device"`,
-    /// `"current_fix"`).
-    pub fn inject_error(&self, method: &str, err: GnssError) {
-        self.state
-            .lock()
-            .unwrap()
-            .canned_errors
-            .push((method.to_owned(), err));
-    }
-
-    /// Preset the cached fix `current_fix()` returns for a device.
-    pub fn set_current_fix(&self, device_path: &str, fix: GnssFix) {
-        self.state
-            .lock()
-            .unwrap()
-            .current_fix
-            .insert(device_path.to_owned(), fix);
+    /// Make the next `n` `connect()` calls fail with
+    /// `GnssError::NotConnected`. Used to drive the supervisor's
+    /// reconnect-backoff path in fault-injection tests.
+    pub fn fail_next_connect(&self, n: u32) {
+        self.state.lock().unwrap().pending_connect_failures = n;
     }
 
     /// Pretend the connection dropped. The next `is_connected()`
@@ -103,22 +92,19 @@ impl MockGpsdClient {
             satellites,
         });
     }
-
-    fn consume_err(&self, method: &str) -> Option<GnssError> {
-        let mut s = self.state.lock().unwrap();
-        let idx = s.canned_errors.iter().position(|(k, _)| k == method)?;
-        Some(s.canned_errors.remove(idx).1)
-    }
 }
 
 #[async_trait]
 impl GpsdClient for MockGpsdClient {
     async fn connect(&self) -> Result<()> {
-        self.state.lock().unwrap().calls.push(MockCall::Connect);
-        if let Some(e) = self.consume_err("connect") {
-            return Err(e);
+        let mut s = self.state.lock().unwrap();
+        s.calls.push(MockCall::Connect);
+        if s.pending_connect_failures > 0 {
+            s.pending_connect_failures -= 1;
+            return Err(GnssError::NotConnected);
         }
-        self.state.lock().unwrap().connected = true;
+        s.connected = true;
+        drop(s);
         let _ = self.event_tx.send(NexusEvent::GnssGpsdConnected);
         Ok(())
     }
@@ -133,9 +119,6 @@ impl GpsdClient for MockGpsdClient {
             .unwrap()
             .calls
             .push(MockCall::AddDevice(path.to_owned()));
-        if let Some(e) = self.consume_err("add_device") {
-            return Err(e);
-        }
         Ok(())
     }
 
@@ -145,9 +128,6 @@ impl GpsdClient for MockGpsdClient {
             .unwrap()
             .calls
             .push(MockCall::RemoveDevice(path.to_owned()));
-        if let Some(e) = self.consume_err("remove_device") {
-            return Err(e);
-        }
         Ok(())
     }
 
@@ -157,10 +137,7 @@ impl GpsdClient for MockGpsdClient {
             .unwrap()
             .calls
             .push(MockCall::CurrentFix(path.to_owned()));
-        if let Some(e) = self.consume_err("current_fix") {
-            return Err(e);
-        }
-        Ok(self.state.lock().unwrap().current_fix.get(path).cloned())
+        Ok(None)
     }
 
     fn name(&self) -> &'static str {

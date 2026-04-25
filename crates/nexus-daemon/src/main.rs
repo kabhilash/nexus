@@ -752,12 +752,22 @@ fn build_bluetooth_config(section: &nexus_daemon::BluetoothSection) -> Bluetooth
 }
 
 fn build_gnss_config(section: &nexus_daemon::GnssSection) -> GnssConfig {
+    let d = &section.defaults;
     GnssConfig {
         gpsd_endpoint: section.gpsd_endpoint,
         acquisition_timeout_s: section.acquisition_timeout_s,
         tpv_stall_timeout_s: section.tpv_stall_timeout_s,
         gpsd_outage_notify_s: section.gpsd_outage_notify_s,
-        defaults: GnssDefaults::default(),
+        defaults: GnssDefaults {
+            min_fix_mode: d.min_fix_mode.into(),
+            min_satellites: d.min_satellites,
+            max_horizontal_error_m: d.max_horizontal_error_m,
+            strict_quality: d.strict_quality,
+            max_update_hz: d.max_update_hz,
+            report_movement_only: d.report_movement_only,
+            movement_threshold_m: d.movement_threshold_m,
+            heartbeat_interval_s: d.heartbeat_interval_s,
+        },
     }
 }
 

@@ -75,9 +75,16 @@ fn sample_gnss(id: Ulid) -> GnssDeviceProfile {
         metadata: ProfileMetadata::default(),
         device_path: "/dev/ttyUSB0".into(),
         label: Some("external u-blox F9P".into()),
-        max_rate_hz: Some(10),
-        min_horizontal_error_m: Some(1.5),
-        auto_attach: true,
+        vendor_model: Some("u-blox F9P".into()),
+        max_update_hz: Some(10),
+        max_horizontal_error_m: Some(1.5),
+        min_fix_mode: Some(nexus_profile_store::FixModeOnDisk::Fix3D),
+        min_satellites: Some(6),
+        strict_quality: Some(true),
+        report_movement_only: Some(false),
+        movement_threshold_m: Some(5.0),
+        heartbeat_interval_s: Some(60),
+        auto_activate: true,
     }
 }
 

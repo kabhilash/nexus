@@ -63,20 +63,31 @@ crates/
     src/
       lib.rs                    <- entry point (spawn_gnss_backend)
       backend.rs                <- GnssBackend top-level orchestrator
-      lifecycle.rs              <- per-device state machine (§3, §5)
-      gpsd/                     <- gpsd client abstraction
-        mod.rs                  <- GpsdClient trait
-        json_client.rs          <- default impl (TCP JSON)
-        messages.rs             <- gpsd JSON message types
-        parse.rs                <- JSON -> structured types
-      fix.rs                    <- Fix, FixMode, quality thresholds (§7)
-      profile.rs                <- GnssDeviceProfile (§9)
+      lifecycle.rs              <- per-device state machine (§§3, 5)
+      config.rs                 <- GnssConfig + PowerState (§§8, 10)
       errors.rs
+      fix.rs                    <- GnssFix re-export, EffectiveProfile,
+                                   quality threshold (§7)
+      metrics.rs                <- Prometheus metrics (§11.2)
+      profile.rs                <- hydrate + build_stored_profile (§9)
+      gpsd/                     <- gpsd client abstraction
+        mod.rs                  <- GpsdClient trait (§4.1)
+        json_client.rs          <- production impl (TCP JSON)
+        messages.rs             <- gpsd JSON wire types
+        parse.rs                <- TPV/SKY -> structured types
+        mock.rs                 <- MockGpsdClient for tests
+      bin/
+        demo.rs                 <- nexus-gnss-demo binary
     tests/
-      parse.rs                  <- gpsd JSON parsing
-      lifecycle.rs              <- state machine unit tests
-      fix_filter.rs             <- quality threshold tests
+      backend_tests.rs          <- mock-driven end-to-end coverage
+      json_client_tcp.rs        <- TCP-listener phase 2 fixture
+      integration_gpsd.rs       <- live-gpsd HIL (feature-gated, ignored)
 ```
+
+Unit tests live inline in `#[cfg(test)] mod tests` blocks at the
+bottom of each `src/*.rs` module, per the project's general
+convention (CLAUDE.md). Cross-module / state-machine integration
+tests live under `tests/`.
 
 **Key dependencies:**
 
@@ -215,12 +226,21 @@ Finally: there is **no connect/disconnect action** in the GNSS Backend's API. Th
 /// `NexusEvent::GnssFixChanged` for downstream consumers. The trait
 /// impl does not poll or emit filtered events — that's the backend's
 /// job.
+///
+/// Every method takes `&self`. The backend stores the client as
+/// `Arc<dyn GpsdClient>` and shares it across the supervisor task,
+/// the device-registration path, and any future diagnostic command
+/// path; that sharing pattern is incompatible with `&mut self`.
+/// Implementations therefore use interior mutability (e.g.
+/// `Arc<Mutex<…>>` over the writer half and the reader-task handle)
+/// to keep `connect`, `add_device`, and `remove_device` safe to call
+/// concurrently from multiple call sites.
 #[async_trait]
 pub trait GpsdClient: Send + Sync {
     /// Establish or re-establish the connection to gpsd.
     /// Idempotent — calling when already connected is a no-op.
     /// On success, emits NexusEvent::GnssGpsdConnected.
-    async fn connect(&mut self) -> Result<()>;
+    async fn connect(&self) -> Result<()>;
 
     /// Report whether the client currently has a live connection to
     /// gpsd. Used by the reconcile supervisor (§6.4) to decide whether
@@ -235,11 +255,11 @@ pub trait GpsdClient: Send + Sync {
     /// Note: gpsd autodetects many devices itself (via hotplug hooks
     /// or its configured device list). On systems where gpsd has
     /// already picked up the device, this call is just a check.
-    async fn add_device(&mut self, path: &str) -> Result<()>;
+    async fn add_device(&self, path: &str) -> Result<()>;
 
     /// Request removal of a device from gpsd's watch list. Typically
     /// triggered when the Interface Monitor reports InterfaceRemoved.
-    async fn remove_device(&mut self, path: &str) -> Result<()>;
+    async fn remove_device(&self, path: &str) -> Result<()>;
 
     /// Query the current fix for a specific device. Diagnostics only;
     /// not used in the steady-state event loop (which is push-driven
@@ -375,7 +395,7 @@ Two distinct `NexusEvent` variants carry position data:
 - **`GnssTpvReceived`** — every TPV the gpsd client receives. Unfiltered. Consumers that need raw data (diagnostic recorders, fleet-logging, NTRIP-style flows) subscribe to this.
 - **`GnssFixChanged`** — quality-filtered and rate-capped fixes emitted by the GNSS Backend itself. This is what the D-Bus layer (DD-006 §6.5) translates into `fi.nexus.Gnss.FixChanged`.
 
-The backend subscribes only to `GnssTpvReceived`; it never subscribes to `GnssFixChanged` (avoiding a subscribe-to-own-emission loop).
+The backend uses one bus subscription that returns every variant (the `tokio::sync::broadcast` channel has no per-variant filter), so it sees its own `GnssFixChanged` emissions on the receiver. It does not act on them: the `handle_event` match has no arm for `GnssFixChanged`, so it falls through the catch-all and the no-op terminates immediately. This is what the prior DD wording meant by "no subscribe-to-own-emission loop" — there is no logical loop, just shared-channel fanout that the backend filters at dispatch.
 
 `GnssSatellites` uses a **single-tier** flow — the gpsd client emits it from every SKY message; both the backend (for state snapshot) and the D-Bus layer (for signal emission, with coalescing per DD-006 §12.2) subscribe independently. A separate filtered variant for satellites isn't needed because SKY messages are lower-rate than TPV and their D-Bus equivalent is already coalesced.
 

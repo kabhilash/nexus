@@ -416,6 +416,9 @@ pub struct GnssSection {
     pub acquisition_timeout_s: u32,
     pub tpv_stall_timeout_s: u32,
     pub gpsd_outage_notify_s: u32,
+    /// Per-device thresholds applied when no profile-store entry
+    /// overrides them. Mirrors DD-005 §8.
+    pub defaults: GnssDefaultsSection,
 }
 
 impl Default for GnssSection {
@@ -427,6 +430,36 @@ impl Default for GnssSection {
             acquisition_timeout_s: 300,
             tpv_stall_timeout_s: 30,
             gpsd_outage_notify_s: 60,
+            defaults: GnssDefaultsSection::default(),
+        }
+    }
+}
+
+/// `[gnss.defaults]` — DD-005 §8.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GnssDefaultsSection {
+    pub min_fix_mode: nexus_profile_store::FixModeOnDisk,
+    pub min_satellites: u32,
+    pub max_horizontal_error_m: Option<f64>,
+    pub strict_quality: bool,
+    pub max_update_hz: u32,
+    pub report_movement_only: bool,
+    pub movement_threshold_m: f64,
+    pub heartbeat_interval_s: u32,
+}
+
+impl Default for GnssDefaultsSection {
+    fn default() -> Self {
+        Self {
+            min_fix_mode: nexus_profile_store::FixModeOnDisk::Fix2D,
+            min_satellites: 4,
+            max_horizontal_error_m: Some(100.0),
+            strict_quality: false,
+            max_update_hz: 1,
+            report_movement_only: false,
+            movement_threshold_m: 10.0,
+            heartbeat_interval_s: 60,
         }
     }
 }
@@ -538,6 +571,16 @@ mod tests {
             acquisition_timeout_s = 600
             tpv_stall_timeout_s = 60
             gpsd_outage_notify_s = 120
+
+            [gnss.defaults]
+            min_fix_mode = "fix_3d"
+            min_satellites = 6
+            max_horizontal_error_m = 25.0
+            strict_quality = true
+            max_update_hz = 5
+            report_movement_only = true
+            movement_threshold_m = 20.0
+            heartbeat_interval_s = 30
         "#;
         let cfg = Config::parse_str(text).unwrap();
         assert_eq!(cfg.bus_capacity, 512);
@@ -570,6 +613,17 @@ mod tests {
             cfg.gnss.gpsd_endpoint,
             "127.0.0.1:3947".parse::<SocketAddr>().unwrap()
         );
+        assert_eq!(
+            cfg.gnss.defaults.min_fix_mode,
+            nexus_profile_store::FixModeOnDisk::Fix3D
+        );
+        assert_eq!(cfg.gnss.defaults.min_satellites, 6);
+        assert_eq!(cfg.gnss.defaults.max_horizontal_error_m, Some(25.0));
+        assert!(cfg.gnss.defaults.strict_quality);
+        assert_eq!(cfg.gnss.defaults.max_update_hz, 5);
+        assert!(cfg.gnss.defaults.report_movement_only);
+        assert!((cfg.gnss.defaults.movement_threshold_m - 20.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.gnss.defaults.heartbeat_interval_s, 30);
     }
 
     #[test]
