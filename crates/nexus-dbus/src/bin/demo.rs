@@ -51,6 +51,7 @@ async fn main() {
         ops: nexus_dbus::NoopOps::arc(),
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
+        ethernet_auth_backend: "none".to_owned(),
     };
     let handle = match spawn_dbus_service(event_tx.subscribe(), store, config).await {
         Ok(h) => h,

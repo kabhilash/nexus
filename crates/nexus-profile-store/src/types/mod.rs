@@ -59,6 +59,49 @@ pub enum EapMethod {
     Fast,
 }
 
+impl EapMethod {
+    /// Stable wire label exposed via `fi.nexus.Profile.Ethernet.Dot1xEap`
+    /// (DD-006 §7.3) and `fi.nexus.Interface.StateChanged` `details`
+    /// (DD-006 §6.2 / §9). Source of truth for the string form;
+    /// callers that need the label must go through this method to
+    /// avoid drift between profile-side and lifecycle-side surfaces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EapMethod::Peap => "PEAP",
+            EapMethod::Ttls => "TTLS",
+            EapMethod::Tls => "TLS",
+            EapMethod::PwdMschapv2 => "PWD_MSCHAPV2",
+            EapMethod::Leap => "LEAP",
+            EapMethod::Fast => "FAST",
+        }
+    }
+}
+
+#[cfg(test)]
+mod eap_method_tests {
+    use super::EapMethod;
+
+    #[test]
+    fn as_str_covers_every_variant() {
+        // Every variant must produce a non-empty label so D-Bus
+        // properties (DD-006 §6.2 / §7.3) never surface "" by
+        // accident on a future enum extension.
+        for m in [
+            EapMethod::Peap,
+            EapMethod::Ttls,
+            EapMethod::Tls,
+            EapMethod::PwdMschapv2,
+            EapMethod::Leap,
+            EapMethod::Fast,
+        ] {
+            assert!(!m.as_str().is_empty(), "{m:?} produced empty label");
+        }
+        assert_eq!(EapMethod::Peap.as_str(), "PEAP");
+        assert_eq!(EapMethod::Tls.as_str(), "TLS");
+        assert_eq!(EapMethod::PwdMschapv2.as_str(), "PWD_MSCHAPV2");
+    }
+}
+
 /// On-disk form of [`Dot1xEapConfig`]. Credential fields are
 /// `EncryptedBlob`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -53,6 +53,21 @@ pub enum NexusEvent {
         ifindex: u32,
         state: AuthState,
     },
+    /// Lifecycle-state transition for an Ethernet interface. Emitted
+    /// by the Ethernet Backend on every `EthInterfaceState` change so
+    /// the D-Bus layer can mirror DD-006 §6.2 `fi.nexus.Ethernet`
+    /// properties (`State`, `EapMethod`, `AuthFailureReason`).
+    /// `state` uses the labels in DD-006 §6.2 (`waiting_carrier` /
+    /// `link_ready` / `authenticating` / `authenticated` /
+    /// `auth_failed`). `eap_method` is `Some` when the interface's
+    /// profile has 802.1X enabled. `auth_failure_reason` is `Some`
+    /// only when `state == "auth_failed"`.
+    EthLifecycleStateChanged {
+        ifindex: u32,
+        state: String,
+        eap_method: Option<String>,
+        auth_failure_reason: Option<String>,
+    },
     /// Carrier up AND authenticated (if required).
     EthLinkReady {
         ifindex: u32,
@@ -60,6 +75,15 @@ pub enum NexusEvent {
     /// Carrier dropped or authentication ended.
     EthLinkLost {
         ifindex: u32,
+    },
+    /// `NameOwnerChanged` transition on the wired-auth backend's
+    /// D-Bus name (e.g., `fi.w1.wpa_supplicant1`). Emitted by the
+    /// auth-backend implementation. The Ethernet Backend uses this
+    /// to fail any in-flight auth (DD-002 §9.2) and to refresh the
+    /// `nexus_eth_auth_backend_available` gauge (§9.5).
+    EthAuthBackendOwnerChanged {
+        backend: String,
+        present: bool,
     },
 
     // --- Wi-Fi Backend ---

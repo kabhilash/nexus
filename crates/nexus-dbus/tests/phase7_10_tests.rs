@@ -120,6 +120,7 @@ async fn spawn(
         ops: NoopOps::arc(),
         rate_limits,
         enabled_features: nexus_dbus::EnabledFeatures::default(),
+        ethernet_auth_backend: "none".to_owned(),
     };
     let h = spawn_dbus_service(event_tx.subscribe(), st, cfg)
         .await
@@ -310,6 +311,7 @@ async fn rotate_master_key_denied_returns_auth_failed() {
         ops: NoopOps::arc(),
         rate_limits: RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
+        ethernet_auth_backend: "none".to_owned(),
     };
     let handle = spawn_dbus_service(event_tx.subscribe(), st, cfg)
         .await
@@ -529,6 +531,7 @@ async fn spawn_with_features(
         ops: NoopOps::arc(),
         rate_limits: RateLimits::default(),
         enabled_features: enabled,
+        ethernet_auth_backend: "none".to_owned(),
     };
     let h = spawn_dbus_service(event_tx.subscribe(), st, cfg)
         .await
@@ -798,6 +801,7 @@ async fn spawn_with_ops(
             ..RateLimits::default()
         },
         enabled_features: nexus_dbus::EnabledFeatures::default(),
+        ethernet_auth_backend: "none".to_owned(),
     };
     spawn_dbus_service(event_tx.subscribe(), st, cfg)
         .await

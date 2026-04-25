@@ -1,6 +1,6 @@
 [package]
 name = "nexus-ethernet"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = ["auth-wpa_supplicant"]
 # Build the wpa_supplicant-backed WiredAuthBackend (default).
-auth-wpa_supplicant = ["dep:zbus"]
+auth-wpa_supplicant = ["dep:zbus", "dep:futures-util"]
 # Build the experimental ead-backed WiredAuthBackend. Gated so
 # integrators targeting minimal footprints can drop the zbus + ead
 # dependencies entirely.
@@ -22,6 +22,7 @@ nexus-core = { path = "../nexus-core" }
 nexus-profile-store = { path = "../nexus-profile-store" }
 
 async-trait = { workspace = true }
+futures-util = { version = "0.3", optional = true }
 metrics = { workspace = true }
 thiserror = { workspace = true }
 ulid = { workspace = true }

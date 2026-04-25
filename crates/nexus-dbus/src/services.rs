@@ -98,6 +98,10 @@ pub struct Services {
     /// Which per-technology backends are enabled (DD-006 §11.1
     /// `FeatureDisabled`).
     pub enabled: EnabledFeatures,
+    /// Configured wired-auth backend label (DD-006 §6.2 `AuthBackend`):
+    /// `"wpa_supplicant"` / `"ead"` / `"none"`. Stamped onto every
+    /// Ethernet interface's cache on `InterfaceDiscovered`.
+    pub ethernet_auth_backend: String,
 }
 
 impl Services {
@@ -108,6 +112,7 @@ impl Services {
         ops: Arc<dyn BackendOps>,
         rate_limiter: Arc<RateLimiter>,
         enabled: EnabledFeatures,
+        ethernet_auth_backend: String,
     ) -> Self {
         Self {
             state,
@@ -117,6 +122,7 @@ impl Services {
             batcher: Arc::new(PropertyBatcher::new()),
             rate_limiter,
             enabled,
+            ethernet_auth_backend,
         }
     }
 }

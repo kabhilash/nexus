@@ -78,6 +78,24 @@ struct Harness {
 
 impl Harness {
     async fn start(config: EthernetConfig, with_dot1x_profile: Option<(u32, &str)>) -> Self {
+        Self::start_inner(config, with_dot1x_profile, true).await
+    }
+
+    /// Same as [`start`] but the backend is constructed without a
+    /// `WiredAuthBackend` — exercises the DD-002 §9.1
+    /// `AuthBackendUnavailable` path.
+    async fn start_no_auth_backend(
+        config: EthernetConfig,
+        with_dot1x_profile: Option<(u32, &str)>,
+    ) -> Self {
+        Self::start_inner(config, with_dot1x_profile, false).await
+    }
+
+    async fn start_inner(
+        config: EthernetConfig,
+        with_dot1x_profile: Option<(u32, &str)>,
+        with_auth_backend: bool,
+    ) -> Self {
         let (tx, rx) = broadcast::channel(256);
         let shutdown = CancellationToken::new();
 
@@ -114,9 +132,16 @@ impl Harness {
             store.put_ethernet(&profile).await.unwrap();
         }
 
-        let mock = MockAuthBackend::new(tx.clone());
-        let scenarios = mock.scenarios();
-        let auth_backend: Option<Box<dyn WiredAuthBackend>> = Some(Box::new(mock));
+        let (auth_backend, scenarios) = if with_auth_backend {
+            let mock = MockAuthBackend::new(tx.clone());
+            let scenarios = mock.scenarios();
+            (
+                Some(Box::new(mock) as Box<dyn WiredAuthBackend>),
+                scenarios,
+            )
+        } else {
+            (None, nexus_ethernet::auth::mock::MockScenarios::default())
+        };
 
         let backend = EthernetBackend::new(tx.clone(), store, auth_backend, config);
         let handle = tokio::spawn(backend.run(shutdown.clone()));
@@ -441,6 +466,272 @@ async fn missing_profile_defaults_to_no_auth() {
     assert!(ready.is_some());
     let profile = default_ethernet_profile("eth7");
     assert_eq!(profile.interface.name, "eth7");
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn lifecycle_event_emitted_for_plain_ethernet_carrier_cycle() {
+    // Covers the DD-006 §6.2 `State` property surface for a non-802.1X
+    // interface: discovery → waiting_carrier, carrier-up → link_ready,
+    // carrier-down → waiting_carrier. Each transition must produce
+    // exactly one `EthLifecycleStateChanged` carrying the canonical
+    // label and `eap_method = None`.
+    let mut h = Harness::start(EthernetConfig::default(), None).await;
+    h.tx.send(NexusEvent::InterfaceDiscovered(ethernet_info(
+        2, "eth0", false,
+    )))
+    .unwrap();
+
+    let waiting = h
+        .wait_for(|e| {
+            matches!(e, NexusEvent::EthLifecycleStateChanged {
+                ifindex: 2,
+                state, eap_method, auth_failure_reason,
+            } if state == "waiting_carrier"
+                && eap_method.is_none()
+                && auth_failure_reason.is_none())
+        })
+        .await;
+    assert!(waiting.is_some(), "expected waiting_carrier lifecycle event");
+
+    h.tx.send(NexusEvent::CarrierChanged {
+        ifindex: 2,
+        up: true,
+    })
+    .unwrap();
+
+    let ready = h
+        .wait_for(|e| {
+            matches!(e, NexusEvent::EthLifecycleStateChanged {
+                ifindex: 2,
+                state, eap_method, ..
+            } if state == "link_ready" && eap_method.is_none())
+        })
+        .await;
+    assert!(ready.is_some(), "expected link_ready lifecycle event");
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn lifecycle_event_carries_eap_method_and_reason_on_auth_failure() {
+    // Covers DD-006 §6.2 `EapMethod` + `AuthFailureReason`. When a
+    // 802.1X-configured interface fails auth, the lifecycle event
+    // surfaces both: `state == "auth_failed"`, `eap_method == "PEAP"`,
+    // `auth_failure_reason == "bad_credentials"`.
+    let config = EthernetConfig::default().with_retry(
+        Duration::from_millis(20),
+        Duration::from_millis(200),
+        2.0,
+        0,
+    );
+    let mut h = Harness::start(config, Some((11, "eth0"))).await;
+    h.scenarios.set(
+        11,
+        MockScenario::ImmediateFailure(AuthFailureReason::BadCredentials),
+    );
+
+    h.tx.send(NexusEvent::InterfaceDiscovered(ethernet_info(
+        11, "eth0", true,
+    )))
+    .unwrap();
+
+    let failed = h
+        .wait_for(|e| {
+            matches!(e, NexusEvent::EthLifecycleStateChanged {
+                ifindex: 11,
+                state, eap_method, auth_failure_reason,
+            } if state == "auth_failed"
+                && eap_method.as_deref() == Some("PEAP")
+                && auth_failure_reason.as_deref() == Some("bad_credentials"))
+        })
+        .await;
+    assert!(
+        failed.is_some(),
+        "expected auth_failed lifecycle event with eap_method + reason",
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn dot1x_max_attempts_caps_retries() {
+    // DD-002 §8.1 `auth_max_attempts`: with `max_attempts = 2`, the
+    // backend should make exactly two `Authenticating` attempts on a
+    // retriable failure (Timeout) before parking the entry. This
+    // exercises `AuthContext.failed_attempts` carrying across the
+    // `AuthFailed → Authenticating` retry transition (audit #11).
+    let config = EthernetConfig::default().with_retry(
+        Duration::from_millis(20),
+        Duration::from_millis(40),
+        2.0,
+        2,
+    );
+    let mut h = Harness::start(config, Some((21, "eth0"))).await;
+    h.scenarios
+        .set(21, MockScenario::ImmediateFailure(AuthFailureReason::Timeout));
+
+    h.tx.send(NexusEvent::InterfaceDiscovered(ethernet_info(
+        21, "eth0", true,
+    )))
+    .unwrap();
+
+    // Settle past several backoff windows (max=40ms ⇒ ≤80ms total
+    // for the two scheduled attempts; pad heavily to be tolerant of
+    // CI scheduling).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let mut authenticating = 0u32;
+    while let Ok(e) = h.rx.try_recv() {
+        if matches!(
+            e,
+            NexusEvent::EthAuthStateChanged {
+                ifindex: 21,
+                state: nexus_core::AuthState::Authenticating,
+            }
+        ) {
+            authenticating += 1;
+        }
+    }
+    assert_eq!(
+        authenticating, 2,
+        "expected exactly 2 auth attempts under max_attempts=2 (saw {authenticating})",
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn auth_unavailable_parks_in_auth_failed_without_propagating_error() {
+    // DD-002 §9.1: 802.1X profile present but no auth backend
+    // configured at startup → park entry in `AuthFailed` and continue
+    // running (audit #7). The lifecycle event must surface
+    // `state = "auth_failed"`, `eap_method = "PEAP"` (from the stored
+    // profile), and `auth_failure_reason = "server_unreachable"`.
+    let mut h = Harness::start_no_auth_backend(
+        EthernetConfig::default(),
+        Some((23, "eth0")),
+    )
+    .await;
+
+    h.tx.send(NexusEvent::InterfaceDiscovered(ethernet_info(
+        23, "eth0", true,
+    )))
+    .unwrap();
+
+    let parked = h
+        .wait_for(|e| {
+            matches!(e, NexusEvent::EthLifecycleStateChanged {
+                ifindex: 23,
+                state, eap_method, auth_failure_reason,
+            } if state == "auth_failed"
+                && eap_method.as_deref() == Some("PEAP")
+                && auth_failure_reason.as_deref() == Some("server_unreachable"))
+        })
+        .await;
+    assert!(
+        parked.is_some(),
+        "expected lifecycle event with auth_failed + PEAP + server_unreachable",
+    );
+
+    // The handler did not propagate `Err`; the backend's run loop is
+    // still alive. Sending another event and observing it land
+    // demonstrates this without coupling to log output.
+    h.tx.send(NexusEvent::CarrierChanged {
+        ifindex: 23,
+        up: false,
+    })
+    .unwrap();
+    let waiting = h
+        .wait_for(|e| {
+            matches!(e, NexusEvent::EthLifecycleStateChanged {
+                ifindex: 23,
+                state, ..
+            } if state == "waiting_carrier")
+        })
+        .await;
+    assert!(waiting.is_some(), "backend kept running after AuthUnavailable");
+
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn fail_fast_emits_operator_notification() {
+    // DD-002 §9.6: a fail-fast `AuthState::Failed` (BadCredentials,
+    // CertificateRejected) emits a `NexusEvent::OperatorNotification`
+    // so the D-Bus layer can surface a `Manager.NotificationEvent`
+    // (audit #9). The payload carries `ifname` and `reason`.
+    let mut h = Harness::start(EthernetConfig::default(), Some((25, "eth0"))).await;
+    h.scenarios.set(
+        25,
+        MockScenario::ImmediateFailure(AuthFailureReason::CertificateRejected),
+    );
+    h.tx.send(NexusEvent::InterfaceDiscovered(ethernet_info(
+        25, "eth0", true,
+    )))
+    .unwrap();
+
+    let notif = h
+        .wait_for(|e| {
+            matches!(e, NexusEvent::OperatorNotification { kind, data }
+                if kind == "eth_credentials_invalid"
+                    && matches!(data.get("ifname"), Some(nexus_core::NotificationValue::String(s)) if s == "eth0")
+                    && matches!(data.get("reason"), Some(nexus_core::NotificationValue::String(s)) if s == "certificate_rejected"))
+        })
+        .await;
+    assert!(
+        notif.is_some(),
+        "expected OperatorNotification on fail-fast",
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn auth_backend_owner_change_fails_in_flight_auth() {
+    // DD-002 §9.2: `NameOwnerChanged` going down on the auth daemon
+    // transitions every `Authenticating` / `Authenticated` interface
+    // to `AuthFailed { ServerUnreachable }` and emits `EthLinkLost`
+    // for any previously-ready entry (audit #8).
+    let mut h = Harness::start(EthernetConfig::default(), Some((27, "eth0"))).await;
+    h.scenarios.set(27, MockScenario::ImmediateSuccess);
+    h.tx.send(NexusEvent::InterfaceDiscovered(ethernet_info(
+        27, "eth0", true,
+    )))
+    .unwrap();
+
+    // Wait for the interface to become Authenticated.
+    let ready = h
+        .wait_for(|e| matches!(e, NexusEvent::EthLinkReady { ifindex: 27 }))
+        .await;
+    assert!(ready.is_some(), "precondition: interface must reach LinkReady");
+
+    // Synthesize the watcher's "daemon went away" event.
+    h.tx.send(NexusEvent::EthAuthBackendOwnerChanged {
+        backend: "wpa_supplicant".to_owned(),
+        present: false,
+    })
+    .unwrap();
+
+    // Lifecycle event fires before LinkLost (see on_auth_backend_owner_changed).
+    let parked = h
+        .wait_for(|e| {
+            matches!(e, NexusEvent::EthLifecycleStateChanged {
+                ifindex: 27,
+                state, auth_failure_reason, ..
+            } if state == "auth_failed"
+                && auth_failure_reason.as_deref() == Some("server_unreachable"))
+        })
+        .await;
+    assert!(
+        parked.is_some(),
+        "expected lifecycle event with auth_failed + server_unreachable",
+    );
+
+    // The previously-ready entry must also emit EthLinkLost so
+    // systemd-networkd can tear down IP.
+    let lost = h
+        .wait_for(|e| matches!(e, NexusEvent::EthLinkLost { ifindex: 27 }))
+        .await;
+    assert!(lost.is_some(), "expected EthLinkLost after backend disappearance");
+
     h.shutdown().await;
 }
 

@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use nexus_core::InterfaceInfo;
+use nexus_core::{AuthFailureReason, InterfaceInfo};
 use nexus_profile_store::EthernetProfile;
 
 /// State machine per DD-002 §3.1. The `AuthFailed` variant carries
@@ -22,7 +22,11 @@ pub enum EthInterfaceState {
     /// Carrier up and authenticated; LinkReady was emitted.
     Authenticated,
     /// Carrier up but authentication failed. Waiting to retry.
-    AuthFailed { retry_after: Instant, attempts: u32 },
+    AuthFailed {
+        retry_after: Instant,
+        attempts: u32,
+        reason: AuthFailureReason,
+    },
     /// Interface removed.
     Gone,
 }
@@ -99,6 +103,7 @@ mod tests {
             EthInterfaceState::AuthFailed {
                 retry_after: Instant::now() + Duration::from_secs(1),
                 attempts: 1,
+                reason: AuthFailureReason::Timeout,
             }
             .label(),
             "auth_failed",
@@ -116,7 +121,8 @@ mod tests {
         assert!(
             !EthInterfaceState::AuthFailed {
                 retry_after: Instant::now(),
-                attempts: 1
+                attempts: 1,
+                reason: AuthFailureReason::Timeout,
             }
             .is_ready(),
         );

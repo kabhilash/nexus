@@ -62,6 +62,10 @@ pub struct DbusConfig {
     /// `FeatureDisabled`). Mutating methods on a disabled feature
     /// return `fi.nexus.Error.FeatureDisabled`.
     pub enabled_features: EnabledFeatures,
+    /// DD-006 §6.2 `fi.nexus.Ethernet.AuthBackend`. The string the
+    /// daemon stamps onto every Ethernet interface's cache; one of
+    /// `"wpa_supplicant"`, `"ead"`, `"none"`.
+    pub ethernet_auth_backend: String,
 }
 
 impl std::fmt::Debug for DbusConfig {
@@ -86,6 +90,7 @@ impl Default for DbusConfig {
             ops: crate::backend_ops::NoopOps::arc(),
             rate_limits: RateLimits::default(),
             enabled_features: EnabledFeatures::default(),
+            ethernet_auth_backend: "none".to_owned(),
         }
     }
 }
@@ -154,6 +159,7 @@ pub async fn spawn_dbus_service(
         Arc::clone(&config.ops),
         rate_limiter,
         config.enabled_features,
+        config.ethernet_auth_backend.clone(),
     ));
 
     let (registry_tx, registry_rx) = mpsc::channel::<ServiceCommand>(64);
@@ -390,11 +396,17 @@ async fn handle_event(
         NexusEvent::InterfaceDiscovered(info) => {
             let ifname = info.ifname.clone();
             let was_present = state.read().await.interfaces.contains_key(&ifname);
-            state
-                .write()
-                .await
-                .interfaces
-                .insert(ifname.clone(), InterfaceState::new(info));
+            {
+                let mut guard = state.write().await;
+                guard
+                    .interfaces
+                    .insert(ifname.clone(), InterfaceState::new(info));
+                if let Some(e) = guard.interfaces.get_mut(&ifname) {
+                    if let InterfaceKindData::Ethernet(c) = &mut e.kind_data {
+                        c.auth_backend = services.ethernet_auth_backend.clone();
+                    }
+                }
+            }
             if !was_present {
                 register_interface(connection, services, &ifname).await?;
             }
@@ -562,16 +574,39 @@ async fn handle_event(
                 }
             }
         }
-        NexusEvent::EthAuthStateChanged {
+        NexusEvent::EthLifecycleStateChanged {
             ifindex,
-            state: auth,
+            state: state_label,
+            eap_method,
+            auth_failure_reason,
         } => {
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
-                if let Some(e) = state.write().await.interfaces.get_mut(&ifname) {
-                    if let InterfaceKindData::Ethernet(c) = &mut e.kind_data {
-                        c.state = format!("{auth:?}").to_ascii_lowercase();
+                let managed_profile = {
+                    let mut guard = state.write().await;
+                    let mp = guard.interfaces.get(&ifname).and_then(|e| e.managed_profile.clone());
+                    if let Some(e) = guard.interfaces.get_mut(&ifname) {
+                        if let InterfaceKindData::Ethernet(c) = &mut e.kind_data {
+                            c.state = state_label.clone();
+                            c.eap_method = eap_method.clone().unwrap_or_default();
+                            c.auth_failure_reason =
+                                auth_failure_reason.clone().unwrap_or_default();
+                        }
                     }
-                }
+                    mp
+                };
+                // DD-006 §6.2 / §9: ethernet has no
+                // technology-specific signals; lifecycle transitions
+                // surface through `fi.nexus.Interface.StateChanged`
+                // with `reason` / `eap_method` / `profile` in details.
+                emit_eth_state_changed(
+                    connection,
+                    &ifname,
+                    &state_label,
+                    eap_method.as_deref(),
+                    auth_failure_reason.as_deref(),
+                    managed_profile.as_deref(),
+                )
+                .await;
             }
         }
         NexusEvent::BtAdapterChanged {
@@ -605,6 +640,7 @@ async fn handle_event(
         }
         NexusEvent::OperatorNotification { kind, data } => {
             debug!(kind, data_len = data.len(), "operator notification");
+            emit_manager_notification_event(connection, &kind, &data).await;
         }
         _ => {}
     }
@@ -976,6 +1012,118 @@ fn kind_tag(k: &InterfaceKindData) -> &'static str {
         InterfaceKindData::Wifi(_) => "wifi",
         InterfaceKindData::Bluetooth(_) => "bluetooth",
         InterfaceKindData::Gnss(_) => "gnss",
+    }
+}
+
+/// Emit `fi.nexus.Manager.NotificationEvent(kind: s, data: a{sv})`
+/// (DD-006 §5.3). Translates a [`NotificationData`] payload to the
+/// D-Bus dict shape. Best-effort — a failure to emit is logged at
+/// debug.
+async fn emit_manager_notification_event(
+    connection: &zbus::Connection,
+    kind: &str,
+    data: &nexus_core::NotificationData,
+) {
+    use std::collections::HashMap;
+    use zbus::zvariant::{OwnedValue, Value};
+
+    let mut payload: HashMap<String, OwnedValue> = HashMap::new();
+    for (k, v) in data.iter() {
+        let value = match v {
+            nexus_core::NotificationValue::String(s) => OwnedValue::try_from(Value::new(s.clone())),
+            nexus_core::NotificationValue::U32(n) => OwnedValue::try_from(Value::new(*n)),
+            nexus_core::NotificationValue::U64(n) => OwnedValue::try_from(Value::new(*n)),
+            nexus_core::NotificationValue::Bool(b) => OwnedValue::try_from(Value::new(*b)),
+            nexus_core::NotificationValue::ObjectPath(p) => match ObjectPath::try_from(p.clone()) {
+                Ok(op) => OwnedValue::try_from(Value::ObjectPath(op)),
+                Err(_) => continue,
+            },
+        };
+        if let Ok(v) = value {
+            payload.insert(k.clone(), v);
+        }
+    }
+    let Ok(manager_path) = ObjectPath::try_from(MANAGER_PATH) else {
+        return;
+    };
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            manager_path,
+            "fi.nexus.Manager",
+            "NotificationEvent",
+            &(kind, payload),
+        )
+        .await
+    {
+        tracing::debug!(error = ?e, kind, "Manager.NotificationEvent emit failed");
+    }
+}
+
+/// Emit `fi.nexus.Interface.StateChanged(new_state: s, details: a{sv})`
+/// for an Ethernet interface (DD-006 §6.2 / §9). Best-effort — a
+/// failure to emit is logged at debug.
+async fn emit_eth_state_changed(
+    connection: &zbus::Connection,
+    ifname: &str,
+    state_label: &str,
+    eap_method: Option<&str>,
+    auth_failure_reason: Option<&str>,
+    managed_profile: Option<&str>,
+) {
+    use std::collections::HashMap;
+    use zbus::zvariant::{OwnedValue, Value};
+
+    let path = interface_path(ifname);
+    let Ok(obj_path) = ObjectPath::try_from(path.clone()) else {
+        return;
+    };
+    let mut details: HashMap<String, OwnedValue> = HashMap::new();
+    if let Some(reason) = auth_failure_reason {
+        if !reason.is_empty() {
+            if let Ok(v) = OwnedValue::try_from(Value::new(reason.to_owned())) {
+                details.insert("reason".into(), v);
+            }
+        }
+    }
+    // DD-006 §9 details table: `eap_method` is set when the
+    // interface enters `Authenticating`. For other auth-relevant
+    // states the cached property carries it; we keep the signal
+    // payload focused on the authoritative table.
+    if state_label == "authenticating" {
+        if let Some(eap) = eap_method {
+            if !eap.is_empty() {
+                if let Ok(v) = OwnedValue::try_from(Value::new(eap.to_owned())) {
+                    details.insert("eap_method".into(), v);
+                }
+            }
+        }
+    }
+    if let Some(profile) = managed_profile {
+        if profile != "/" && !profile.is_empty() {
+            if let Ok(p) = ObjectPath::try_from(profile.to_owned()) {
+                if let Ok(v) = OwnedValue::try_from(Value::ObjectPath(p)) {
+                    details.insert("profile".into(), v);
+                }
+            }
+        }
+    }
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            obj_path,
+            "fi.nexus.Interface",
+            "StateChanged",
+            &(state_label, details),
+        )
+        .await
+    {
+        tracing::debug!(
+            error = ?e,
+            ifname,
+            state = state_label,
+            "fi.nexus.Interface.StateChanged emit failed",
+        );
     }
 }
 

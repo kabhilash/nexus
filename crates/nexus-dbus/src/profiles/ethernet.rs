@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nexus_profile_store::{EapMethod, EthernetProfile};
+use nexus_profile_store::EthernetProfile;
 use ulid::Ulid;
 
 use crate::services::Services;
@@ -54,7 +54,7 @@ impl EthernetProfileIface {
         self.with_profile(String::new(), |p| {
             p.dot1x
                 .as_ref()
-                .map(|d| eap_method_label(d.eap.eap).to_owned())
+                .map(|d| d.eap.eap.as_str().to_owned())
                 .unwrap_or_default()
         })
         .await
@@ -78,28 +78,9 @@ impl EthernetProfileIface {
     }
 }
 
-fn eap_method_label(m: EapMethod) -> &'static str {
-    use EapMethod::*;
-    match m {
-        Peap => "PEAP",
-        Ttls => "TTLS",
-        Tls => "TLS",
-        PwdMschapv2 => "PWD_MSCHAPV2",
-        Leap => "LEAP",
-        Fast => "FAST",
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nexus_profile_store::{Dot1xEapConfig, Dot1xSettings, EapMethod};
-
-    #[test]
-    fn eap_method_labels() {
-        assert_eq!(eap_method_label(EapMethod::Tls), "TLS");
-        assert_eq!(eap_method_label(EapMethod::Peap), "PEAP");
-    }
 
     #[test]
     fn dot1x_settings_build() {

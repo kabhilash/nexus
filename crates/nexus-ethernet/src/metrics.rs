@@ -25,6 +25,10 @@ pub mod auth_outcome {
     pub const CERT_REJECTED: &str = "cert_rejected";
     pub const TIMEOUT: &str = "timeout";
     pub const OTHER: &str = "other";
+    /// 802.1X required by the profile but no auth backend was
+    /// configured at startup. Distinct from `OTHER` so dashboards
+    /// don't conflate operational gaps with real auth failures.
+    pub const BACKEND_UNAVAILABLE: &str = "backend_unavailable";
 }
 
 pub fn register() {

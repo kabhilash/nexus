@@ -5,7 +5,7 @@ use std::future::pending;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nexus_core::{AuthState, InterfaceKind, NexusEvent};
+use nexus_core::{AuthFailureReason, AuthState, InterfaceKind, NexusEvent, NotificationData};
 use nexus_profile_store::ProfileStore;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +25,13 @@ struct AuthContext {
     /// When the current (or most recent) authentication attempt
     /// started — used for the `auth_duration_seconds` histogram.
     started_at: Option<Instant>,
+    /// Monotonically increasing count of `AuthState::Failed`
+    /// arrivals since the last `Authenticated`. Drives
+    /// `RetryPolicy::next_attempt`. Survives the
+    /// `AuthFailed → Authenticating` retry transition (the
+    /// `EthInterfaceState` does not, by design — see DD-002 §3.1).
+    /// Reset to 0 on `Authenticated`.
+    failed_attempts: u32,
 }
 
 /// The Ethernet Backend. Owned by the spawned task; the handle the
@@ -117,6 +124,8 @@ impl EthernetBackend {
                     .insert(ifindex, EthInterfaceEntry::new(info, profile));
                 self.auth_ctx.insert(ifindex, AuthContext::default());
 
+                self.emit_lifecycle(ifindex);
+
                 if had_carrier {
                     self.on_carrier_up(ifindex).await?;
                 }
@@ -145,9 +154,61 @@ impl EthernetBackend {
             NexusEvent::EthAuthStateChanged { ifindex, state } => {
                 self.on_auth_state_changed(ifindex, state).await?;
             }
+            NexusEvent::EthAuthBackendOwnerChanged { backend, present } => {
+                self.on_auth_backend_owner_changed(&backend, present).await;
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// DD-002 §§9.1, 9.2: react to wpa_supplicant / ead D-Bus name
+    /// transitions. On disappearance, every `Authenticating` /
+    /// `Authenticated` interface drops to
+    /// `AuthFailed { ServerUnreachable }` and emits `EthLinkLost` if
+    /// it had been ready. On reappearance, the existing retry timer
+    /// picks up the parked entries.
+    async fn on_auth_backend_owner_changed(&mut self, backend: &str, present: bool) {
+        m::set_auth_backend_available(backend, present);
+        if present {
+            return;
+        }
+        let now = Instant::now();
+        let affected: Vec<u32> = self
+            .interfaces
+            .iter()
+            .filter_map(|(ifindex, e)| match e.state {
+                EthInterfaceState::Authenticating | EthInterfaceState::Authenticated => {
+                    Some(*ifindex)
+                }
+                _ => None,
+            })
+            .collect();
+        for ifindex in affected {
+            let Some(entry) = self.interfaces.get_mut(&ifindex) else {
+                continue;
+            };
+            let was_ready = entry.state.is_ready();
+            let ifname = entry.info.ifname.clone();
+            let attempts = self
+                .auth_ctx
+                .get(&ifindex)
+                .map(|c| c.failed_attempts)
+                .unwrap_or(0);
+            let reason = AuthFailureReason::ServerUnreachable;
+            let next = self.config.retry.next_attempt(&reason, attempts, now);
+            let retry_after = next.unwrap_or(now + Duration::from_secs(3600));
+            entry.state = EthInterfaceState::AuthFailed {
+                retry_after,
+                attempts,
+                reason,
+            };
+            self.emit_lifecycle(ifindex);
+            if was_ready {
+                m::record_link_lost(&ifname, m::link_lost_reason::AUTH_FAILURE);
+                let _ = self.event_tx.send(NexusEvent::EthLinkLost { ifindex });
+            }
+        }
     }
 
     async fn on_carrier_up(&mut self, ifindex: u32) -> Result<()> {
@@ -182,6 +243,7 @@ impl EthernetBackend {
                     entry.state = EthInterfaceState::AuthFailed {
                         retry_after: Instant::now() + Duration::from_secs(60),
                         attempts: 0,
+                        reason: AuthFailureReason::ServerUnreachable,
                     };
                     Action::AuthUnavailable {
                         ifname: entry.info.ifname.clone(),
@@ -194,6 +256,8 @@ impl EthernetBackend {
                 }
             }
         };
+
+        self.emit_lifecycle(ifindex);
 
         match action {
             Action::NoAuth { ifname } => {
@@ -214,12 +278,17 @@ impl EthernetBackend {
                 }
             }
             Action::AuthUnavailable { ifname } => {
+                // DD-002 §9.1: 802.1X required but no backend up.
+                // Park the entry in `AuthFailed { ServerUnreachable }`
+                // (already done above) and emit a distinct metric so
+                // dashboards can distinguish "no backend" from real
+                // auth failures. Not an event-handler error — the
+                // lifecycle is well-defined; the loop continues.
                 tracing::error!(
                     ifname,
-                    "802.1X profile on interface but no auth backend available"
+                    "802.1X profile requires auth but no backend is configured; parked in auth_failed",
                 );
-                m::record_auth_attempt(&ifname, m::auth_outcome::OTHER);
-                return Err(EthernetError::AuthBackendUnavailable { ifname });
+                m::record_auth_attempt(&ifname, m::auth_outcome::BACKEND_UNAVAILABLE);
             }
         }
         Ok(())
@@ -235,6 +304,8 @@ impl EthernetBackend {
             entry.state = EthInterfaceState::WaitingForCarrier;
             (ready, entry.info.ifname.clone())
         };
+
+        self.emit_lifecycle(ifindex);
 
         if let Some(auth) = self.auth_backend.as_mut() {
             let _ = auth.detach(ifindex).await;
@@ -252,56 +323,81 @@ impl EthernetBackend {
             return Ok(());
         };
         let ifname = entry.info.ifname.clone();
+        let was_ready = entry.state.is_ready();
 
         match state {
             AuthState::Authenticated => {
                 entry.state = EthInterfaceState::Authenticated;
                 if let Some(ctx) = self.auth_ctx.get_mut(&ifindex) {
+                    ctx.failed_attempts = 0;
                     if let Some(start) = ctx.started_at.take() {
                         m::record_auth_duration(&ifname, start.elapsed().as_secs_f64());
                     }
                 }
+                self.emit_lifecycle(ifindex);
                 m::record_auth_attempt(&ifname, m::auth_outcome::SUCCESS);
                 m::record_link_ready(&ifname);
                 let _ = self.event_tx.send(NexusEvent::EthLinkReady { ifindex });
             }
             AuthState::Failed { reason } => {
-                let attempts = match &entry.state {
-                    EthInterfaceState::AuthFailed { attempts, .. } => attempts + 1,
-                    _ => 1,
-                };
+                let ctx = self.auth_ctx.entry(ifindex).or_default();
+                ctx.failed_attempts = ctx.failed_attempts.saturating_add(1);
+                let attempts = ctx.failed_attempts;
+                let started_at = ctx.started_at.take();
+
                 let now = Instant::now();
                 let next = self.config.retry.next_attempt(&reason, attempts, now);
                 let retry_after = next.unwrap_or(now + Duration::from_secs(3600));
-                entry.state = EthInterfaceState::AuthFailed {
-                    retry_after,
-                    attempts,
-                };
+                let outcome = m::outcome_for(&reason);
+                let retriable = crate::retry::is_retriable(&reason);
+                let reason_label = failure_reason_label(&reason).to_owned();
 
-                if let Some(ctx) = self.auth_ctx.get_mut(&ifindex) {
-                    if let Some(start) = ctx.started_at.take() {
-                        m::record_auth_duration(&ifname, start.elapsed().as_secs_f64());
-                    }
+                if let Some(e) = self.interfaces.get_mut(&ifindex) {
+                    e.state = EthInterfaceState::AuthFailed {
+                        retry_after,
+                        attempts,
+                        reason,
+                    };
                 }
 
-                m::record_auth_attempt(&ifname, m::outcome_for(&reason));
+                if let Some(start) = started_at {
+                    m::record_auth_duration(&ifname, start.elapsed().as_secs_f64());
+                }
+
+                self.emit_lifecycle(ifindex);
+
+                m::record_auth_attempt(&ifname, outcome);
                 if next.is_some() && attempts > 1 {
                     m::record_auth_retry(&ifname);
                 }
 
-                if !crate::retry::is_retriable(&reason) {
-                    // Fail-fast: surface via ProfileCorrupt so the
-                    // operator notices. DD-002 §9.3 says these don't
-                    // loop.
+                if !retriable {
+                    // DD-002 §9.3 fail-fast: do not retry until the
+                    // operator fixes the profile. `handle_retries_due`
+                    // also re-checks `is_retriable` so the parked
+                    // entry is never re-armed.
                     tracing::error!(
                         ifname,
-                        ?reason,
                         "802.1X fail-fast; profile needs operator attention",
                     );
+                    // DD-002 §9.6: surface to the operator via
+                    // `fi.nexus.Manager.NotificationEvent`. Profile-
+                    // store `credentials_invalid` is not yet wired
+                    // for ethernet (the on-disk schema lacks the
+                    // field today; tracked alongside DD-007).
+                    let mut data = NotificationData::default();
+                    data.insert("ifname", ifname.clone());
+                    data.insert("reason", reason_label.clone());
+                    let _ = self.event_tx.send(NexusEvent::OperatorNotification {
+                        kind: "eth_credentials_invalid".to_owned(),
+                        data,
+                    });
                 }
 
-                // If we were ready before, emit LinkLost.
-                m::record_link_lost(&ifname, m::link_lost_reason::AUTH_FAILURE);
+                if was_ready {
+                    m::record_link_lost(&ifname, m::link_lost_reason::AUTH_FAILURE);
+                    let _ = self.event_tx.send(NexusEvent::EthLinkLost { ifindex });
+                }
             }
             AuthState::Authenticating | AuthState::Idle => {
                 // Intermediate — no lifecycle transition.
@@ -318,7 +414,11 @@ impl EthernetBackend {
         self.interfaces
             .values()
             .filter_map(|e| match &e.state {
-                EthInterfaceState::AuthFailed { retry_after, .. } => Some(*retry_after),
+                EthInterfaceState::AuthFailed {
+                    retry_after,
+                    reason,
+                    ..
+                } if crate::retry::is_retriable(reason) => Some(*retry_after),
                 _ => None,
             })
             .min()
@@ -330,9 +430,11 @@ impl EthernetBackend {
             .interfaces
             .iter()
             .filter_map(|(ifindex, entry)| match &entry.state {
-                EthInterfaceState::AuthFailed { retry_after, .. } if *retry_after <= now => {
-                    Some(*ifindex)
-                }
+                EthInterfaceState::AuthFailed {
+                    retry_after,
+                    reason,
+                    ..
+                } if *retry_after <= now && crate::retry::is_retriable(reason) => Some(*ifindex),
                 _ => None,
             })
             .collect();
@@ -342,8 +444,6 @@ impl EthernetBackend {
                 Some(e) => e,
                 None => continue,
             };
-            // If the profile is fail-fast-retry-expired (retry_after
-            // was set to far-future), skip.
             let EthInterfaceState::AuthFailed { attempts, .. } = entry.state else {
                 continue;
             };
@@ -360,17 +460,20 @@ impl EthernetBackend {
             let ifname = entry.info.ifname.clone();
 
             // Only retry if we actually have an auth backend; the
-            // AuthUnavailable path hit this same arm with a far-
-            // future retry_after.
-            let auth = match self.auth_backend.as_mut() {
-                Some(a) => a,
-                None => continue,
-            };
+            // AuthUnavailable path parks the entry with the same
+            // `AuthFailed` shape and `is_retriable(ServerUnreachable)`
+            // is true, so we'd reach here on every tick until the
+            // backend reattaches.
+            if self.auth_backend.is_none() {
+                continue;
+            }
 
             if let Some(e) = self.interfaces.get_mut(&ifindex) {
                 e.state = EthInterfaceState::Authenticating;
             }
+            self.emit_lifecycle(ifindex);
             self.auth_ctx.entry(ifindex).or_default().started_at = Some(Instant::now());
+            let auth = self.auth_backend.as_mut().expect("checked above");
             if let Err(e) = auth.authenticate(ifindex, &eap_config).await {
                 tracing::warn!(
                     ifname,
@@ -408,7 +511,49 @@ impl EthernetBackend {
     fn ifname_hint(&self, ifindex: u32) -> Option<String> {
         self.interfaces.get(&ifindex).map(|e| e.info.ifname.clone())
     }
+
+    /// Emit `NexusEvent::EthLifecycleStateChanged` reflecting the
+    /// current `EthInterfaceState` for `ifindex`. Idempotent — callers
+    /// invoke it after every `entry.state = ...` assignment so the
+    /// D-Bus layer's `fi.nexus.Ethernet` cache stays in sync per
+    /// DD-006 §6.2.
+    fn emit_lifecycle(&self, ifindex: u32) {
+        let Some(entry) = self.interfaces.get(&ifindex) else {
+            return;
+        };
+        let state = entry.state.label().to_owned();
+        let eap_method = entry
+            .profile
+            .dot1x
+            .as_ref()
+            .filter(|d| d.enabled)
+            .map(|d| d.eap.eap.as_str().to_owned());
+        let auth_failure_reason = match &entry.state {
+            EthInterfaceState::AuthFailed { reason, .. } => {
+                Some(failure_reason_label(reason).to_owned())
+            }
+            _ => None,
+        };
+        let _ = self.event_tx.send(NexusEvent::EthLifecycleStateChanged {
+            ifindex,
+            state,
+            eap_method,
+            auth_failure_reason,
+        });
+    }
 }
+
+/// DD-006 §6.2 `AuthFailureReason` wire labels.
+fn failure_reason_label(reason: &AuthFailureReason) -> &'static str {
+    match reason {
+        AuthFailureReason::BadCredentials => "bad_credentials",
+        AuthFailureReason::ServerUnreachable => "server_unreachable",
+        AuthFailureReason::CertificateRejected => "certificate_rejected",
+        AuthFailureReason::Timeout => "timeout",
+        AuthFailureReason::Other(_) => "other",
+    }
+}
+
 
 async fn sleep_until_option(deadline: Option<Instant>) {
     match deadline {

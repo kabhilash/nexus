@@ -21,6 +21,16 @@ pub struct EthernetProfile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EthInterfaceSettings {
     pub name: String,
+    /// Surfaced via `fi.nexus.Profile.Ethernet.AutoConnect`
+    /// (DD-006 §7.3). **Currently a no-op for the Ethernet Backend
+    /// — DD-002 §3 has no `Connect()` method, so the carrier-up
+    /// path always proceeds to LinkReady regardless of this flag.**
+    /// Wi-Fi consults the analogous flag during scan-result
+    /// selection (`nexus-wifi/src/select.rs`); ethernet has no
+    /// equivalent gating point today. Callers that need
+    /// "registered but quiescent" semantics should set
+    /// `dot1x.enabled = true` with an unreachable RADIUS server, or
+    /// remove the profile entirely.
     pub auto_connect: bool,
 }
 

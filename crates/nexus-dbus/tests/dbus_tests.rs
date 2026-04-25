@@ -16,7 +16,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nexus_core::{InterfaceInfo, InterfaceKind, NexusEvent, OperState};
+use futures_util::StreamExt;
+use nexus_core::{
+    InterfaceInfo, InterfaceKind, NexusEvent, NotificationData, NotificationValue, OperState,
+};
 use nexus_dbus::{DbusConfig, spawn_dbus_service};
 use nexus_profile_store::{InMemoryKeySource, ProfileFileStore, ProfileStore};
 use tempfile::TempDir;
@@ -101,6 +104,7 @@ async fn spawn_service(bus: &Bus, bus_name: &str) -> nexus_dbus::DbusServiceHand
         ops: nexus_dbus::NoopOps::arc(),
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
+        ethernet_auth_backend: "none".to_owned(),
     };
     spawn_dbus_service(event_tx.subscribe(), store, config)
         .await
@@ -161,6 +165,7 @@ async fn interface_appears_in_managed_objects_after_event() {
         ops: nexus_dbus::NoopOps::arc(),
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
+        ethernet_auth_backend: "none".to_owned(),
     };
     let handle = spawn_dbus_service(event_tx.subscribe(), store, config)
         .await
@@ -290,6 +295,7 @@ async fn wifi_interface_properties_readable() {
             ops: nexus_dbus::NoopOps::arc(),
             rate_limits: nexus_dbus::RateLimits::default(),
             enabled_features: nexus_dbus::EnabledFeatures::default(),
+            ethernet_auth_backend: "none".to_owned(),
         },
     )
     .await
@@ -355,6 +361,7 @@ async fn bluetooth_interface_properties_readable() {
             ops: nexus_dbus::NoopOps::arc(),
             rate_limits: nexus_dbus::RateLimits::default(),
             enabled_features: nexus_dbus::EnabledFeatures::default(),
+            ethernet_auth_backend: "none".to_owned(),
         },
     )
     .await
@@ -424,6 +431,7 @@ async fn gnss_interface_properties_readable() {
             ops: nexus_dbus::NoopOps::arc(),
             rate_limits: nexus_dbus::RateLimits::default(),
             enabled_features: nexus_dbus::EnabledFeatures::default(),
+            ethernet_auth_backend: "none".to_owned(),
         },
     )
     .await
@@ -526,6 +534,7 @@ async fn wifi_profile_with_credentials_exposes_has_credentials() {
             ops: nexus_dbus::NoopOps::arc(),
             rate_limits: nexus_dbus::RateLimits::default(),
             enabled_features: nexus_dbus::EnabledFeatures::default(),
+            ethernet_auth_backend: "none".to_owned(),
         },
     )
     .await
@@ -553,5 +562,200 @@ async fn wifi_profile_with_credentials_exposes_has_credentials() {
 
     // Silence unused-binding warning on the seed id.
     let _ = id;
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn ethernet_lifecycle_emits_interface_state_changed_signal() {
+    // DD-006 §6.2 + §9: ethernet has no technology-specific signals;
+    // lifecycle transitions surface via
+    // `fi.nexus.Interface.StateChanged(new_state, details)` with
+    // `details["reason"]` on `auth_failed` and
+    // `details["eap_method"]` on `authenticating`.
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
+    let (_tmp, store) = start_store().await;
+    let config = DbusConfig {
+        bus_name: "fi.nexus1.test_eth_state_signal".into(),
+        address: Some(bus.addr.clone()),
+        use_session_bus: false,
+        version: "0.1.0-test".into(),
+        auth: nexus_dbus::always_allow(),
+        ops: nexus_dbus::NoopOps::arc(),
+        rate_limits: nexus_dbus::RateLimits::default(),
+        enabled_features: nexus_dbus::EnabledFeatures::default(),
+        ethernet_auth_backend: "wpa_supplicant".to_owned(),
+    };
+    let handle = spawn_dbus_service(event_tx.subscribe(), store, config)
+        .await
+        .unwrap();
+
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(eth_info("eth0", 7)))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let client = bus.connection().await;
+
+    // Subscribe BEFORE sending the lifecycle event so we don't race.
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("fi.nexus.Interface")
+        .unwrap()
+        .member("StateChanged")
+        .unwrap()
+        .path("/fi/nexus1/interface/eth0")
+        .unwrap()
+        .build();
+    let mut stream = zbus::MessageStream::for_match_rule(rule, &client, None)
+        .await
+        .expect("subscribe StateChanged");
+
+    // Drive the backend through an authenticating → auth_failed
+    // transition with a populated profile so eap_method + reason
+    // surface.
+    event_tx
+        .send(NexusEvent::EthLifecycleStateChanged {
+            ifindex: 7,
+            state: "authenticating".into(),
+            eap_method: Some("PEAP".into()),
+            auth_failure_reason: None,
+        })
+        .unwrap();
+    event_tx
+        .send(NexusEvent::EthLifecycleStateChanged {
+            ifindex: 7,
+            state: "auth_failed".into(),
+            eap_method: Some("PEAP".into()),
+            auth_failure_reason: Some("bad_credentials".into()),
+        })
+        .unwrap();
+
+    let mut authenticating: Option<HashMap<String, OwnedValue>> = None;
+    let mut auth_failed: Option<HashMap<String, OwnedValue>> = None;
+    let deadline = std::time::Instant::now() + Duration::from_millis(800);
+    while std::time::Instant::now() < deadline
+        && (authenticating.is_none() || auth_failed.is_none())
+    {
+        let remaining =
+            deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(1);
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                let body = msg.body();
+                if let Ok((new_state, details)) =
+                    body.deserialize::<(String, HashMap<String, OwnedValue>)>()
+                {
+                    match new_state.as_str() {
+                        "authenticating" => authenticating = Some(details),
+                        "auth_failed" => auth_failed = Some(details),
+                        _ => {}
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    let auth_details = authenticating.expect("StateChanged(authenticating) not received");
+    let eap = auth_details
+        .get("eap_method")
+        .expect("authenticating details must include eap_method");
+    let eap_str: &str = eap.downcast_ref().expect("eap_method is a string");
+    assert_eq!(eap_str, "PEAP");
+    assert!(
+        !auth_details.contains_key("reason"),
+        "authenticating must not carry reason",
+    );
+
+    let fail_details = auth_failed.expect("StateChanged(auth_failed) not received");
+    let reason = fail_details
+        .get("reason")
+        .expect("auth_failed details must include reason");
+    let reason_str: &str = reason.downcast_ref().expect("reason is a string");
+    assert_eq!(reason_str, "bad_credentials");
+    assert!(
+        !fail_details.contains_key("eap_method"),
+        "auth_failed details follow DD-006 §9 table; eap_method only on authenticating",
+    );
+
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn operator_notification_fires_manager_notification_event_signal() {
+    // DD-006 §5.3 / §9: a `NexusEvent::OperatorNotification` from any
+    // backend translates to `fi.nexus.Manager.NotificationEvent`
+    // (audit #9). Without this bridge, the gnss/eth/etc. notifications
+    // never reach operator UIs.
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
+    let (_tmp, store) = start_store().await;
+    let config = DbusConfig {
+        bus_name: "fi.nexus1.test_notif_signal".into(),
+        address: Some(bus.addr.clone()),
+        use_session_bus: false,
+        version: "0.1.0-test".into(),
+        auth: nexus_dbus::always_allow(),
+        ops: nexus_dbus::NoopOps::arc(),
+        rate_limits: nexus_dbus::RateLimits::default(),
+        enabled_features: nexus_dbus::EnabledFeatures::default(),
+        ethernet_auth_backend: "none".to_owned(),
+    };
+    let handle = spawn_dbus_service(event_tx.subscribe(), store, config)
+        .await
+        .unwrap();
+
+    let client = bus.connection().await;
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("fi.nexus.Manager")
+        .unwrap()
+        .member("NotificationEvent")
+        .unwrap()
+        .path("/fi/nexus1")
+        .unwrap()
+        .build();
+    let mut stream = zbus::MessageStream::for_match_rule(rule, &client, None)
+        .await
+        .expect("subscribe NotificationEvent");
+
+    let mut data = NotificationData::default();
+    data.insert("ifname", NotificationValue::String("eth0".into()));
+    data.insert(
+        "reason",
+        NotificationValue::String("certificate_rejected".into()),
+    );
+    event_tx
+        .send(NexusEvent::OperatorNotification {
+            kind: "eth_credentials_invalid".into(),
+            data,
+        })
+        .unwrap();
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("timed out waiting for NotificationEvent")
+        .expect("stream closed")
+        .expect("decode signal");
+    let body = msg.body();
+    let (kind, payload): (String, HashMap<String, OwnedValue>) =
+        body.deserialize().expect("decode args");
+    assert_eq!(kind, "eth_credentials_invalid");
+    let ifname: &str = payload
+        .get("ifname")
+        .expect("ifname key")
+        .downcast_ref()
+        .expect("ifname is string");
+    assert_eq!(ifname, "eth0");
+    let reason: &str = payload
+        .get("reason")
+        .expect("reason key")
+        .downcast_ref()
+        .expect("reason is string");
+    assert_eq!(reason, "certificate_rejected");
+
     handle.stop().await;
 }

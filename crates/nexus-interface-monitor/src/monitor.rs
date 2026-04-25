@@ -493,6 +493,27 @@ fn apply_rtnl_newlink(
             registry.insert(classified.clone());
             send_event(event_tx, NexusEvent::InterfaceDiscovered(classified));
         }
+        Some(existing) if existing.ifname != classified.ifname => {
+            // Kernel rename (`RTM_NEWLINK` with same ifindex but new
+            // `IFLA_IFNAME`). Downstream surfaces are keyed by ifname
+            // — D-Bus paths (`/fi/nexus1/interface/<ifname>`,
+            // DD-006 §6), per-interface profiles
+            // (`/var/lib/nexus/ethernet/<ifname>.toml`, DD-002 §8.2),
+            // metric labels — so we model the rename as a logical
+            // re-discovery: emit `InterfaceRemoved` followed by
+            // `InterfaceDiscovered`. Each consumer drops its
+            // by-ifname caches and re-establishes against the new
+            // identifier. systemd's predictable-name renamer is the
+            // common trigger; in production this typically fires
+            // before nexusd starts, but `ip link set name …` and
+            // USB-Ethernet replug can hit the same path.
+            m::record_event_for(&existing, m::event_label::INTERFACE_REMOVED);
+            registry.remove(ifindex);
+            send_event(event_tx, NexusEvent::InterfaceRemoved { ifindex });
+            m::record_event_for(&classified, m::event_label::INTERFACE_DISCOVERED);
+            registry.insert(classified.clone());
+            send_event(event_tx, NexusEvent::InterfaceDiscovered(classified));
+        }
         Some(existing) => {
             let mut next = existing.clone();
             if existing.carrier != classified.carrier {
@@ -523,7 +544,6 @@ fn apply_rtnl_newlink(
                     },
                 );
             }
-            next.ifname = classified.ifname.clone();
             next.mac = classified.mac;
             next.mtu = classified.mtu;
             registry.insert(next);
@@ -1092,6 +1112,45 @@ mod tests {
                 up: false,
             }
         ));
+    }
+
+    #[test]
+    fn rtnl_newlink_with_renamed_ifname_emits_remove_then_discovered() {
+        // DD-002 §15 / DD-006 §6: ifname is the path key downstream.
+        // A kernel rename (RTM_NEWLINK with same ifindex but a new
+        // IFLA_IFNAME) must surface as InterfaceRemoved +
+        // InterfaceDiscovered so consumers re-establish their
+        // by-ifname caches against the new identifier.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut registry = Registry::new();
+        seed_eth0(&mut registry);
+        let wireless = HashMap::new();
+        let caps = HashMap::new();
+
+        let raw = build_newlink(2, "enp1s0", true);
+        let (msg, _) = crate::netlink::parser::parse_message(&raw).unwrap();
+        let link = parse_link_message(msg.payload).unwrap();
+        apply_rtnl_newlink(&mut registry, &tx, &wireless, &caps, &link);
+
+        let events = drain_events(&mut rx);
+        assert_eq!(
+            events.len(),
+            2,
+            "expected exactly InterfaceRemoved + InterfaceDiscovered, got {events:?}",
+        );
+        assert!(matches!(
+            events[0],
+            NexusEvent::InterfaceRemoved { ifindex: 2 },
+        ));
+        match &events[1] {
+            NexusEvent::InterfaceDiscovered(info) => {
+                assert_eq!(info.ifindex, 2);
+                assert_eq!(info.ifname, "enp1s0");
+            }
+            other => panic!("expected InterfaceDiscovered(enp1s0), got {other:?}"),
+        }
+        // Registry now reflects the new name.
+        assert_eq!(registry.get(2).unwrap().ifname, "enp1s0");
     }
 
     #[test]

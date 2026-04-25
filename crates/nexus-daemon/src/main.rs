@@ -430,6 +430,7 @@ async fn spawn_all(
         let ev = event_tx.clone();
         let store = Arc::clone(&profile_store);
         let eth_cfg = build_ethernet_config(&config.ethernet)?;
+        let auth_kind = eth_cfg.auth_backend;
         out.push((
             SubsystemName::Ethernet,
             spawn_supervised(
@@ -441,12 +442,11 @@ async fn spawn_all(
                     let ev = ev.clone();
                     let store = Arc::clone(&store);
                     async move {
-                        // Wired 802.1X is pluggable; for now we spawn the
-                        // backend without one. When the wpa_supplicant /
-                        // ead WiredAuthBackend lands, config selects it.
-                        let join = spawn_ethernet_backend(ev, store, None, eth_cfg, cancel)
-                            .await
-                            .map_err(|e| anyhow!("{e}"))?;
+                        let auth_backend = build_wired_auth_backend(auth_kind, ev.clone()).await;
+                        let join =
+                            spawn_ethernet_backend(ev, store, auth_backend, eth_cfg, cancel)
+                                .await
+                                .map_err(|e| anyhow!("{e}"))?;
                         let res = join.await?;
                         res.map_err(|e| anyhow!("{e}"))
                     }
@@ -703,6 +703,38 @@ fn build_ethernet_config(section: &nexus_daemon::EthernetSection) -> Result<Ethe
     })
 }
 
+/// Construct the `WiredAuthBackend` selected by config. Returns
+/// `None` (and logs at `error!`) if construction fails — the
+/// Ethernet Backend's `AuthUnavailable` path then takes over and
+/// any 802.1X-required interface parks in `auth_failed` until the
+/// daemon shows up. DD-002 §9.1.
+async fn build_wired_auth_backend(
+    kind: AuthBackendKind,
+    event_tx: broadcast::Sender<nexus_core::NexusEvent>,
+) -> Option<Box<dyn nexus_ethernet::WiredAuthBackend>> {
+    use nexus_ethernet::auth::wpa_supplicant::WpaSupplicantWiredBackend;
+    match kind {
+        AuthBackendKind::WpaSupplicant => match WpaSupplicantWiredBackend::new(event_tx).await {
+            Ok(b) => Some(Box::new(b) as Box<dyn nexus_ethernet::WiredAuthBackend>),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "ethernet: wpa_supplicant wired backend init failed; running with no auth backend",
+                );
+                None
+            }
+        },
+        AuthBackendKind::Ead => {
+            let _ = event_tx;
+            tracing::error!(
+                "ethernet.auth_backend = \"ead\" is not yet implemented; running with no auth backend (DD-002 §7)",
+            );
+            None
+        }
+        AuthBackendKind::None => None,
+    }
+}
+
 fn build_wifi_config(section: &nexus_daemon::WifiSection) -> Result<WifiConfig> {
     use nexus_wifi::types::RoamMode;
     let roam_mode = match section.roam_mode.as_str() {
@@ -812,6 +844,11 @@ async fn build_dbus_config(
         None => noop,
     };
     let ops: Arc<dyn BackendOps> = ReloadOps::new(reload_coordinator, mid);
+    let ethernet_auth_backend = if config.ethernet.enabled {
+        config.ethernet.auth_backend.clone()
+    } else {
+        "none".to_owned()
+    };
     Ok(DbusConfig {
         bus_name: config.dbus.bus_name.clone(),
         use_session_bus: config.dbus.use_session_bus,
@@ -826,6 +863,7 @@ async fn build_dbus_config(
             bluetooth: config.bluetooth.enabled,
             gnss: config.gnss.enabled,
         },
+        ethernet_auth_backend,
     })
 }
 
