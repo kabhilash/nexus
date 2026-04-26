@@ -91,16 +91,46 @@ fn bluetooth_from_device(device: &Device) -> Option<BluetoothAdapter> {
     let sysname = device.sysname().to_str()?;
     let rest = sysname.strip_prefix("hci")?;
     let hci_index: u32 = rest.parse().ok()?;
+    // udev caches sysfs attributes from when the device was added.
+    // On controllers whose firmware sets the BD_ADDR after the
+    // initial registration (Raspberry Pi BCM43xx, CYW43xx, several
+    // Marvell parts), the cached value is `00:00:00:00:00:00` even
+    // though the kernel logs the real address moments later — and
+    // no further udev event fires once the firmware has run. Probe
+    // sysfs directly when the cached attribute is missing or all
+    // zeros so the registry holds the post-firmware-load address.
     let bt_address = device
         .attribute_value("address")
         .and_then(|s| s.to_str())
-        .and_then(parse_colon_hex_mac);
+        .and_then(parse_colon_hex_mac)
+        .filter(|mac| *mac != [0u8; 6])
+        .or_else(|| read_bluetooth_sysfs_address(sysname));
     Some(BluetoothAdapter {
         hci_name: sysname.to_owned(),
         hci_index,
         bt_address,
         bluez_path: format!("/org/bluez/{sysname}"),
     })
+}
+
+/// Read `/sys/class/bluetooth/<hci_name>/address` directly. Used as
+/// a fallback when udev's cached `address` attribute is empty or
+/// `00:00:00:00:00:00` because the BD_ADDR was set after the udev
+/// event fired (BCM / Marvell firmware-loaded controllers). All-zero
+/// reads from sysfs itself are also rejected — those mean the
+/// firmware genuinely hasn't assigned an address yet, in which case
+/// returning `None` lets the caller stamp `[0; 6]` and a later udev
+/// `change` event (or daemon restart) can re-probe.
+fn read_bluetooth_sysfs_address(hci_name: &str) -> Option<[u8; 6]> {
+    read_bluetooth_sysfs_address_in("/sys/class/bluetooth", hci_name)
+}
+
+/// Inner form parameterised on the sysfs base directory so tests can
+/// stage a fake hierarchy without writing to `/sys`.
+fn read_bluetooth_sysfs_address_in(base: &str, hci_name: &str) -> Option<[u8; 6]> {
+    let path = format!("{base}/{hci_name}/address");
+    let raw = std::fs::read_to_string(path).ok()?;
+    parse_colon_hex_mac(raw.trim()).filter(|mac| *mac != [0u8; 6])
 }
 
 fn looks_like_gnss(device: &Device) -> bool {
@@ -341,5 +371,36 @@ mod tests {
         assert!(parse_colon_hex_mac("AA:BB:CC:DD:EE").is_none());
         assert!(parse_colon_hex_mac("ZZ:BB:CC:DD:EE:FF").is_none());
         assert!(parse_colon_hex_mac("AA-BB-CC-DD-EE-FF").is_none());
+    }
+
+    #[test]
+    fn sysfs_address_fallback_returns_real_mac() {
+        // Stage /sys/class/bluetooth/hci0/address in a tempdir.
+        let tmp = tempfile::tempdir().unwrap();
+        let hci_dir = tmp.path().join("hci0");
+        std::fs::create_dir_all(&hci_dir).unwrap();
+        std::fs::write(hci_dir.join("address"), "43:45:c0:00:1f:ac\n").unwrap();
+        let base = tmp.path().to_string_lossy().into_owned();
+        assert_eq!(
+            read_bluetooth_sysfs_address_in(&base, "hci0"),
+            Some([0x43, 0x45, 0xc0, 0x00, 0x1f, 0xac]),
+        );
+    }
+
+    #[test]
+    fn sysfs_address_fallback_rejects_all_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hci_dir = tmp.path().join("hci0");
+        std::fs::create_dir_all(&hci_dir).unwrap();
+        std::fs::write(hci_dir.join("address"), "00:00:00:00:00:00\n").unwrap();
+        let base = tmp.path().to_string_lossy().into_owned();
+        assert_eq!(read_bluetooth_sysfs_address_in(&base, "hci0"), None);
+    }
+
+    #[test]
+    fn sysfs_address_fallback_returns_none_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_string_lossy().into_owned();
+        assert_eq!(read_bluetooth_sysfs_address_in(&base, "hci0"), None);
     }
 }

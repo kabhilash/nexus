@@ -1100,11 +1100,12 @@ dependencies = [
 
 [[package]]
 name = "nexus-interface-monitor"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "libc",
  "metrics",
  "nexus-core",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
