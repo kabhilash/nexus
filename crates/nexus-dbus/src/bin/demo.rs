@@ -52,6 +52,8 @@ async fn main() {
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
         ethernet_auth_backend: "none".to_owned(),
+        wifi_supplicant: "wpa_supplicant".to_owned(),
+        wifi_roaming_mode: "supplicant".to_owned(),
     };
     let handle = match spawn_dbus_service(event_tx.subscribe(), store, config).await {
         Ok(h) => h,

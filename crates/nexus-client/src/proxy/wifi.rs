@@ -38,13 +38,16 @@ pub trait Wifi {
     #[zbus(property, name = "Powered")]
     fn powered(&self) -> zbus::Result<bool>;
 
-    /// `Scan(params: a{sv}) -> ()`. Pass an empty dict for the
-    /// default "active probe every frequency" behaviour.
+    /// `Scan(params: a{sv}) -> (job_id: s)`. Pass an empty dict for
+    /// the default "active probe every frequency" behaviour. The
+    /// returned ULID correlates the subsequent
+    /// `fi.nexus.Wifi.ScanComplete(job_id, success, results_count,
+    /// reason)` signal — DD-006 §6.3 / §9.
     #[zbus(name = "Scan")]
     fn scan(
         &self,
         params: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
-    ) -> zbus::Result<()>;
+    ) -> zbus::Result<String>;
 
     /// `Connect(profile: o) -> (job_id: s)`. Returns a ULID job id
     /// that correlates the subsequent
@@ -84,6 +87,18 @@ pub trait Wifi {
         &self,
         job_id: String,
         success: bool,
+        reason: String,
+    ) -> zbus::Result<()>;
+
+    /// `ScanComplete(job_id: s, success: b, results_count: u, reason: s)`
+    /// — DD-006 §9. Terminal signal for an operator-initiated
+    /// `Scan`. Fires exactly once per accepted call.
+    #[zbus(signal, name = "ScanComplete")]
+    fn scan_complete(
+        &self,
+        job_id: String,
+        success: bool,
+        results_count: u32,
         reason: String,
     ) -> zbus::Result<()>;
 

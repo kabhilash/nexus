@@ -535,9 +535,16 @@ impl ManagerOps for ZbusManagerOps {
             .map_err(from_zbus_error)?;
         let empty: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
             std::collections::HashMap::new();
-        wifi.scan(empty).await.map_err(from_zbus_error)?;
+        // The new wire shape returns a `(job_id: s)` tuple per
+        // DD-006 §6.3; the CLI doesn't subscribe to ScanComplete
+        // yet (Phase 7.6 work) so we discard the id and keep the
+        // poll-on-ScanResults loop below.
+        wifi.scan(empty)
+            .await
+            .map(|_job_id| ())
+            .map_err(from_zbus_error)?;
         // Phase 4 polls ScanResults for a short window rather than
-        // subscribing to `ScanCompleted` — the signal flow lands in
+        // subscribing to `ScanComplete` — the signal flow lands in
         // Phase 7.6 alongside the `watch` machinery. Two second
         // window with 200 ms poll matches wpa_supplicant's typical
         // scan latency.

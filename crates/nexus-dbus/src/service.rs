@@ -66,6 +66,16 @@ pub struct DbusConfig {
     /// daemon stamps onto every Ethernet interface's cache; one of
     /// `"wpa_supplicant"`, `"ead"`, `"none"`.
     pub ethernet_auth_backend: String,
+    /// DD-006 §6.3 `fi.nexus.Wifi.Supplicant`. The string the daemon
+    /// stamps onto every Wi-Fi interface's cache; one of
+    /// `"wpa_supplicant"`, `"iwd"`. `"mock"` is also accepted for
+    /// test harnesses but never appears in production deployments.
+    pub wifi_supplicant: String,
+    /// DD-006 §6.3 `fi.nexus.Wifi.RoamingMode`. Initial value
+    /// stamped onto every Wi-Fi interface's cache; one of `"off"`,
+    /// `"supplicant"`, `"nexus"`. Operators can change it at
+    /// runtime via the writable property.
+    pub wifi_roaming_mode: String,
 }
 
 impl std::fmt::Debug for DbusConfig {
@@ -91,6 +101,8 @@ impl Default for DbusConfig {
             rate_limits: RateLimits::default(),
             enabled_features: EnabledFeatures::default(),
             ethernet_auth_backend: "none".to_owned(),
+            wifi_supplicant: "wpa_supplicant".to_owned(),
+            wifi_roaming_mode: "supplicant".to_owned(),
         }
     }
 }
@@ -160,6 +172,8 @@ pub async fn spawn_dbus_service(
         rate_limiter,
         config.enabled_features,
         config.ethernet_auth_backend.clone(),
+        config.wifi_supplicant.clone(),
+        config.wifi_roaming_mode.clone(),
     ));
 
     let (registry_tx, registry_rx) = mpsc::channel::<ServiceCommand>(64);
@@ -402,8 +416,20 @@ async fn handle_event(
                     .interfaces
                     .insert(ifname.clone(), InterfaceState::new(info));
                 if let Some(e) = guard.interfaces.get_mut(&ifname) {
-                    if let InterfaceKindData::Ethernet(c) = &mut e.kind_data {
-                        c.auth_backend = services.ethernet_auth_backend.clone();
+                    match &mut e.kind_data {
+                        InterfaceKindData::Ethernet(c) => {
+                            c.auth_backend = services.ethernet_auth_backend.clone();
+                        }
+                        InterfaceKindData::Wifi(c) => {
+                            // DD-006 §6.3 / DD-008 §4.1: stamp the
+                            // configured supplicant + initial roaming
+                            // mode onto the cache so property reads
+                            // (and `nexusctl wifi show`) return the
+                            // configured strings instead of `""`.
+                            c.supplicant = services.wifi_supplicant.clone();
+                            c.roaming_mode = services.wifi_roaming_mode.clone();
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -535,7 +561,11 @@ async fn handle_event(
                 }
             }
         }
-        NexusEvent::WifiScanComplete { ifindex, results } => {
+        NexusEvent::WifiScanComplete {
+            ifindex,
+            success,
+            results,
+        } => {
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
                 let mut to_register: Vec<nexus_core::MacAddr> = Vec::new();
                 let mut to_unregister: Vec<nexus_core::MacAddr> = Vec::new();
@@ -586,6 +616,7 @@ async fn handle_event(
                         })
                         .await;
                 }
+                resolve_scan_job(connection, services, &ifname, success).await;
             }
         }
         NexusEvent::EthLifecycleStateChanged {
@@ -1336,6 +1367,55 @@ async fn resolve_connect_job(
             ifname,
             job_id = job_id,
             "fi.nexus.Wifi.ConnectComplete emit failed",
+        );
+    }
+}
+
+/// If a `Wifi.Scan` job is pending for `ifname`, resolve it against
+/// this scan-complete event and emit `Wifi.ScanComplete`. The
+/// `results_count` payload is read from the freshly-applied
+/// `scan_cache` so it reflects the on-bus number of registered
+/// `fi.nexus.ScanResult` objects rather than the raw event payload
+/// — the two match in the steady state but the cache is the
+/// authoritative source for what clients see.
+async fn resolve_scan_job(
+    connection: &zbus::Connection,
+    services: &Arc<Services>,
+    ifname: &str,
+    success: bool,
+) {
+    let Some(job_id) = services.wifi_jobs.take_scan(ifname) else {
+        return;
+    };
+    let path = interface_path(ifname);
+    let Ok(obj_path) = ObjectPath::try_from(path.clone()) else {
+        return;
+    };
+    let results_count: u32 = if success {
+        let guard = services.state.read().await;
+        match guard.interfaces.get(ifname).map(|e| &e.kind_data) {
+            Some(InterfaceKindData::Wifi(c)) => c.scan_cache.len() as u32,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let reason: &str = if success { "" } else { "aborted" };
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            &obj_path,
+            "fi.nexus.Wifi",
+            "ScanComplete",
+            &(job_id.as_str(), success, results_count, reason),
+        )
+        .await
+    {
+        tracing::debug!(
+            error = ?e,
+            ifname,
+            job_id = job_id,
+            "fi.nexus.Wifi.ScanComplete emit failed",
         );
     }
 }

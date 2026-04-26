@@ -103,12 +103,22 @@ pub struct Services {
     /// `"wpa_supplicant"` / `"ead"` / `"none"`. Stamped onto every
     /// Ethernet interface's cache on `InterfaceDiscovered`.
     pub ethernet_auth_backend: String,
-    /// Outstanding Wi-Fi `Connect` / `Disconnect` jobs (DD-006 §6.3
-    /// completion-signal correlation).
+    /// Configured Wi-Fi supplicant label (DD-006 §6.3 `Supplicant`):
+    /// `"wpa_supplicant"` / `"iwd"`. Stamped onto every Wi-Fi
+    /// interface's cache on `InterfaceDiscovered`.
+    pub wifi_supplicant: String,
+    /// Configured Wi-Fi roaming mode (DD-006 §6.3 `RoamingMode`):
+    /// `"off"` / `"supplicant"` / `"nexus"`. Stamped onto every Wi-Fi
+    /// interface's cache on `InterfaceDiscovered`. Updated at runtime
+    /// when the operator sets the property via D-Bus.
+    pub wifi_roaming_mode: String,
+    /// Outstanding Wi-Fi `Connect` / `Disconnect` / `Scan` jobs
+    /// (DD-006 §6.3 completion-signal correlation).
     pub wifi_jobs: Arc<WifiJobs>,
 }
 
 impl Services {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: Arc<RwLock<State>>,
         profile_store: Arc<dyn ProfileStore>,
@@ -117,6 +127,8 @@ impl Services {
         rate_limiter: Arc<RateLimiter>,
         enabled: EnabledFeatures,
         ethernet_auth_backend: String,
+        wifi_supplicant: String,
+        wifi_roaming_mode: String,
     ) -> Self {
         Self {
             state,
@@ -127,6 +139,8 @@ impl Services {
             rate_limiter,
             enabled,
             ethernet_auth_backend,
+            wifi_supplicant,
+            wifi_roaming_mode,
             wifi_jobs: Arc::new(WifiJobs::new()),
         }
     }

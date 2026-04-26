@@ -105,6 +105,8 @@ async fn spawn_service(bus: &Bus, bus_name: &str) -> nexus_dbus::DbusServiceHand
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
         ethernet_auth_backend: "none".to_owned(),
+        wifi_supplicant: "wpa_supplicant".to_owned(),
+        wifi_roaming_mode: "supplicant".to_owned(),
     };
     spawn_dbus_service(event_tx.subscribe(), store, config)
         .await
@@ -166,6 +168,8 @@ async fn interface_appears_in_managed_objects_after_event() {
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
         ethernet_auth_backend: "none".to_owned(),
+        wifi_supplicant: "wpa_supplicant".to_owned(),
+        wifi_roaming_mode: "supplicant".to_owned(),
     };
     let handle = spawn_dbus_service(event_tx.subscribe(), store, config)
         .await
@@ -296,6 +300,8 @@ async fn wifi_interface_properties_readable() {
             rate_limits: nexus_dbus::RateLimits::default(),
             enabled_features: nexus_dbus::EnabledFeatures::default(),
             ethernet_auth_backend: "none".to_owned(),
+            wifi_supplicant: "wpa_supplicant".to_owned(),
+            wifi_roaming_mode: "supplicant".to_owned(),
         },
     )
     .await
@@ -362,6 +368,8 @@ async fn bluetooth_interface_properties_readable() {
             rate_limits: nexus_dbus::RateLimits::default(),
             enabled_features: nexus_dbus::EnabledFeatures::default(),
             ethernet_auth_backend: "none".to_owned(),
+            wifi_supplicant: "wpa_supplicant".to_owned(),
+            wifi_roaming_mode: "supplicant".to_owned(),
         },
     )
     .await
@@ -432,6 +440,8 @@ async fn gnss_interface_properties_readable() {
             rate_limits: nexus_dbus::RateLimits::default(),
             enabled_features: nexus_dbus::EnabledFeatures::default(),
             ethernet_auth_backend: "none".to_owned(),
+            wifi_supplicant: "wpa_supplicant".to_owned(),
+            wifi_roaming_mode: "supplicant".to_owned(),
         },
     )
     .await
@@ -536,6 +546,8 @@ async fn wifi_profile_with_credentials_exposes_has_credentials() {
             rate_limits: nexus_dbus::RateLimits::default(),
             enabled_features: nexus_dbus::EnabledFeatures::default(),
             ethernet_auth_backend: "none".to_owned(),
+            wifi_supplicant: "wpa_supplicant".to_owned(),
+            wifi_roaming_mode: "supplicant".to_owned(),
         },
     )
     .await
@@ -588,6 +600,8 @@ async fn ethernet_lifecycle_emits_interface_state_changed_signal() {
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
         ethernet_auth_backend: "wpa_supplicant".to_owned(),
+        wifi_supplicant: "wpa_supplicant".to_owned(),
+        wifi_roaming_mode: "supplicant".to_owned(),
     };
     let handle = spawn_dbus_service(event_tx.subscribe(), store, config)
         .await
@@ -704,6 +718,8 @@ async fn operator_notification_fires_manager_notification_event_signal() {
         rate_limits: nexus_dbus::RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
         ethernet_auth_backend: "none".to_owned(),
+        wifi_supplicant: "wpa_supplicant".to_owned(),
+        wifi_roaming_mode: "supplicant".to_owned(),
     };
     let handle = spawn_dbus_service(event_tx.subscribe(), store, config)
         .await

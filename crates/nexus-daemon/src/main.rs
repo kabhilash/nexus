@@ -849,6 +849,15 @@ async fn build_dbus_config(
     } else {
         "none".to_owned()
     };
+    let (wifi_supplicant, wifi_roaming_mode) = if config.wifi.enabled {
+        (config.wifi.backend.clone(), config.wifi.roam_mode.clone())
+    } else {
+        // The Wi-Fi feature is off — clients see Powered=false and
+        // FeatureDisabled on every mutating method anyway. Stamp
+        // empty strings so a property read doesn't suggest a live
+        // supplicant on a disabled stack.
+        (String::new(), String::new())
+    };
     Ok(DbusConfig {
         bus_name: config.dbus.bus_name.clone(),
         use_session_bus: config.dbus.use_session_bus,
@@ -864,6 +873,8 @@ async fn build_dbus_config(
             gnss: config.gnss.enabled,
         },
         ethernet_auth_backend,
+        wifi_supplicant,
+        wifi_roaming_mode,
     })
 }
 

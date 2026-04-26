@@ -1,14 +1,14 @@
-//! Per-interface tracking of in-flight Wi-Fi `Connect` / `Disconnect`
-//! jobs.
+//! Per-interface tracking of in-flight Wi-Fi `Connect` /
+//! `Disconnect` / `Scan` jobs.
 //!
-//! Each `Wifi.Connect` and `Wifi.Disconnect` call returns a ULID
-//! `job_id` immediately and resolves later via a typed
-//! `Wifi.ConnectComplete` / `Wifi.DisconnectComplete` signal (DD-006
-//! §6.3 / §9). The completion edge for a `Connect` is emitted from
-//! the service event loop the next time the interface reaches
-//! `Connected` (success) or `Disconnected{reason}` (failure); the
+//! Each `Wifi.Connect` / `Wifi.Disconnect` / `Wifi.Scan` call returns
+//! a ULID `job_id` immediately and resolves later via a typed
+//! `Wifi.ConnectComplete` / `Wifi.DisconnectComplete` /
+//! `Wifi.ScanComplete` signal (DD-006 §6.3 / §9). The Connect /
+//! Scan completion edges are emitted from the service event loop the
+//! next time the interface reaches a terminal state for the job; the
 //! tracker stores the pending `(ifname, job_id)` so the loop can
-//! correlate the state transition with the job.
+//! correlate the event with the job.
 //!
 //! Disconnect tracking is only used to emit
 //! `Wifi.DisconnectComplete` from the spawned task that drives the
@@ -17,13 +17,16 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Tracker for outstanding `Wifi.Connect` / `Wifi.Disconnect` jobs.
+/// Tracker for outstanding `Wifi.Connect` / `Wifi.Disconnect` /
+/// `Wifi.Scan` jobs.
 #[derive(Default)]
 pub struct WifiJobs {
     /// `ifname -> job_id` for an in-flight Connect.
     connect: Mutex<HashMap<String, String>>,
     /// `ifname -> job_id` for an in-flight Disconnect.
     disconnect: Mutex<HashMap<String, String>>,
+    /// `ifname -> job_id` for an in-flight Scan.
+    scan: Mutex<HashMap<String, String>>,
 }
 
 impl WifiJobs {
@@ -57,6 +60,21 @@ impl WifiJobs {
 
     pub fn take_disconnect(&self, ifname: &str) -> Option<String> {
         self.disconnect.lock().unwrap().remove(ifname)
+    }
+
+    /// Register `(ifname, job_id)` as the active Scan job. Replaces
+    /// any prior entry — DD-003 §5 disallows overlapping scans at
+    /// the backend level, so at most one Scan job per interface is
+    /// outstanding in normal operation.
+    pub fn register_scan(&self, ifname: &str, job_id: &str) {
+        self.scan
+            .lock()
+            .unwrap()
+            .insert(ifname.to_owned(), job_id.to_owned());
+    }
+
+    pub fn take_scan(&self, ifname: &str) -> Option<String> {
+        self.scan.lock().unwrap().remove(ifname)
     }
 }
 
@@ -97,5 +115,24 @@ mod tests {
         j.register_connect("wlan1", "B");
         assert_eq!(j.take_connect("wlan1").as_deref(), Some("B"));
         assert_eq!(j.take_connect("wlan0").as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn scan_register_then_take_returns_job_id() {
+        let j = WifiJobs::new();
+        j.register_scan("wlan0", "S1");
+        assert_eq!(j.take_scan("wlan0").as_deref(), Some("S1"));
+        assert!(j.take_scan("wlan0").is_none());
+    }
+
+    #[test]
+    fn scan_independent_of_connect_and_disconnect() {
+        let j = WifiJobs::new();
+        j.register_connect("wlan0", "C1");
+        j.register_scan("wlan0", "S1");
+        j.register_disconnect("wlan0", "D1");
+        assert_eq!(j.take_scan("wlan0").as_deref(), Some("S1"));
+        assert_eq!(j.take_connect("wlan0").as_deref(), Some("C1"));
+        assert_eq!(j.take_disconnect("wlan0").as_deref(), Some("D1"));
     }
 }

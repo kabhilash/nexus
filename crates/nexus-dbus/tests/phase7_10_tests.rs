@@ -121,6 +121,8 @@ async fn spawn(
         rate_limits,
         enabled_features: nexus_dbus::EnabledFeatures::default(),
         ethernet_auth_backend: "none".to_owned(),
+        wifi_supplicant: "wpa_supplicant".to_owned(),
+        wifi_roaming_mode: "supplicant".to_owned(),
     };
     let h = spawn_dbus_service(event_tx.subscribe(), st, cfg)
         .await
@@ -146,6 +148,7 @@ async fn scan_result_objects_appear_and_disappear() {
     event_tx
         .send(NexusEvent::WifiScanComplete {
             ifindex: 3,
+            success: true,
             results: vec![bss.clone()],
         })
         .unwrap();
@@ -192,6 +195,7 @@ async fn scan_result_objects_appear_and_disappear() {
     event_tx
         .send(NexusEvent::WifiScanComplete {
             ifindex: 3,
+            success: true,
             results: vec![make_bss([0x01, 0x02, 0x03, 0x04, 0x05, 0x06], b"corp", -65)],
         })
         .unwrap();
@@ -312,6 +316,8 @@ async fn rotate_master_key_denied_returns_auth_failed() {
         rate_limits: RateLimits::default(),
         enabled_features: nexus_dbus::EnabledFeatures::default(),
         ethernet_auth_backend: "none".to_owned(),
+        wifi_supplicant: "wpa_supplicant".to_owned(),
+        wifi_roaming_mode: "supplicant".to_owned(),
     };
     let handle = spawn_dbus_service(event_tx.subscribe(), st, cfg)
         .await
@@ -532,6 +538,8 @@ async fn spawn_with_features(
         rate_limits: RateLimits::default(),
         enabled_features: enabled,
         ethernet_auth_backend: "none".to_owned(),
+        wifi_supplicant: "wpa_supplicant".to_owned(),
+        wifi_roaming_mode: "supplicant".to_owned(),
     };
     let h = spawn_dbus_service(event_tx.subscribe(), st, cfg)
         .await
@@ -802,6 +810,8 @@ async fn spawn_with_ops(
         },
         enabled_features: nexus_dbus::EnabledFeatures::default(),
         ethernet_auth_backend: "none".to_owned(),
+        wifi_supplicant: "wpa_supplicant".to_owned(),
+        wifi_roaming_mode: "supplicant".to_owned(),
     };
     spawn_dbus_service(event_tx.subscribe(), st, cfg)
         .await

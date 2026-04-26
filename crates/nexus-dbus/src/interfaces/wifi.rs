@@ -171,22 +171,53 @@ impl WifiIface {
 
     // ---- Mutating methods (DD-006 §6.3 + §10) ----
 
-    /// `Scan(params: a{sv}) -> ()` — `fi.nexus.scan`.
+    /// `Scan(params: a{sv}) -> (job_id: s)` — `fi.nexus.scan`.
+    /// DD-006 §6.3. Returns a ULID `job_id` that correlates the
+    /// subsequent `ScanComplete` signal. Synchronous gates
+    /// (auth / rate / feature / parse) propagate as fdo errors;
+    /// after the gates pass the call is "accepted" and the
+    /// backend's outcome — including `ResourceBusy` for stacked
+    /// scans — surfaces via `ScanComplete(success=false, reason=…)`
+    /// so clients only need to listen on one channel.
     async fn scan(
         &self,
         #[zbus(header)] hdr: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         params: HashMap<String, OwnedValue>,
-    ) -> fdo::Result<()> {
+    ) -> fdo::Result<String> {
         self.check_feature()?;
         self.check_rate(&hdr, OpClass::Scan)?;
         self.require_auth(&hdr, actions::SCAN).await?;
         let parsed = parse_scan_params(&params)
             .map_err(|e| fdo::Error::from(DbusError::InvalidArgument(e)))?;
-        self.services
-            .ops
-            .wifi_scan(&self.ifname, parsed)
-            .await
-            .map_err(fdo::Error::from)
+        let job_id = Ulid::new().to_string();
+        self.services.wifi_jobs.register_scan(&self.ifname, &job_id);
+        let services = Arc::clone(&self.services);
+        let ifname = self.ifname.clone();
+        let emitter_owned = emitter.to_owned();
+        let job_for_task = job_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = services.ops.wifi_scan(&ifname, parsed).await {
+                // Only fire ScanComplete if no other path has
+                // resolved the job. The state-machine handler in
+                // service.rs does the same `take_scan` before
+                // emitting on success; whichever side races first
+                // wins and the other becomes a no-op.
+                if let Some(jid) = services.wifi_jobs.take_scan(&ifname) {
+                    let reason = scan_reason_for_dbus_error(&e);
+                    let _ = WifiIface::scan_complete(
+                        &emitter_owned,
+                        &jid,
+                        false,
+                        0,
+                        reason,
+                    )
+                    .await;
+                    let _ = job_for_task; // keep the value alive for tracing
+                }
+            }
+        });
+        Ok(job_id)
     }
 
     /// `Connect(profile: o) -> (job_id: s)` — `fi.nexus.connect`.
@@ -435,6 +466,20 @@ impl WifiIface {
         reason: &str,
     ) -> zbus::Result<()>;
 
+    /// `ScanComplete(job_id: s, success: b, results_count: u, reason: s)`.
+    ///
+    /// Terminal signal for an operator-initiated `Scan`. Fires
+    /// exactly once per accepted call. See DD-006 §9 for the
+    /// `reason` value set.
+    #[zbus(signal)]
+    pub async fn scan_complete(
+        emitter: &SignalEmitter<'_>,
+        job_id: &str,
+        success: bool,
+        results_count: u32,
+        reason: &str,
+    ) -> zbus::Result<()>;
+
     /// `RoamingMode` writeable property — `fi.nexus.connect`.
     #[zbus(property)]
     async fn set_roaming_mode(
@@ -476,6 +521,26 @@ impl WifiIface {
             .wifi_set_roaming_mode(&self.ifname, parsed)
             .await
             .map_err(|e| zbus::Error::from(zbus::fdo::Error::from(e)))
+    }
+}
+
+/// Map a synchronous backend error from `wifi_scan` to the wire
+/// `reason` documented in DD-006 §9 for `Wifi.ScanComplete`. Only
+/// runtime rejections from the backend reach this function — auth /
+/// rate / feature / invalid-argument are pre-job gates that surface
+/// as fdo errors, not as signals. The mapping mirrors
+/// `nexus-daemon/src/wifi_ops.rs::map_wifi_error`:
+///
+/// - `WifiError::Supplicant`        → `DbusError::ResourceBusy`        → `"busy"`
+/// - `WifiError::Rfkill`            → `DbusError::Io`                  → `"rf_killed"`
+/// - `WifiError::NotAttached` / `UnknownInterface` → `DbusError::NotFound` → `"supplicant_unavailable"`
+/// - everything else                                                   → `"other"`
+pub(crate) fn scan_reason_for_dbus_error(e: &DbusError) -> &'static str {
+    match e {
+        DbusError::ResourceBusy(_) => "busy",
+        DbusError::Io(_) => "rf_killed",
+        DbusError::NotFound(_) => "supplicant_unavailable",
+        _ => "other",
     }
 }
 

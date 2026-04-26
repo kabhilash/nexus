@@ -333,14 +333,16 @@
     { "id": "method:fi.nexus.Wifi.Scan", "type": "Method", "label": "Wifi.Scan",
       "attrs": {
         "in": "params:a{sv}",
+        "out": "job_id:s",
         "params": {
           "active": "b — active probing (default true)",
           "ssids": "aay — specific SSIDs to probe",
           "frequencies": "au — specific frequencies in MHz",
           "allow_roam": "b — only honoured when RoamingMode == supplicant"
         },
-        "completion_signal": "Wifi.ScanCompleted",
-        "retry_hint": "On ResourceBusy, wait >= 2s. On RateLimited, honour retry_after_ms.",
+        "completion_signal": "sig:fi.nexus.Wifi.ScanComplete",
+        "completion_semantics": "Returns the job_id immediately after auth/rate/feature/parse gates pass. ScanComplete fires exactly once per accepted call, on either the supplicant's ScanDone or a synchronous backend rejection. ResourceBusy (stacked-scan rejection) is no longer a synchronous error — it surfaces as ScanComplete(success=false, reason='busy').",
+        "retry_hint": "RateLimited carries retry_after_ms; honour it. For ScanComplete(success=false, reason='busy'), wait at least 2s before re-issuing.",
         "min_attempt_interval_ms": 2000
       } },
     { "id": "method:fi.nexus.Wifi.Connect", "type": "Method", "label": "Wifi.Connect",
@@ -375,9 +377,11 @@
         "fields": ["password", "passphrase", "otp", "pin"]
       } },
 
-    { "id": "sig:fi.nexus.Wifi.ScanCompleted", "type": "Signal", "label": "Wifi.ScanCompleted",
-      "attrs": { "args": "results_count:u",
-                 "post": "Walk Wifi.ScanResults (via PropertiesChanged or one-shot Get) to fetch detail." } },
+    { "id": "sig:fi.nexus.Wifi.ScanComplete", "type": "Signal", "label": "Wifi.ScanComplete",
+      "attrs": { "args": "job_id:s, success:b, results_count:u, reason:s",
+                 "purpose": "Terminal edge for an operator-initiated Wifi.Scan. Fires exactly once per accepted call (passive or active). job_id matches the value returned by Scan; results_count is the number of fi.nexus.ScanResult objects currently registered under <iface>/scan_result/ at completion time. reason is '' on success and one of busy | rf_killed | supplicant_unavailable | aborted | other on failure.",
+                 "correlation": "Match by job_id with the value returned by method:fi.nexus.Wifi.Scan.",
+                 "see_also": ["method:fi.nexus.Wifi.Scan", "iface:fi.nexus.ScanResult"] } },
     { "id": "sig:fi.nexus.Wifi.SignalLevel", "type": "Signal", "label": "Wifi.SignalLevel",
       "attrs": { "args": "rssi:i, frequency:u" } },
     { "id": "sig:fi.nexus.Wifi.RoamStarted", "type": "Signal", "label": "Wifi.RoamStarted",
@@ -837,7 +841,7 @@
     { "from": "iface:fi.nexus.Wifi", "rel": "defines_method", "to": "method:fi.nexus.Wifi.Disconnect" },
     { "from": "iface:fi.nexus.Wifi", "rel": "defines_method", "to": "method:fi.nexus.Wifi.Roam" },
     { "from": "iface:fi.nexus.Wifi", "rel": "defines_method", "to": "method:fi.nexus.Wifi.ProvideCredential" },
-    { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.ScanCompleted" },
+    { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.ScanComplete" },
     { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.SignalLevel" },
     { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.RoamStarted" },
     { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.RoamCompleted" },
@@ -981,7 +985,7 @@
     { "from": "method:fi.nexus.Wifi.Scan", "rel": "may_return_error", "to": "err:fi.nexus.Error.ResourceBusy" },
     { "from": "method:fi.nexus.Wifi.Scan", "rel": "may_return_error", "to": "err:fi.nexus.Error.RateLimited" },
     { "from": "method:fi.nexus.Wifi.Scan", "rel": "may_return_error", "to": "err:fi.nexus.Error.FeatureDisabled" },
-    { "from": "method:fi.nexus.Wifi.Scan", "rel": "may_emit_signal", "to": "sig:fi.nexus.Wifi.ScanCompleted" },
+    { "from": "method:fi.nexus.Wifi.Scan", "rel": "may_emit_signal", "to": "sig:fi.nexus.Wifi.ScanComplete" },
     { "from": "method:fi.nexus.Wifi.Scan", "rel": "rate_limit_class", "to": "rate:scans" },
     { "from": "method:fi.nexus.Wifi.Connect", "rel": "requires_polkit", "to": "polkit:fi.nexus.connect" },
     { "from": "method:fi.nexus.Wifi.Connect", "rel": "may_return_error", "to": "err:fi.nexus.Error.NotFound" },
@@ -1206,8 +1210,8 @@
       "steps": [
         { "do": "Optionally Wifi.Scan to populate ScanResults so the UI can pick an SSID",
           "node": "method:fi.nexus.Wifi.Scan" },
-        { "do": "Wait for Wifi.ScanCompleted and read Wifi.ScanResults",
-          "node": "sig:fi.nexus.Wifi.ScanCompleted" },
+        { "do": "Wait for Wifi.ScanComplete and read Wifi.ScanResults",
+          "node": "sig:fi.nexus.Wifi.ScanComplete" },
         { "do": "Manager.AddWifiProfile(settings)",
           "node": "method:fi.nexus.Manager.AddWifiProfile",
           "polkit": "polkit:fi.nexus.profile.add",
@@ -1231,10 +1235,15 @@
       "name": "Build a Wi-Fi scan picker that updates live",
       "audience": ["ui builder"],
       "steps": [
-        { "do": "Trigger Wifi.Scan with empty params",
+        { "do": "Subscribe to Wifi.ScanComplete on the interface path BEFORE issuing the scan to avoid a startup race",
+          "node": "sig:fi.nexus.Wifi.ScanComplete" },
+        { "do": "Trigger Wifi.Scan with empty params — capture the returned job_id",
           "node": "method:fi.nexus.Wifi.Scan",
+          "yields": "job_id:s",
           "rate_limit": "rate:scans" },
-        { "do": "Subscribe to InterfacesAdded/InterfacesRemoved under /fi/nexus1/interface/<ifname>/scan_result/",
+        { "do": "Wait for Wifi.ScanComplete(job_id, success, results_count, reason) — canonical completion edge. results_count is the on-bus number of fi.nexus.ScanResult objects under <iface>/scan_result/ at completion time. Failure reasons: busy | rf_killed | supplicant_unavailable | aborted | other.",
+          "node": "sig:fi.nexus.Wifi.ScanComplete" },
+        { "do": "(Parallel option for streaming-row UIs) Subscribe to InterfacesAdded/InterfacesRemoved under /fi/nexus1/interface/<ifname>/scan_result/ to render rows incrementally as BSSes are discovered, rather than waiting for ScanComplete to settle the list.",
           "node": "sig:org.freedesktop.DBus.ObjectManager.InterfacesAdded" },
         { "do": "For each new path, GetAll on fi.nexus.ScanResult to populate the row",
           "node": "iface:fi.nexus.ScanResult" },
@@ -1605,7 +1614,7 @@
           "evidence_signal": "PropertiesChanged Wifi.State=scanning",
           "ui_progress_label": "Scanning…" },
         { "from": "state:wifi.scanning", "to": "state:wifi.idle", "trigger_kind": "external_event", "trigger": "supplicant ScanDone, no auto-connect",
-          "evidence_signal": "sig:fi.nexus.Wifi.ScanCompleted then PropertiesChanged Wifi.State=idle" },
+          "evidence_signal": "sig:fi.nexus.Wifi.ScanComplete then PropertiesChanged Wifi.State=idle" },
         { "from": "state:wifi.idle", "to": "state:wifi.connecting", "trigger_kind": "method_call", "trigger": "method:fi.nexus.Wifi.Connect",
           "evidence_signal": "PropertiesChanged Wifi.State=connecting; details.profile, details.ssid_bytes populated",
           "ui_progress_label": "Connecting…" },
@@ -2052,7 +2061,7 @@
       "subscriptions_open_first": [
         "ObjectManager InterfacesAdded/Removed at /fi/nexus1 (path-prefix filter on /fi/nexus1/interface/<ifname>/scan_result/)",
         "PropertiesChanged on the Wi-Fi interface object (filter member=PropertiesChanged, path=<wifi-iface>)",
-        "fi.nexus.Wifi.ScanCompleted on the Wi-Fi interface object",
+        "fi.nexus.Wifi.ScanComplete on the Wi-Fi interface object",
         "fi.nexus.Interface.StateChanged on the Wi-Fi interface object",
         "fi.nexus.Wifi.NetworkRequest on the Wi-Fi interface object",
         "fi.nexus.Manager.NotificationEvent at /fi/nexus1"
@@ -2068,7 +2077,7 @@
             "FeatureDisabled": "Wi-Fi backend disabled in nexus.toml — show static 'Wi-Fi unavailable on this device'."
           } },
         { "n": 4, "ui": "Render incoming scan_result objects as a live list. Sort by SignalDbm desc, group by SSID.",
-          "wait_for": "ObjectManager InterfacesAdded under <wifi-iface>/scan_result/, plus Wifi.ScanCompleted to mark the list as settled.",
+          "wait_for": "ObjectManager InterfacesAdded under <wifi-iface>/scan_result/, plus Wifi.ScanComplete to mark the list as settled.",
           "render_per_row": ["ScanResult.Ssid (decode UTF-8 lossy for display, keep ay for matching)", "ScanResult.SignalDbm → bars (e.g. >= -55 = 4 bars, -55..-65 = 3, -65..-75 = 2, < -75 = 1)", "ScanResult.SecurityOffered → lock icon if non-empty/non-open", "ScanResult.Frequency → 2.4G/5G/6G band tag"] },
         { "n": 5, "ui": "User taps a row.",
           "branches": {

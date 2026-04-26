@@ -1529,6 +1529,7 @@ impl WifiBackend {
 
         let _ = self.event_tx.send(NexusEvent::WifiScanComplete {
             ifindex,
+            success,
             results: results.iter().cloned().map(to_nexus_bss_info).collect(),
         });
 

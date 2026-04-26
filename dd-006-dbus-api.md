@@ -417,7 +417,7 @@ The sentinel tuple is a D-Bus-layer construct — the Wi-Fi Backend's state mach
 **Methods:**
 
 ```
-Scan(params: a{sv}) -> ()
+Scan(params: a{sv}) -> (job_id: s)
     Trigger a scan. params may include:
       "active"        (b)  active probing (default true)
       "ssids"         (aay) specific SSIDs to probe (default empty)
@@ -425,13 +425,17 @@ Scan(params: a{sv}) -> ()
       "allow_roam"    (b)  whether the supplicant may autonomously roam based
                            on scan results (default false; ignored unless
                            RoamingMode == "supplicant"). See DD-003 §5.
-    Scan completes asynchronously; clients watch ScanCompleted signal.
+    Returns a ULID `job_id` that correlates the subsequent
+    `ScanComplete` signal. The signal fires exactly once per accepted
+    Scan() call — clients should subscribe before issuing the call to
+    avoid a startup race.
     Clients receiving ResourceBusy should wait at least 2 seconds before
     retrying (DD-003 §6.3 minimum attempt interval). RateLimited uses the
     `retry_after_ms` hint it carries.
     Errors: fi.nexus.Error.InvalidArgument, fi.nexus.Error.AuthFailed,
-            fi.nexus.Error.ResourceBusy, fi.nexus.Error.RateLimited,
-            fi.nexus.Error.FeatureDisabled
+            fi.nexus.Error.RateLimited, fi.nexus.Error.FeatureDisabled.
+    `ResourceBusy` (stacked-scan rejection) is no longer a synchronous
+    error — it surfaces as `ScanComplete(success=false, reason="busy")`.
 
 Connect(profile: o) -> (job_id: s)
     Connect to the given Wi-Fi profile. The profile path must be under
@@ -868,8 +872,22 @@ Clients must handle missing keys gracefully — the set of populated keys is a f
 **Wi-Fi (`fi.nexus.Wifi`):**
 
 ```
-ScanCompleted(results_count: u)
-    Fires after a scan settles. Clients walk ScanResults to fetch details.
+ScanComplete(job_id: s, success: b, results_count: u, reason: s)
+    Terminal signal for an operator-initiated `Scan`. Fires exactly
+    once per accepted call (passive or active). `job_id` matches the
+    value returned by `Scan`. `results_count` is the number of
+    `fi.nexus.ScanResult` objects currently registered under
+    <iface>/scan_result/ at completion time — clients can use it as a
+    quick "did anything come back" gate without iterating
+    ScanResults. `reason` is `""` on success and one of:
+      "busy"                  — another scan was already in flight
+                                 (stacked-scan rejection).
+      "rf_killed"             — rfkill asserted before/during the scan.
+      "supplicant_unavailable"— wpa_supplicant / iwd dropped off the
+                                 bus before the scan returned.
+      "aborted"               — supplicant reported the scan as
+                                 aborted (e.g., driver canceled).
+      "other"                 — any other backend error.
 
 SignalLevel(rssi: i, frequency: u)
     Periodic signal poll. Emitted at the Wi-Fi backend's polling rate (§DD-003 §7.2).
@@ -1255,10 +1273,11 @@ The passphrase is in memory only; the Profile Store encrypts it on write. The re
 ### 16.3 Scan and Enumerate Results
 
 ```
-# Trigger a scan
+# Trigger a scan — returns a job_id ULID
 busctl call fi.nexus1 /fi/nexus1/interface/wlp2s0 fi.nexus.Wifi Scan a{sv} 0
+# -> s "01J0PQR6V0Y8K9M7V3Y2F4T5W6"
 
-# Wait for ScanCompleted signal, then read results
+# Wait for ScanComplete(job_id, success, results_count, reason); then read results
 busctl get-property fi.nexus1 /fi/nexus1/interface/wlp2s0 \
     fi.nexus.Wifi ScanResults
 # -> ao 5 "/fi/nexus1/interface/wlp2s0/scan_result/aabbccddeeff" ...

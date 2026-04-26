@@ -87,8 +87,17 @@ pub enum NexusEvent {
     },
 
     // --- Wi-Fi Backend ---
+    /// Emitted whenever the Wi-Fi Backend finishes a scan attempt
+    /// (DD-003 §5.3). `success` mirrors wpa_supplicant's
+    /// `ScanDone(success)` argument — `false` means the supplicant
+    /// reported the scan as aborted (driver-initiated cancel,
+    /// rfkill-mid-scan, etc.). `results` is always the latest
+    /// supplicant cache snapshot, regardless of `success`, so
+    /// downstream consumers (`fi.nexus.ScanResult` registration)
+    /// stay in sync with whatever the cache currently contains.
     WifiScanComplete {
         ifindex: u32,
+        success: bool,
         results: Vec<BssInfo>,
     },
     WifiStateChanged {
