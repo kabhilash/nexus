@@ -99,11 +99,20 @@ pub enum WifiCommand {
         reply: oneshot::Sender<Result<()>>,
     },
     /// Disconnect the current session. Matches DD-006 §6.3
-    /// `Wifi.Disconnect()` semantics: the supplicant tears down
-    /// the association; the network entry is kept so future
-    /// auto-connect attempts don't have to rebuild it.
+    /// `Wifi.Disconnect(params: a{sv})` semantics: the supplicant
+    /// tears down the association; the network entry is kept so
+    /// future auto-connect attempts don't have to rebuild it.
+    /// When `pause_auto_connect` is true and an active profile was
+    /// in use, the backend adds that profile's id to an in-memory
+    /// paused-set that [`crate::select::select_network`] consults,
+    /// so the automatic selector won't pick it back up. The pause
+    /// is *runtime only* — it never touches the on-disk profile's
+    /// `auto_connect` field. Cleared by an explicit `Connect` to
+    /// the same profile, by `ProfileChanged` (operator edited or
+    /// removed the profile), or by daemon restart.
     Disconnect {
         ifname: String,
+        pause_auto_connect: bool,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Targeted roam to `bssid`. Only meaningful in `roam_mode =

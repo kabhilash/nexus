@@ -100,6 +100,16 @@ pub struct WifiBackend {
     /// per DD-003 §6.5.
     active_handle: HashMap<u32, (ulid::Ulid, NetworkHandle)>,
 
+    /// Profile IDs the operator paused via
+    /// `Wifi.Disconnect(pause_auto_connect=true)`. The automatic
+    /// selector skips these (see [`select_network`]). Runtime-only
+    /// — never persisted, never touches `WifiNetworkSettings::auto_connect`
+    /// on disk. Cleared by an explicit `Connect` to the same
+    /// profile, by `ProfileChanged` reconciliation (the on-disk
+    /// shape changed, so let auto-connect re-evaluate), and by
+    /// daemon restart.
+    paused_profiles: std::collections::HashSet<ulid::Ulid>,
+
     power: Arc<RwLock<PowerState>>,
     config: WifiConfig,
     supplicant_up: bool,
@@ -201,6 +211,7 @@ impl WifiBackend {
             cache: BssCache::new(),
             retry: RetryBook::new(),
             active_handle: HashMap::new(),
+            paused_profiles: std::collections::HashSet::new(),
             power: Arc::new(RwLock::new(PowerState::default())),
             config,
             supplicant_up: true,
@@ -694,8 +705,15 @@ impl WifiBackend {
             } => {
                 let _ = reply.send(self.operator_connect(&ifname, profile_id).await);
             }
-            crate::WifiCommand::Disconnect { ifname, reply } => {
-                let _ = reply.send(self.operator_disconnect(&ifname).await);
+            crate::WifiCommand::Disconnect {
+                ifname,
+                pause_auto_connect,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.operator_disconnect(&ifname, pause_auto_connect)
+                        .await,
+                );
             }
             crate::WifiCommand::Roam {
                 ifname,
@@ -792,6 +810,12 @@ impl WifiBackend {
                 id: profile_id.to_string(),
             })?;
 
+        // An explicit Connect is the operator's way of saying
+        // "I want this network now." Clear any pause that
+        // `Disconnect(pause_auto_connect=true)` may have left
+        // for this profile.
+        self.paused_profiles.remove(&profile_id);
+
         // Forget the previous handle *only if* it's for a different
         // profile. Same-profile re-connects (e.g. the operator
         // deliberately re-issuing Connect) keep the handle so the
@@ -832,10 +856,31 @@ impl WifiBackend {
     /// Operator-initiated `Disconnect`. The supplicant tears down
     /// the association; the in-memory active handle is cleared so a
     /// subsequent auto-select cycle can compete fresh.
-    async fn operator_disconnect(&mut self, ifname: &str) -> Result<()> {
+    ///
+    /// When `pause_auto_connect` is true and there was an active
+    /// profile, its id is added to [`Self::paused_profiles`] so
+    /// [`select_network`] skips it on the next auto-select tick.
+    /// The on-disk profile is *not* modified — DD-006 §6.3 calls
+    /// this out as the differentiator from `Profile.Update`.
+    async fn operator_disconnect(
+        &mut self,
+        ifname: &str,
+        pause_auto_connect: bool,
+    ) -> Result<()> {
         let ifindex = self.require_ifindex(ifname)?;
+        let active_profile = self.active_handle.get(&ifindex).map(|(id, _)| *id);
         self.supplicant.disconnect(ifindex).await?;
         self.active_handle.remove(&ifindex);
+        if pause_auto_connect {
+            if let Some(id) = active_profile {
+                self.paused_profiles.insert(id);
+                tracing::info!(
+                    ifname,
+                    profile_id = %id,
+                    "wifi profile paused from auto-connect (runtime only)"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -990,6 +1035,13 @@ impl WifiBackend {
                             self.retry.clear_credentials_invalid(p.id);
                         }
                     }
+                    // Drop runtime auto-connect pauses whose
+                    // profile is gone or was edited. The operator
+                    // changing the on-disk shape is implicit
+                    // re-engagement; let auto-select re-evaluate.
+                    let live: std::collections::HashSet<ulid::Ulid> =
+                        new_profiles.iter().map(|p| p.id).collect();
+                    self.paused_profiles.retain(|id| live.contains(id));
                     self.profiles = new_profiles;
                 }
                 Err(e) => {
@@ -1487,7 +1539,9 @@ impl WifiBackend {
                 matched = true;
                 self.dispatch_roam(ifindex, target).await;
             }
-        } else if let Some((profile, bss)) = select_network(&self.profiles, &results) {
+        } else if let Some((profile, bss)) =
+            select_network(&self.profiles, &results, &self.paused_profiles)
+        {
             matched = true;
             self.try_connect(ifindex, profile, bss).await?;
         }

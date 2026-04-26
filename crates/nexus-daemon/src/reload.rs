@@ -173,8 +173,12 @@ impl BackendOps for ReloadOps {
     async fn wifi_connect(&self, ifname: &str, profile_id: ulid::Ulid) -> nexus_dbus::Result<()> {
         self.inner.wifi_connect(ifname, profile_id).await
     }
-    async fn wifi_disconnect(&self, ifname: &str) -> nexus_dbus::Result<()> {
-        self.inner.wifi_disconnect(ifname).await
+    async fn wifi_disconnect(
+        &self,
+        ifname: &str,
+        pause_auto_connect: bool,
+    ) -> nexus_dbus::Result<()> {
+        self.inner.wifi_disconnect(ifname, pause_auto_connect).await
     }
     async fn wifi_roam(&self, ifname: &str, bssid: nexus_core::MacAddr) -> nexus_dbus::Result<()> {
         self.inner.wifi_roam(ifname, bssid).await

@@ -408,7 +408,18 @@ pub enum WifiSub {
         iface: Option<String>,
     },
     /// Disconnect the current Wi-Fi session.
-    Disconnect { iface: Option<String> },
+    ///
+    /// `--pause-auto-connect` also blocks the active profile from
+    /// the daemon's auto-connect picker until daemon restart, an
+    /// explicit `wifi connect`, or a profile edit. Runtime-only —
+    /// the profile file's `auto_connect` field is not modified.
+    Disconnect {
+        iface: Option<String>,
+        /// Block the active profile from auto-connect for this
+        /// session without touching the on-disk profile.
+        #[arg(long = "pause-auto-connect")]
+        pause_auto_connect: bool,
+    },
     /// Delete a stored Wi-Fi profile (matched by SSID or ULID).
     Forget { reference: String },
 }

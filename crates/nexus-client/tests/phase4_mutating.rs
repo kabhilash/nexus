@@ -27,7 +27,10 @@ enum Call {
         ifname: String,
         profile: String,
     },
-    WifiDisconnect(String),
+    WifiDisconnect {
+        ifname: String,
+        pause_auto_connect: bool,
+    },
     FindWifiProfile(Vec<u8>),
     BtPower {
         adapter: String,
@@ -114,8 +117,15 @@ impl ManagerOps for Recorder {
         }
         Ok(())
     }
-    async fn wifi_disconnect(&self, ifname: &str) -> Result<(), NexusctlError> {
-        self.record(Call::WifiDisconnect(ifname.into()));
+    async fn wifi_disconnect(
+        &self,
+        ifname: &str,
+        pause_auto_connect: bool,
+    ) -> Result<(), NexusctlError> {
+        self.record(Call::WifiDisconnect {
+            ifname: ifname.into(),
+            pause_auto_connect,
+        });
         if let Some(e) = self.mutation_error() {
             return Err(e);
         }
@@ -466,13 +476,20 @@ async fn wifi_disconnect_calls_ops() {
     commands::wifi::disconnect(
         rec.as_ref(),
         None,
+        false,
         OutputFormat::Human,
         &RenderContext::default(),
         &mut buf,
     )
     .await
     .unwrap();
-    assert_eq!(rec.calls(), vec![Call::WifiDisconnect("wlan0".into())]);
+    assert_eq!(
+        rec.calls(),
+        vec![Call::WifiDisconnect {
+            ifname: "wlan0".into(),
+            pause_auto_connect: false,
+        }]
+    );
 }
 
 #[tokio::test]
@@ -488,6 +505,7 @@ async fn wifi_auth_denied_exits_3() {
     let err = commands::wifi::disconnect(
         rec.as_ref(),
         None,
+        false,
         OutputFormat::Human,
         &RenderContext::default(),
         &mut buf,

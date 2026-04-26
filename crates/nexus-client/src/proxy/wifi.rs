@@ -50,7 +50,13 @@ pub trait Wifi {
     #[zbus(name = "Connect")]
     fn connect(&self, profile: zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
 
-    /// `Disconnect() -> ()`.
+    /// `Disconnect(params: a{sv}) -> ()`. Pass an empty dict for
+    /// the historical no-arg behaviour. Recognised params:
+    ///   - `pause_auto_connect` (b): also block the active profile
+    ///     from auto-connect for the rest of this daemon session.
     #[zbus(name = "Disconnect")]
-    fn disconnect(&self) -> zbus::Result<()>;
+    fn disconnect(
+        &self,
+        params: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    ) -> zbus::Result<()>;
 }

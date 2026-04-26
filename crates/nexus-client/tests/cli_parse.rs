@@ -113,7 +113,10 @@ fn command_is_mutating_classifier_matches_dd008() {
 
     // A sampling of mutating paths.
     assert!(command_is_mutating(&Some(Command::Wifi {
-        sub: WifiSub::Disconnect { iface: None }
+        sub: WifiSub::Disconnect {
+            iface: None,
+            pause_auto_connect: false,
+        }
     })));
     assert!(command_is_mutating(&Some(Command::Bt {
         sub: BtSub::Power {

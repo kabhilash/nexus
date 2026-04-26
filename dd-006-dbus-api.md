@@ -454,9 +454,17 @@ Connect(profile: o) -> ()
     Returns immediately; progress is reported via StateChanged.
     Errors: fi.nexus.Error.NotFound, fi.nexus.Error.InvalidArgument, fi.nexus.Error.AuthFailed
 
-Disconnect() -> ()
-    Disconnect from the current network.
-    Errors: fi.nexus.Error.AuthFailed
+Disconnect(params: a{sv}) -> ()
+    Disconnect from the current network. params may include:
+      "pause_auto_connect" (b)  also block the active profile from
+                                the daemon's auto-connect picker
+                                until daemon restart, an explicit
+                                Connect(profile), or a profile
+                                edit. Runtime-only — the on-disk
+                                profile's `auto_connect` field is
+                                NOT modified. Default false.
+    Pass an empty dict for the historical no-arg behaviour.
+    Errors: fi.nexus.Error.AuthFailed, fi.nexus.Error.InvalidArgument
 
 Roam(bssid: ay) -> ()
     Request a roam to the given BSSID. Only valid in RoamingMode == "nexus".

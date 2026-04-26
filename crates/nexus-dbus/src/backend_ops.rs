@@ -89,7 +89,7 @@ pub trait BackendOps: Send + Sync {
     async fn wifi_connect(&self, _ifname: &str, _profile_id: Ulid) -> Result<()> {
         Err(DbusError::Unsupported("wifi_connect".into()))
     }
-    async fn wifi_disconnect(&self, _ifname: &str) -> Result<()> {
+    async fn wifi_disconnect(&self, _ifname: &str, _pause_auto_connect: bool) -> Result<()> {
         Err(DbusError::Unsupported("wifi_disconnect".into()))
     }
     async fn wifi_roam(&self, _ifname: &str, _bssid: MacAddr) -> Result<()> {
@@ -160,7 +160,7 @@ pub struct RecordingOps {
 pub enum RecordedCall {
     WifiScan { ifname: String, params: ScanParams },
     WifiConnect { ifname: String, profile_id: Ulid },
-    WifiDisconnect { ifname: String },
+    WifiDisconnect { ifname: String, pause_auto_connect: bool },
     WifiRoam { ifname: String, bssid: MacAddr },
     WifiSetPowered { ifname: String, on: bool },
     WifiSetRoamingMode { ifname: String, mode: RoamingMode },
@@ -220,9 +220,10 @@ impl BackendOps for RecordingOps {
         }
         Ok(())
     }
-    async fn wifi_disconnect(&self, ifname: &str) -> Result<()> {
+    async fn wifi_disconnect(&self, ifname: &str, pause_auto_connect: bool) -> Result<()> {
         self.record(RecordedCall::WifiDisconnect {
             ifname: ifname.to_owned(),
+            pause_auto_connect,
         });
         if let Some(e) = self.consume_error() {
             return Err(e);
@@ -300,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn recording_collects_calls() {
         let ops = RecordingOps::new();
-        ops.wifi_disconnect("wlan0").await.unwrap();
+        ops.wifi_disconnect("wlan0", false).await.unwrap();
         ops.set_power_state(PowerState::Sleep).await.unwrap();
         let calls = ops.calls();
         assert_eq!(calls.len(), 2);

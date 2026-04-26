@@ -456,13 +456,14 @@ async fn wifi_disconnect_denied_returns_auth_failed() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let client = bus.connection().await;
+    let empty: HashMap<String, OwnedValue> = HashMap::new();
     let err = client
         .call_method(
             Some("fi.nexus1.test_disc_deny"),
             "/fi/nexus1/interface/wlan0",
             Some("fi.nexus.Wifi"),
             "Disconnect",
-            &(),
+            &(empty,),
         )
         .await
         .expect_err("denied");
@@ -483,20 +484,62 @@ async fn wifi_disconnect_accepted_dispatches() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let client = bus.connection().await;
+    let empty: HashMap<String, OwnedValue> = HashMap::new();
     client
         .call_method(
             Some("fi.nexus1.test_disc_ok"),
             "/fi/nexus1/interface/wlan0",
             Some("fi.nexus.Wifi"),
             "Disconnect",
-            &(),
+            &(empty,),
         )
         .await
         .expect("Disconnect");
     let calls = ops.calls();
-    assert!(
-        matches!(calls.first(), Some(RecordedCall::WifiDisconnect { ifname }) if ifname == "wlan0")
+    assert!(matches!(
+        calls.first(),
+        Some(RecordedCall::WifiDisconnect { ifname, pause_auto_connect: false }) if ifname == "wlan0"
+    ));
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn wifi_disconnect_with_pause_flag_propagates() {
+    // DD-006 §6.3 Wifi.Disconnect(params) — `pause_auto_connect`
+    // forwards through to the BackendOps layer.
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let (handle, event_tx) =
+        spawn(&bus, "fi.nexus1.test_disc_pause", always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = bus.connection().await;
+    let mut params: HashMap<String, OwnedValue> = HashMap::new();
+    params.insert(
+        "pause_auto_connect".to_owned(),
+        OwnedValue::try_from(zbus::zvariant::Value::new(true)).unwrap(),
     );
+    client
+        .call_method(
+            Some("fi.nexus1.test_disc_pause"),
+            "/fi/nexus1/interface/wlan0",
+            Some("fi.nexus.Wifi"),
+            "Disconnect",
+            &(params,),
+        )
+        .await
+        .expect("Disconnect");
+    let calls = ops.calls();
+    assert!(matches!(
+        calls.first(),
+        Some(RecordedCall::WifiDisconnect {
+            ifname,
+            pause_auto_connect: true,
+        }) if ifname == "wlan0"
+    ));
     handle.stop().await;
 }
 

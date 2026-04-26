@@ -130,8 +130,19 @@ pub async fn dispatch(
                 )
                 .await
             }
-            WifiSub::Disconnect { iface } => {
-                commands::wifi::disconnect(ops, iface.as_deref(), format, &ctx, stdout).await
+            WifiSub::Disconnect {
+                iface,
+                pause_auto_connect,
+            } => {
+                commands::wifi::disconnect(
+                    ops,
+                    iface.as_deref(),
+                    *pause_auto_connect,
+                    format,
+                    &ctx,
+                    stdout,
+                )
+                .await
             }
             WifiSub::Forget { reference } => {
                 commands::wifi::forget(ops, reference, format, &ctx, stdout).await

@@ -1,18 +1,23 @@
 //! Network selection: pick the best `(WifiProfile, BssInfo)` given
 //! what's visible in the scan cache. See DD-003 §6.1.
 
+use std::collections::HashSet;
+
 use nexus_core::SecurityMode;
 use nexus_profile_store::{SecurityConfig, WifiProfile};
+use ulid::Ulid;
 
 use crate::types::BssInfo;
 
 /// Pick the best candidate for auto-connect. `None` means either
 /// no profile opts in, or every compatible profile is either
-/// blacklisted on the visible BSS or marked
-/// `credentials_invalid`.
+/// blacklisted on the visible BSS, marked `credentials_invalid`,
+/// or runtime-paused via
+/// `Wifi.Disconnect(pause_auto_connect=true)`.
 pub fn select_network(
     profiles: &[WifiProfile],
     visible_bsses: &[BssInfo],
+    paused: &HashSet<Ulid>,
 ) -> Option<(WifiProfile, BssInfo)> {
     let mut candidates: Vec<(WifiProfile, BssInfo)> = Vec::new();
 
@@ -21,6 +26,9 @@ pub fn select_network(
             continue;
         }
         if profile.network.credentials_invalid {
+            continue;
+        }
+        if paused.contains(&profile.id) {
             continue;
         }
         for bss in visible_bsses {
@@ -145,7 +153,7 @@ mod tests {
         let a = profile(b"corp", psk("x"), 10, true, false);
         let b = profile(b"corp", psk("y"), 20, true, false);
         let bsses = vec![bss([0xAA; 6], b"corp", -55, SecurityMode::Wpa2Psk)];
-        let (picked, _) = select_network(&[a, b.clone()], &bsses).unwrap();
+        let (picked, _) = select_network(&[a, b.clone()], &bsses, &HashSet::new()).unwrap();
         assert_eq!(picked.id, b.id);
     }
 
@@ -157,7 +165,7 @@ mod tests {
             bss([0x02; 6], b"corp", -55, SecurityMode::Wpa2Psk),
             bss([0x03; 6], b"corp", -80, SecurityMode::Wpa2Psk),
         ];
-        let (_, b) = select_network(&[p], &bsses).unwrap();
+        let (_, b) = select_network(&[p], &bsses, &HashSet::new()).unwrap();
         assert_eq!(b.bssid, MacAddr([0x02; 6]));
     }
 
@@ -169,7 +177,7 @@ mod tests {
             bss([0x01; 6], b"corp", -70, SecurityMode::Wpa2Psk),
             bss([0x02; 6], b"corp", -55, SecurityMode::Wpa2Psk),
         ];
-        let (_, b) = select_network(&[p], &bsses).unwrap();
+        let (_, b) = select_network(&[p], &bsses, &HashSet::new()).unwrap();
         assert_eq!(b.bssid, MacAddr([0x01; 6]));
     }
 
@@ -181,7 +189,7 @@ mod tests {
             bss([0x01; 6], b"corp", -40, SecurityMode::Wpa2Psk),
             bss([0x02; 6], b"corp", -70, SecurityMode::Wpa2Psk),
         ];
-        let (_, b) = select_network(&[p], &bsses).unwrap();
+        let (_, b) = select_network(&[p], &bsses, &HashSet::new()).unwrap();
         assert_eq!(b.bssid, MacAddr([0x02; 6]));
     }
 
@@ -189,14 +197,28 @@ mod tests {
     fn auto_connect_off_profile_is_ignored() {
         let p = profile(b"corp", psk("x"), 10, false, false);
         let bsses = vec![bss([0x01; 6], b"corp", -40, SecurityMode::Wpa2Psk)];
-        assert!(select_network(&[p], &bsses).is_none());
+        assert!(select_network(&[p], &bsses, &HashSet::new()).is_none());
     }
 
     #[test]
     fn credentials_invalid_profile_is_ignored() {
         let p = profile(b"corp", psk("x"), 10, true, true);
         let bsses = vec![bss([0x01; 6], b"corp", -40, SecurityMode::Wpa2Psk)];
-        assert!(select_network(&[p], &bsses).is_none());
+        assert!(select_network(&[p], &bsses, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn paused_profile_is_skipped_in_auto_select() {
+        // DD-006 §6.3 Wifi.Disconnect(pause_auto_connect=true):
+        // the runtime pause must hide a profile from auto-connect
+        // even though `auto_connect = true` in the on-disk shape.
+        let p = profile(b"corp", psk("x"), 10, true, false);
+        let bsses = vec![bss([0x01; 6], b"corp", -40, SecurityMode::Wpa2Psk)];
+        let mut paused = HashSet::new();
+        paused.insert(p.id);
+        assert!(select_network(&[p.clone()], &bsses, &paused).is_none());
+        // And without the pause, the same profile is selected.
+        assert!(select_network(&[p], &bsses, &HashSet::new()).is_some());
     }
 
     #[test]
@@ -204,7 +226,7 @@ mod tests {
         // Profile wants WPA2-PSK; only an Open BSS is visible.
         let p = profile(b"corp", psk("x"), 10, true, false);
         let bsses = vec![bss([0x01; 6], b"corp", -40, SecurityMode::Open)];
-        assert!(select_network(&[p], &bsses).is_none());
+        assert!(select_network(&[p], &bsses, &HashSet::new()).is_none());
     }
 
     #[test]
@@ -225,9 +247,9 @@ mod tests {
             -40,
             SecurityMode::Wpa2Wpa3Transition,
         )];
-        let (picked2, _) = select_network(std::slice::from_ref(&p2), &bsses).unwrap();
+        let (picked2, _) = select_network(std::slice::from_ref(&p2), &bsses, &HashSet::new()).unwrap();
         assert_eq!(picked2.id, p2.id);
-        let (picked3, _) = select_network(std::slice::from_ref(&p3), &bsses).unwrap();
+        let (picked3, _) = select_network(std::slice::from_ref(&p3), &bsses, &HashSet::new()).unwrap();
         assert_eq!(picked3.id, p3.id);
     }
 }

@@ -416,8 +416,17 @@ pub trait ManagerOps: Send + Sync {
         })
     }
 
-    /// Disconnect the interface's current session.
-    async fn wifi_disconnect(&self, _ifname: &str) -> Result<(), NexusctlError> {
+    /// Disconnect the interface's current session. When
+    /// `pause_auto_connect` is true, the daemon also adds the
+    /// active profile to its runtime paused-set so the auto-select
+    /// picker skips it until daemon restart, an explicit Connect,
+    /// or a profile edit. The on-disk `auto_connect` flag is not
+    /// modified.
+    async fn wifi_disconnect(
+        &self,
+        _ifname: &str,
+        _pause_auto_connect: bool,
+    ) -> Result<(), NexusctlError> {
         Err(NexusctlError::Unsupported {
             detail: "wifi_disconnect".into(),
         })

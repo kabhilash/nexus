@@ -224,14 +224,30 @@ impl WifiIface {
             .map_err(fdo::Error::from)
     }
 
-    /// `Disconnect() -> ()` — `fi.nexus.connect`.
-    async fn disconnect(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+    /// `Disconnect(params: a{sv}) -> ()` — `fi.nexus.connect`.
+    /// DD-006 §6.3. Recognised params:
+    ///   - `pause_auto_connect` (b, default false): if true, the
+    ///     active profile is added to the backend's runtime
+    ///     paused-set so the automatic selector skips it until the
+    ///     operator either explicitly `Connect`s, edits the profile,
+    ///     or restarts the daemon. The on-disk profile's
+    ///     `auto_connect` field is *not* modified.
+    /// Unknown keys are ignored — clients can probe for
+    /// future-added knobs without server-side validation churn.
+    async fn disconnect(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        params: HashMap<String, OwnedValue>,
+    ) -> fdo::Result<()> {
         self.check_feature()?;
         self.check_rate(&hdr, OpClass::ConnectDisconnect)?;
         self.require_auth(&hdr, actions::CONNECT).await?;
+        let pause_auto_connect = lookup_bool(&params, "pause_auto_connect")
+            .map_err(|e| fdo::Error::from(DbusError::InvalidArgument(e)))?
+            .unwrap_or(false);
         self.services
             .ops
-            .wifi_disconnect(&self.ifname)
+            .wifi_disconnect(&self.ifname, pause_auto_connect)
             .await
             .map_err(fdo::Error::from)
     }

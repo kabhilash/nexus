@@ -331,10 +331,14 @@
         "stickiness": "Explicit Connect on a non-auto-connect profile makes it sticky until explicit Disconnect or daemon restart, even across transient Disconnected states."
       } },
     { "id": "method:fi.nexus.Wifi.Disconnect", "type": "Method", "label": "Wifi.Disconnect",
-      "attrs": { "in": "()",
+      "attrs": { "in": "params:a{sv}",
                  "purpose": "Tear down the current association on this Wi-Fi interface. Transitions the interface to State=disconnected and emits Interface.StateChanged.",
-                 "durability": "Transient — does not remove the stored profile. The backend may auto-reconnect on the next scan tick if the profile has auto_connect=true and a matching BSS is in range. To opt out durably, follow with Manager.RemoveProfile (or Profile.Delete) on the profile path.",
-                 "see_also": ["method:fi.nexus.Manager.RemoveProfile", "flow:disconnect-and-forget-wifi"] } },
+                 "params_keys": {
+                   "pause_auto_connect": "b — when true, also block the active profile from the daemon's auto-connect picker until daemon restart, an explicit Connect(profile), or a profile edit. Runtime-only; does NOT modify the on-disk Profile.Wifi.AutoConnect field. Default false."
+                 },
+                 "durability": "By default, transient — does not remove the stored profile and does not block auto-reconnect; the backend may auto-reconnect on the next scan tick if the profile has auto_connect=true and a matching BSS is in range. With params.pause_auto_connect=true, the disconnect also installs a session-only pause that survives across SetPowered toggles and adapter off/on cycles, but is cleared by daemon restart, by an explicit Connect(profile) on the same profile, by Profile.Update, or by Profile.Delete / Manager.RemoveProfile.",
+                 "to_opt_out_persistently": "Either Profile.Update with auto_connect=false (persistent, on-disk), or Manager.RemoveProfile / Profile.Delete (forget the profile).",
+                 "see_also": ["method:fi.nexus.Manager.RemoveProfile", "flow:disconnect-and-forget-wifi", "flow:disconnect-and-pause-wifi"] } },
     { "id": "method:fi.nexus.Wifi.Roam", "type": "Method", "label": "Wifi.Roam",
       "attrs": { "in": "bssid:ay", "valid_when": "RoamingMode == nexus" } },
     { "id": "method:fi.nexus.Wifi.ProvideCredential", "type": "Method", "label": "Wifi.ProvideCredential",
@@ -1235,6 +1239,22 @@
           "node": "sig:fi.nexus.Interface.StateChanged" }
       ],
       "note": "EthernetProfile does not yet carry a CredentialsInvalid flag (the on-disk schema lacks the field), so there is no Profile.CredentialsInvalidChanged signal to confirm the recovery. The Manager.NotificationEvent above is the only authoritative event for ethernet credentials-invalid; the recovery-confirmation signal is Interface.StateChanged transitioning to authenticated."
+    },
+
+    {
+      "id": "flow:disconnect-and-pause-wifi",
+      "name": "Disconnect from a Wi-Fi network and pause its auto-connect for this session",
+      "audience": ["app integrator", "ui builder"],
+      "trigger": "Operator chose 'Disconnect (don't auto-rejoin)' or equivalent — a transient opt-out that should NOT touch the on-disk profile.",
+      "preconditions": ["A wifi-Kind interface is registered. An active connection on that interface (or no connection — the pause is then a no-op since the active-profile lookup misses)."],
+      "steps": [
+        { "do": "Call Wifi.Disconnect(params={'pause_auto_connect': true}) on the interface object. Tears down the current association and adds the active profile to the daemon's runtime paused-set.",
+          "node": "method:fi.nexus.Wifi.Disconnect",
+          "polkit": "polkit:fi.nexus.connect" },
+        { "do": "Watch Interface.StateChanged on the interface path for state=disconnected to confirm tear-down.",
+          "node": "sig:fi.nexus.Interface.StateChanged" }
+      ],
+      "note": "The pause is runtime-only: it survives Wifi.SetPowered toggles and adapter off/on cycles but is cleared on daemon restart, on an explicit Connect to the same profile, on Profile.Update, and on RemoveProfile/Profile.Delete. Inspectable side-effect: the profile's Profile.Wifi.AutoConnect property still reads true on disk, but auto-select skips the profile until one of the clearing events fires. Use this when the operator wants 'don't connect right now' without committing to a persistent change. For persistent opt-out, edit Profile.Wifi.AutoConnect to false; for full removal, use flow:disconnect-and-forget-wifi."
     },
 
     {

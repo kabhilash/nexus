@@ -143,10 +143,11 @@ impl BackendOps for WifiBackendOps {
         .await
     }
 
-    async fn wifi_disconnect(&self, ifname: &str) -> Result<()> {
+    async fn wifi_disconnect(&self, ifname: &str, pause_auto_connect: bool) -> Result<()> {
         let ifname = ifname.to_owned();
         dispatch(&self.commands, |tx| WifiCommand::Disconnect {
             ifname,
+            pause_auto_connect,
             reply: tx,
         })
         .await
@@ -350,12 +351,18 @@ mod tests {
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<WifiCommand>(4);
         let ops = WifiBackendOps::new(cmd_tx, NoopOps::arc());
         tokio::spawn(async move {
-            if let Some(WifiCommand::Disconnect { ifname, reply }) = cmd_rx.recv().await {
+            if let Some(WifiCommand::Disconnect {
+                ifname,
+                pause_auto_connect,
+                reply,
+            }) = cmd_rx.recv().await
+            {
                 assert_eq!(ifname, "wlan0");
+                assert!(!pause_auto_connect);
                 let _ = reply.send(Ok(()));
             }
         });
-        assert!(ops.wifi_disconnect("wlan0").await.is_ok());
+        assert!(ops.wifi_disconnect("wlan0", false).await.is_ok());
     }
 
     #[tokio::test]

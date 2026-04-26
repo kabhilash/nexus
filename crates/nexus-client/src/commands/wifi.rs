@@ -127,17 +127,30 @@ pub async fn connect_profile(
 pub async fn disconnect(
     ops: &dyn ManagerOps,
     iface: Option<&str>,
+    pause_auto_connect: bool,
     format: OutputFormat,
     ctx: &RenderContext,
     w: &mut dyn Write,
 ) -> Result<(), NexusctlError> {
     let target = resolve_wifi_iface(ops, iface).await?;
-    ops.wifi_disconnect(&target).await?;
+    ops.wifi_disconnect(&target, pause_auto_connect).await?;
+    let action = if pause_auto_connect {
+        "wifi disconnect (pause auto-connect)".to_owned()
+    } else {
+        "wifi disconnect".to_owned()
+    };
     let outcome = MutationOutcome {
-        action: "wifi disconnect".into(),
+        action,
         subject: target,
         id: None,
-        note: None,
+        note: if pause_auto_connect {
+            Some(
+                "auto-connect paused for this session; profile's on-disk auto_connect unchanged"
+                    .into(),
+            )
+        } else {
+            None
+        },
     };
     render(&outcome, format, ctx, w).map_err(io_err)
 }

@@ -560,7 +560,11 @@ impl ManagerOps for ZbusManagerOps {
         wifi.connect(p).await.map_err(from_zbus_error)
     }
 
-    async fn wifi_disconnect(&self, ifname: &str) -> Result<(), NexusctlError> {
+    async fn wifi_disconnect(
+        &self,
+        ifname: &str,
+        pause_auto_connect: bool,
+    ) -> Result<(), NexusctlError> {
         let path = resolve_interface_by_ifname(&self.connection, ifname).await?;
         let wifi = WifiProxy::builder(&self.connection)
             .path(path)
@@ -568,7 +572,16 @@ impl ManagerOps for ZbusManagerOps {
             .build()
             .await
             .map_err(from_zbus_error)?;
-        wifi.disconnect().await.map_err(from_zbus_error)
+        let mut params: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+            std::collections::HashMap::new();
+        if pause_auto_connect {
+            if let Ok(v) =
+                zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::new(true))
+            {
+                params.insert("pause_auto_connect".to_owned(), v);
+            }
+        }
+        wifi.disconnect(params).await.map_err(from_zbus_error)
     }
 
     async fn find_wifi_profile(&self, ssid: &[u8]) -> Result<String, NexusctlError> {
