@@ -67,6 +67,7 @@ mod tests {
                 bssid_blacklist: vec![],
                 scan_freqs: vec![2412, 5180],
                 credentials_invalid: false,
+                last_connected_at: None,
             },
         }
     }

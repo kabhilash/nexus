@@ -192,6 +192,7 @@ fn wifi_profile(ssid: &[u8], passphrase: &str, priority: i32) -> WifiProfile {
             bssid_blacklist: vec![],
             scan_freqs: vec![],
             credentials_invalid: false,
+            last_connected_at: None,
         },
     }
 }
@@ -212,6 +213,7 @@ fn open_profile(ssid: &[u8]) -> WifiProfile {
             bssid_blacklist: vec![],
             scan_freqs: vec![],
             credentials_invalid: false,
+            last_connected_at: None,
         },
     }
 }

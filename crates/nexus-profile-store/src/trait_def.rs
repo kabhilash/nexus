@@ -113,6 +113,17 @@ pub trait ProfileStore: Send + Sync {
     async fn set_credentials_invalid(&self, reference: ProfileRef<'_>, invalid: bool)
     -> Result<()>;
 
+    /// Stamp `WifiNetworkSettings::last_connected_at` on the
+    /// referenced profile. The Wi-Fi backend calls this on every
+    /// successful Connected transition so auto-select can use
+    /// recency as a tiebreaker on the next boot. No-op for
+    /// non-Wi-Fi `ProfileRef` variants. Idempotent.
+    async fn set_last_connected(
+        &self,
+        reference: ProfileRef<'_>,
+        when: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+
     /// Rotate the master key (§4.5). Phase 2 does not have an
     /// encryption layer, so this returns
     /// [`crate::error::StoreError::NotYetImplemented`].

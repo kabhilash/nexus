@@ -1,6 +1,6 @@
 [package]
 name = "nexus-wifi"
-version = "0.14.0"
+version = "0.15.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,6 +21,7 @@ nexus-interface-monitor = { path = "../nexus-interface-monitor" }
 nexus-profile-store = { path = "../nexus-profile-store" }
 
 async-trait = { workspace = true }
+chrono = { workspace = true }
 futures-util = "0.3"
 libc = { workspace = true }
 metrics = { workspace = true }

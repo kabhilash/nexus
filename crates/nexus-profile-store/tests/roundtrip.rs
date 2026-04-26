@@ -64,6 +64,7 @@ fn sample_wifi(id: Ulid, ssid_bytes: &[u8]) -> WifiProfile {
             bssid_blacklist: vec![MacAddr([0x11; 6])],
             scan_freqs: vec![2412, 5180],
             credentials_invalid: false,
+            last_connected_at: None,
         },
     }
 }
@@ -315,6 +316,13 @@ impl ProfileStore for DummyStore {
         &self,
         _reference: nexus_profile_store::ProfileRef<'_>,
         _invalid: bool,
+    ) -> nexus_profile_store::Result<()> {
+        Ok(())
+    }
+    async fn set_last_connected(
+        &self,
+        _reference: nexus_profile_store::ProfileRef<'_>,
+        _when: chrono::DateTime<chrono::Utc>,
     ) -> nexus_profile_store::Result<()> {
         Ok(())
     }

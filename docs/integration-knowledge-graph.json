@@ -37,6 +37,25 @@
       "policykit_first_check_ms": 10,
       "early_property_read_on_unregistered": "fi.nexus.Error.NotFound — subscribe to InterfacesAdded instead",
       "early_mutating_call_on_unattached_backend": "Server queues up to 5s; on timeout returns ResourceBusy with retry_after_ms"
+    },
+    "wifi_auto_select_rules": {
+      "summary": "On every successful scan, the Wi-Fi backend picks at most one (profile, BSS) pair to connect to, from the set of stored profiles whose SSID/security match a visible BSS.",
+      "filter": [
+        "Profile.Wifi.AutoConnect == true",
+        "Profile.Wifi.Security compatible with BSS security mode",
+        "BSS not in Profile.Wifi.BssidBlacklist",
+        "Profile not flagged credentials_invalid (DD-003 §12.3)",
+        "Profile not in the runtime paused-set (Wifi.Disconnect(pause_auto_connect=true), DD-006 §6.3 — cleared on daemon restart, explicit Connect, Profile.Update, RemoveProfile/Profile.Delete)"
+      ],
+      "ranking_descending": [
+        "1. Profile.Wifi.Priority (higher wins)",
+        "2. Preferred-BSSID match (Profile.Wifi.BssidPreferred matches the candidate BSS)",
+        "3. Profile.Wifi.LastConnectedAt (most-recently-connected wins; never-connected profiles fall through to signal)",
+        "4. BSS signal_dbm (stronger RSSI wins)"
+      ],
+      "reboot_behavior": "Filter inputs that are persisted on disk (AutoConnect, Security, BssidBlacklist, credentials_invalid, LastConnectedAt) survive reboot. The runtime paused-set is in-memory and cleared.",
+      "adapter_off_on_behavior": "Same picker re-runs after Wifi.SetPowered(true). The paused-set persists across an adapter toggle (only daemon restart clears it).",
+      "see_also": ["prop:fi.nexus.Profile.Wifi.Priority", "prop:fi.nexus.Profile.Wifi.LastConnectedAt", "prop:fi.nexus.Profile.Wifi.BssidPreferred", "method:fi.nexus.Wifi.Disconnect"]
     }
   },
 
@@ -586,7 +605,14 @@
     { "id": "prop:fi.nexus.Profile.Wifi.Hidden", "type": "Property", "label": "Profile.Wifi.Hidden",
       "attrs": { "sig": "b", "access": "read/write" } },
     { "id": "prop:fi.nexus.Profile.Wifi.Priority", "type": "Property", "label": "Profile.Wifi.Priority",
-      "attrs": { "sig": "i", "access": "read/write" } },
+      "attrs": { "sig": "i", "access": "read/write",
+                 "auto_select_role": "Primary tiebreaker. Higher value wins when multiple profiles match the same scan." } },
+    { "id": "prop:fi.nexus.Profile.Wifi.LastConnectedAt", "type": "Property", "label": "Profile.Wifi.LastConnectedAt",
+      "attrs": { "sig": "s", "access": "read",
+                 "format": "RFC 3339 / ISO 8601 timestamp; empty string when the profile has never connected.",
+                 "updated_when": "Wi-Fi backend stamps it on every successful Connected transition (DD-003 §6.1) and persists via ProfileStore::set_last_connected.",
+                 "auto_select_role": "Tertiary tiebreaker (after Priority and preferred-BSSID match). The most-recently-connected profile wins; profiles never connected (empty string) lose the tiebreaker and fall through to signal strength.",
+                 "ui_use": "Render 'last connected N days ago' in the profile picker; sort the picker by recency." } },
     { "id": "prop:fi.nexus.Profile.Wifi.AutoConnect", "type": "Property", "label": "Profile.Wifi.AutoConnect",
       "attrs": { "sig": "b", "access": "read/write" } },
     { "id": "prop:fi.nexus.Profile.Wifi.FastTransition", "type": "Property", "label": "Profile.Wifi.FastTransition",
@@ -879,6 +905,7 @@
     { "from": "iface:fi.nexus.Profile.Wifi", "rel": "defines_property", "to": "prop:fi.nexus.Profile.Wifi.BssidPreferred" },
     { "from": "iface:fi.nexus.Profile.Wifi", "rel": "defines_property", "to": "prop:fi.nexus.Profile.Wifi.BssidBlacklist" },
     { "from": "iface:fi.nexus.Profile.Wifi", "rel": "defines_property", "to": "prop:fi.nexus.Profile.Wifi.ScanFrequencies" },
+    { "from": "iface:fi.nexus.Profile.Wifi", "rel": "defines_property", "to": "prop:fi.nexus.Profile.Wifi.LastConnectedAt" },
     { "from": "iface:fi.nexus.Profile.Ethernet", "rel": "defines_property", "to": "prop:fi.nexus.Profile.Ethernet.Ifname" },
     { "from": "iface:fi.nexus.Profile.Ethernet", "rel": "defines_property", "to": "prop:fi.nexus.Profile.Ethernet.AutoConnect" },
     { "from": "iface:fi.nexus.Profile.Ethernet", "rel": "defines_property", "to": "prop:fi.nexus.Profile.Ethernet.Dot1xEnabled" },

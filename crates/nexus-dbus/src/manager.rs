@@ -669,6 +669,7 @@ fn parse_wifi_settings(
             bssid_blacklist: Vec::new(),
             scan_freqs: Vec::new(),
             credentials_invalid: false,
+            last_connected_at: None,
         },
     })
 }

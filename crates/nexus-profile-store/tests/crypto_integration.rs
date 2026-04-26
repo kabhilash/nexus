@@ -29,6 +29,7 @@ fn sample_wifi() -> WifiProfile {
             bssid_blacklist: vec![],
             scan_freqs: vec![],
             credentials_invalid: false,
+            last_connected_at: None,
         },
     }
 }

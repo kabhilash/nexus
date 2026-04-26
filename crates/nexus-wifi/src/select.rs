@@ -45,18 +45,37 @@ pub fn select_network(
         }
     }
 
-    candidates.sort_by_key(|(p, b)| {
-        // Higher priority first (negate for ascending sort).
-        let primary = -p.network.priority;
-        // Preferred BSSID beats non-preferred.
-        let preferred = p
-            .network
-            .bssid_preferred
-            .as_ref()
-            .map_or(1, |pref| if pref == &b.bssid { 0 } else { 1 });
-        // Stronger signal first.
-        let signal = -b.signal_dbm;
-        (primary, preferred, signal)
+    candidates.sort_by(|(p1, b1), (p2, b2)| {
+        use std::cmp::Ordering;
+
+        let pref_match = |p: &WifiProfile, b: &BssInfo| -> bool {
+            p.network
+                .bssid_preferred
+                .as_ref()
+                .is_some_and(|pref| pref == &b.bssid)
+        };
+        // Higher priority first.
+        p2.network
+            .priority
+            .cmp(&p1.network.priority)
+            // Preferred-BSSID match first (true > false in our scheme).
+            .then_with(|| pref_match(p2, b2).cmp(&pref_match(p1, b1)))
+            // Most recent successful connection first; profiles
+            // never connected (None) sort last so a known-good
+            // network beats a stranger even if the stranger's RSSI
+            // is briefly stronger. Two candidates tied here fall
+            // through to signal.
+            .then_with(|| match (
+                p1.network.last_connected_at,
+                p2.network.last_connected_at,
+            ) {
+                (Some(t1), Some(t2)) => t2.cmp(&t1),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            })
+            // Stronger signal first.
+            .then_with(|| b2.signal_dbm.cmp(&b1.signal_dbm))
     });
 
     candidates.into_iter().next()
@@ -138,6 +157,7 @@ mod tests {
                 bssid_blacklist: vec![],
                 scan_freqs: vec![],
                 credentials_invalid: invalid,
+                last_connected_at: None,
             },
         }
     }
@@ -205,6 +225,61 @@ mod tests {
         let p = profile(b"corp", psk("x"), 10, true, true);
         let bsses = vec![bss([0x01; 6], b"corp", -40, SecurityMode::Wpa2Psk)];
         assert!(select_network(&[p], &bsses, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn recency_breaks_ties_before_signal() {
+        // Two profiles, same priority, neither has a preferred-BSSID
+        // hit, both visible. The more-recently-connected one wins
+        // even when its RSSI is weaker.
+        use chrono::{TimeZone, Utc};
+        let mut older = profile(b"home", psk("x"), 10, true, false);
+        older.network.last_connected_at = Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
+        let mut newer = profile(b"office", psk("y"), 10, true, false);
+        newer.network.last_connected_at =
+            Some(Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap());
+        let bsses = vec![
+            // Older profile's BSS has *stronger* signal — without
+            // recency, it would win on the previous sort key.
+            bss([0x01; 6], b"home", -45, SecurityMode::Wpa2Psk),
+            bss([0x02; 6], b"office", -65, SecurityMode::Wpa2Psk),
+        ];
+        let (picked, _) = select_network(&[older, newer.clone()], &bsses, &HashSet::new()).unwrap();
+        assert_eq!(picked.id, newer.id, "more-recent profile should win the tiebreaker");
+    }
+
+    #[test]
+    fn never_connected_profile_loses_recency_tiebreaker() {
+        // A profile with last_connected_at=Some(t) beats a profile
+        // with last_connected_at=None even if the latter has a
+        // stronger signal.
+        use chrono::{TimeZone, Utc};
+        let stranger = profile(b"home", psk("x"), 10, true, false);
+        // last_connected_at: None
+        let mut known = profile(b"office", psk("y"), 10, true, false);
+        known.network.last_connected_at =
+            Some(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+        let bsses = vec![
+            bss([0x01; 6], b"home", -40, SecurityMode::Wpa2Psk),
+            bss([0x02; 6], b"office", -75, SecurityMode::Wpa2Psk),
+        ];
+        let (picked, _) =
+            select_network(&[stranger, known.clone()], &bsses, &HashSet::new()).unwrap();
+        assert_eq!(picked.id, known.id);
+    }
+
+    #[test]
+    fn signal_breaks_ties_when_neither_was_ever_connected() {
+        // Both profiles have last_connected_at=None — fall through
+        // to RSSI.
+        let p1 = profile(b"home", psk("x"), 10, true, false);
+        let p2 = profile(b"office", psk("y"), 10, true, false);
+        let bsses = vec![
+            bss([0x01; 6], b"home", -75, SecurityMode::Wpa2Psk),
+            bss([0x02; 6], b"office", -40, SecurityMode::Wpa2Psk),
+        ];
+        let (picked, _) = select_network(&[p1, p2.clone()], &bsses, &HashSet::new()).unwrap();
+        assert_eq!(picked.id, p2.id);
     }
 
     #[test]

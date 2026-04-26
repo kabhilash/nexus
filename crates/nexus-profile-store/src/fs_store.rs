@@ -401,6 +401,29 @@ impl ProfileStore for ProfileFileStore {
         }
     }
 
+    async fn set_last_connected(
+        &self,
+        reference: ProfileRef<'_>,
+        when: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        match reference {
+            ProfileRef::Wifi { ssid_hash } => {
+                let path = self.wifi_path(ssid_hash);
+                let mut on_disk: WifiProfileOnDisk = match load_one(&path)? {
+                    Some(p) => p,
+                    None => return Ok(()),
+                };
+                on_disk.network.last_connected_at = Some(when);
+                write_atomic_toml(&path, &on_disk)
+            }
+            // Ethernet/GNSS/Bluetooth have no auto-select roster
+            // that benefits from a per-profile recency stamp.
+            ProfileRef::Ethernet { .. }
+            | ProfileRef::Gnss { .. }
+            | ProfileRef::Bluetooth { .. } => Ok(()),
+        }
+    }
+
     async fn rotate_master_key(&self) -> Result<RotateReport> {
         // Generate a fresh random key and rotate to it. Callers that
         // need to persist the new key (file source, TPM source) must

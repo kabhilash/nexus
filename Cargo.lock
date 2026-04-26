@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-dbus"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1114,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-profile-store"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1141,9 +1141,10 @@ dependencies = [
 
 [[package]]
 name = "nexus-wifi"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures-util",
  "libc",
  "metrics",

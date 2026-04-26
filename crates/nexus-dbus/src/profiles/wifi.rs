@@ -103,6 +103,25 @@ impl WifiProfileIface {
         self.with_profile(Vec::new(), |p| p.network.scan_freqs.clone())
             .await
     }
+
+    /// `LastConnectedAt: s` — RFC 3339 / ISO 8601 timestamp of the
+    /// most recent successful connection using this profile, or
+    /// the empty string if it has never connected. Updated by the
+    /// Wi-Fi backend on every Connected transition. Drives the
+    /// auto-select recency tiebreaker (DD-003 §6.1) and is
+    /// surfaced here for operator UIs that want to render
+    /// "last connected N days ago" or sort the profile picker by
+    /// recency.
+    #[zbus(property, name = "LastConnectedAt")]
+    async fn last_connected_at(&self) -> String {
+        self.with_profile(String::new(), |p| {
+            p.network
+                .last_connected_at
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_default()
+        })
+        .await
+    }
 }
 
 fn security_dict(cfg: &SecurityConfig) -> HashMap<String, OwnedValue> {
@@ -203,6 +222,7 @@ mod tests {
                 bssid_blacklist: Vec::new(),
                 scan_freqs: Vec::new(),
                 credentials_invalid: false,
+                last_connected_at: None,
             },
         };
     }

@@ -759,6 +759,7 @@ Added to `/fi/nexus1/profile/wifi/<ulid>` in addition to `fi.nexus.Profile`.
 | `BssidPreferred` | `ay` | read/write | Empty if none |
 | `BssidBlacklist` | `aay` | read/write | |
 | `ScanFrequencies` | `au` | read/write | |
+| `LastConnectedAt` | `s` | read | RFC 3339 timestamp of the most recent successful Connected transition that landed on this profile; empty when the profile has never connected. Updated by the Wi-Fi backend on every Connected transition (DD-003 §6.1) and persisted to the profile store. Drives the auto-select recency tiebreaker between profiles of equal `Priority` that don't have a preferred-BSSID hit. Operator UIs can render "last connected N days ago" or sort the profile picker by recency. |
 
 The `HasCredentials` map enumerates every credential field and whether a value is stored. Keys depend on the security type:
 

@@ -1268,6 +1268,12 @@ impl WifiBackend {
             }
             After::LinkReady { bssid } => {
                 self.dwell_since.remove(&ifindex);
+                // Stamp `last_connected_at` on the active profile —
+                // both in-memory and on disk — so the auto-select
+                // tiebreaker after a reboot prefers the network we
+                // were just on. Best-effort: a write failure
+                // doesn't block link-ready emission.
+                self.stamp_last_connected(ifindex).await;
                 // Resolve any in-flight roam: this `Connected`
                 // transition is the answer to the roam dispatch.
                 // Success means the reported BSSID matches the
@@ -1698,6 +1704,43 @@ impl WifiBackend {
             current_rssi,
             &candidates,
         )
+    }
+
+    /// Stamp `last_connected_at = now` on the profile currently
+    /// associated with `ifindex`, both in-memory and on disk. The
+    /// recency-based tiebreaker in [`select_network`] reads this
+    /// field on the next boot to prefer the network the operator
+    /// was most recently using over a stranger that happens to
+    /// have a stronger signal. Best-effort — store-write failures
+    /// log at warn and don't block the LinkReady path.
+    async fn stamp_last_connected(&mut self, ifindex: u32) {
+        let Some(profile_id) = self.active_handle.get(&ifindex).map(|(id, _)| *id) else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let ssid_hash = {
+            let Some(profile) = self.profiles.iter_mut().find(|p| p.id == profile_id) else {
+                return;
+            };
+            profile.network.last_connected_at = Some(now);
+            profile_key(profile)
+        };
+        if let Err(e) = self
+            .profile_store
+            .set_last_connected(
+                ProfileRef::Wifi {
+                    ssid_hash: &ssid_hash,
+                },
+                now,
+            )
+            .await
+        {
+            tracing::warn!(
+                profile_id = %profile_id,
+                error = %e,
+                "wifi: persisting last_connected_at failed; in-memory only"
+            );
+        }
     }
 
     /// DD-003 §6.3 / §12.3: mark a profile as having invalid

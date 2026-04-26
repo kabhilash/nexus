@@ -515,6 +515,7 @@ async fn wifi_profile_with_credentials_exposes_has_credentials() {
             bssid_blacklist: Vec::new(),
             scan_freqs: Vec::new(),
             credentials_invalid: false,
+            last_connected_at: None,
         },
     };
     store.put_wifi(&profile).await.unwrap();

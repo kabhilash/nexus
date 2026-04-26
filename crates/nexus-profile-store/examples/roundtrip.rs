@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             bssid_blacklist: vec![],
             scan_freqs: vec![2412],
             credentials_invalid: false,
+            last_connected_at: None,
         },
     };
     println!("writing profile id={} ssid=\"nexus-demo\"", profile.id);

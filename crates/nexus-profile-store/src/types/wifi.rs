@@ -43,6 +43,15 @@ pub struct WifiNetworkSettings {
     pub bssid_blacklist: Vec<MacAddr>,
     pub scan_freqs: Vec<u32>,
     pub credentials_invalid: bool,
+    /// Timestamp of the most recent successful Wi-Fi connection
+    /// using this profile (i.e., when the supplicant reported
+    /// `Connected` and the backend emitted `WifiLinkReady`).
+    /// Used by [`crate::select_network`](../../../nexus-wifi/src/select.rs)
+    /// as a tiebreaker between profiles of equal `priority` and
+    /// without a preferred-BSSID hit, so a daemon coming back up
+    /// prefers the network the operator was most recently using.
+    /// `None` for profiles that have never successfully connected.
+    pub last_connected_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +102,11 @@ pub struct WifiNetworkSettingsOnDisk {
     pub scan_freqs: Vec<u32>,
     #[serde(default)]
     pub credentials_invalid: bool,
+    /// See [`WifiNetworkSettings::last_connected_at`]. `#[serde(default)]`
+    /// so older on-disk profiles round-trip without bumping
+    /// `schema_version`.
+    #[serde(default)]
+    pub last_connected_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +154,7 @@ pub fn encrypt_wifi(
             bssid_blacklist: profile.network.bssid_blacklist.clone(),
             scan_freqs: profile.network.scan_freqs.clone(),
             credentials_invalid: profile.network.credentials_invalid,
+            last_connected_at: profile.network.last_connected_at,
         },
     })
 }
@@ -166,6 +181,7 @@ pub fn decrypt_wifi(
             bssid_blacklist: on_disk.network.bssid_blacklist,
             scan_freqs: on_disk.network.scan_freqs,
             credentials_invalid: on_disk.network.credentials_invalid,
+            last_connected_at: on_disk.network.last_connected_at,
         },
     })
 }

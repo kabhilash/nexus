@@ -644,12 +644,14 @@ When a scan completes and the interface is `Idle`, the backend matches visible B
 fn select_network(
     profiles: &[WifiProfile],
     visible_bsses: &[BssInfo],
+    paused: &HashSet<Ulid>,    // see DD-006 §6.3 Wifi.Disconnect(pause_auto_connect)
 ) -> Option<(WifiProfile, BssInfo)> {
     let mut candidates: Vec<(WifiProfile, BssInfo)> = Vec::new();
 
     for profile in profiles {
         if !profile.auto_connect { continue; }
         if profile.credentials_invalid { continue; }
+        if paused.contains(&profile.id) { continue; }
 
         for bss in visible_bsses {
             if bss.ssid != profile.ssid { continue; }
@@ -659,21 +661,34 @@ fn select_network(
         }
     }
 
-    // Rank candidates
-    candidates.sort_by_key(|(p, b)| {
-        // Primary: profile priority (higher wins, so negate)
-        // Secondary: preferred BSSID flag (0 if BSS matches preferred, 1 otherwise)
-        // Tertiary: signal strength (higher wins, so negate)
-        (
-            -p.priority,
-            p.bssid_preferred.as_ref().map_or(1, |pref| if pref == &b.bssid { 0 } else { 1 }),
-            -b.signal_dbm,
-        )
+    // Rank candidates (lexicographic sort, descending):
+    //   1. Profile priority — higher wins.
+    //   2. Preferred-BSSID match — true beats false.
+    //   3. last_connected_at — most-recent successful Connected
+    //      first. None sorts last so a known-good profile beats a
+    //      stranger even if the stranger's RSSI is briefly stronger.
+    //   4. Signal strength — stronger RSSI wins; final tiebreaker
+    //      among never-connected profiles.
+    candidates.sort_by(|(p1, b1), (p2, b2)| {
+        let pref = |p: &WifiProfile, b: &BssInfo| -> bool {
+            p.bssid_preferred.as_ref().is_some_and(|pref| pref == &b.bssid)
+        };
+        p2.priority.cmp(&p1.priority)
+            .then_with(|| pref(p2, b2).cmp(&pref(p1, b1)))
+            .then_with(|| match (p1.last_connected_at, p2.last_connected_at) {
+                (Some(t1), Some(t2)) => t2.cmp(&t1),  // newer first
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            })
+            .then_with(|| b2.signal_dbm.cmp(&b1.signal_dbm))
     });
 
     candidates.into_iter().next()
 }
 ```
+
+`last_connected_at` is stamped on every successful Connected transition (§6.5) and persisted to the profile store via `ProfileStore::set_last_connected` so it survives daemon restart and rebooting. The `paused` set is runtime-only — operator intent from `Wifi.Disconnect(pause_auto_connect=true)` (DD-006 §6.3); it does not survive a daemon restart.
 
 ### 6.2 Connection Sequence
 

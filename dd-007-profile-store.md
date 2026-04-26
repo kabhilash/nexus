@@ -536,6 +536,17 @@ pub trait ProfileStore: Send + Sync {
         invalid: bool,
     ) -> Result<()>;
 
+    /// Stamp `last_connected_at` on the referenced profile (Wi-Fi
+    /// only — no-op for ethernet/GNSS/Bluetooth). The Wi-Fi backend
+    /// calls this on every Connected transition so the auto-select
+    /// recency tiebreaker (DD-003 §6.1) survives a daemon restart.
+    /// Idempotent.
+    async fn set_last_connected(
+        &self,
+        reference: ProfileRef<'_>,
+        when: DateTime<Utc>,
+    ) -> Result<()>;
+
     /// Rotate the master key (§4.5). Expensive; call sparingly.
     async fn rotate_master_key(&self) -> Result<RotateReport>;
 }
@@ -623,6 +634,14 @@ pub struct WifiNetworkSettings {
     pub scan_freqs: Vec<u32>,
     #[serde(default)]
     pub credentials_invalid: bool,
+    /// Most recent successful connection on this profile. Stamped
+    /// by the Wi-Fi backend on every Connected transition (DD-003
+    /// §6.1) and consulted by `select_network` as a tiebreaker
+    /// between profiles of equal `priority` that don't have a
+    /// preferred-BSSID hit. `#[serde(default)]` so older on-disk
+    /// profiles round-trip without bumping schema_version.
+    #[serde(default)]
+    pub last_connected_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -688,6 +707,7 @@ pub struct WifiNetworkSettings {
     pub bssid_blacklist: Vec<MacAddr>,
     pub scan_freqs: Vec<u32>,
     pub credentials_invalid: bool,
+    pub last_connected_at: Option<DateTime<Utc>>,
 }
 
 // --- On-disk shape used for serialization; only holds encrypted blobs. ---
