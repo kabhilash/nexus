@@ -1,6 +1,6 @@
 {
   "format": "nexus-integration-knowledge-graph",
-  "format_version": "0.3.0",
+  "format_version": "0.4.0",
   "audience": [
     "App integrators consuming the fi.nexus1 D-Bus API",
     "UI builders implementing operator-facing flows (pair, connect, scan picker, fix display, recovery)"
@@ -1568,7 +1568,7 @@
         "Path-permissions: both calls are open to unprivileged readers on default systemd policy. Writes (Manager.Reload, etc.) are not used here.",
         "Out of scope for this flow (file separately when the UI wants them): DHCP lease lifetime / renew timestamp (DHCPv4.LeaseEnd inside Describe()), IPv6 SLAAC vs DHCPv6 distinguisher (Addresses[].Flags / DHCPv6 dict), and per-link metric stats."
       ],
-      "see_also": ["iface:org.freedesktop.network1.Manager", "iface:org.freedesktop.network1.Link", "iface:org.freedesktop.resolve1.Link", "ui_design_patterns.connected_card_recipe", "consumer_recommendations.ip_layer_data_source"]
+      "see_also": ["iface:org.freedesktop.network1.Manager", "iface:org.freedesktop.network1.Link", "iface:org.freedesktop.resolve1.Link", "ui_design_patterns.connected_card_recipe", "ui_design_patterns.alternative_aps_for_connected_ssid", "consumer_recommendations.ip_layer_data_source"]
     }
   ],
 
@@ -2147,6 +2147,14 @@
         { "row": "Security (Wi-Fi only)",
           "source": "prop:fi.nexus.Wifi.ConnectedBss → security field ('open', 'owe', 'wpa2_personal', 'wpa3_personal', 'wpa2_enterprise', 'wpa3_enterprise', etc.)",
           "render": "Lock icon for any non-open value; copy-text matches the operator's vocabulary ('WPA2', 'WPA3', 'Enterprise')." },
+        { "row": "BSSID + channel (Wi-Fi diagnostics — advanced disclosure)",
+          "source": "prop:fi.nexus.Wifi.ConnectedBss → bssid:ay (decode 6 bytes to colon-MAC, e.g. 8a:78:48:f0:12:ea) + frequency:u. Channel = the same freq→channel lookup the scan picker uses (2412→1, 2437→6, 5180→36, 5260→52, 5745→149, 5955→1 for 6 GHz with operating-class context, etc.).",
+          "render": "Two lines: 'BSSID  aa:bb:cc:dd:ee:ff' and 'Channel  N (2.4 / 5 / 6 GHz)'. iOS does not surface BSSID on the public card; embedded operators routinely need it for roaming, BSSID pinning (Profile.Wifi.BssidPreferred), blacklisting (Profile.Wifi.BssidBlacklist), and field diagnostics — expose it under a 'Show details' / 'Advanced' disclosure rather than hiding it.",
+          "live_update": "Same PropertiesChanged on Wifi.ConnectedBss as the Network-name row — fires on roam, so the BSSID/channel updates atomically with the rest of the card." },
+        { "row": "Other APs for this SSID (Wi-Fi roaming / diagnostics — advanced disclosure)",
+          "source": "Filter prop:fi.nexus.Wifi.ScanResults: GetAll fi.nexus.ScanResult on each path, keep entries where ScanResult.Ssid equals the connected ConnectedBss.ssid_bytes (byte-equal, not string-equal — handles non-UTF-8 SSIDs), and drop the entry whose ScanResult.Bssid equals the connected BSSID. Sort the remainder by ScanResult.SignalDbm descending.",
+          "render": "Stacked rows: 'aa:bb:cc:dd:ee:ff  Ch 36 (5 GHz)  −67 dBm'. Empty list is a normal state — most home deployments have one AP per SSID. Tap-to-pin opens flow:wifi-bssid-pinning (writes Profile.Wifi.BssidPreferred = MAC and re-Connects).",
+          "live_update": "Driven by ObjectManager InterfacesAdded/Removed on /fi/nexus1/interface/<ifname>/scan_result/* and per-row PropertiesChanged on each ScanResult object. The list freshness is the freshness of the last Wi-Fi scan; surface a 'Last scanned: Ns ago' affordance derived from min(ScanResult.AgeMs)." },
         { "row": "IP address",
           "source": "Off-Nexus: org.freedesktop.network1.Manager.Describe(ifindex) → JSON.Addresses[] with Family==2 (IPv4) and Scope==0 (global). See flow:read-ip-info-for-connected-iface.",
           "render": "'192.0.2.42 / 24' — dotted-quad + PrefixLength as CIDR. If multiple global IPv4 addresses, render the first; show a 'show all' affordance only if the device has multi-address use cases.",
@@ -2182,7 +2190,38 @@
         "Don't expect fi.nexus.Interface.* properties to grow IPv4Addresses / Ipv4Gateway / Ipv4DnsServers — Nexus deliberately does not publish IP-layer state. ADR-001 (`No built-in IP management`) keeps the daemon's surface at the kernel-carrier boundary; the IP rows live on networkd / resolved.",
         "Don't conflate 'connected' (Wifi.State or Ethernet.State) with 'online' (networkd OnlineState). A network can be associated and keyed without a working DHCP lease. The connected card should render with whatever IP state networkd has at the moment, even if that's 'no IPv4 yet'."
       ],
-      "see_also": ["flow:read-ip-info-for-connected-iface", "flow:connect-known-wifi", "flow:disconnect-and-pause-wifi", "flow:disconnect-and-forget-wifi", "consumer_recommendations.ip_layer_data_source"]
+      "see_also": ["flow:read-ip-info-for-connected-iface", "flow:connect-known-wifi", "flow:disconnect-and-pause-wifi", "flow:disconnect-and-forget-wifi", "ui_design_patterns.alternative_aps_for_connected_ssid", "consumer_recommendations.ip_layer_data_source"]
+    },
+
+    "alternative_aps_for_connected_ssid": {
+      "title": "Enumerate alternative APs (BSSes) visible for the connected SSID",
+      "purpose": "On the connected card's 'Show details' / 'Advanced' disclosure, surface every BSS in the current scan cache that advertises the same SSID as the one we're associated to. Operators use this for roaming diagnostics ('why am I stuck on the weak AP?'), BSSID pinning (Profile.Wifi.BssidPreferred), and BSSID blacklisting (Profile.Wifi.BssidBlacklist). It is the same un-aggregated view the scan picker hides behind 'show APs' (see flow:scan-picker-ui ui_notes — 'Default presentation' bullet).",
+      "preconditions": [
+        "prop:fi.nexus.Wifi.State == 'connected' (otherwise the 'connected SSID' is undefined — fall back to a plain scan list).",
+        "A recent Wifi.Scan has populated prop:fi.nexus.Wifi.ScanResults. Stale caches are normal — surface min(ScanResult.AgeMs) so the operator can decide whether to retrigger Wifi.Scan."
+      ],
+      "_about": "Nexus exposes the per-BSSID surface deliberately: each scan result is its own object at /fi/nexus1/interface/<ifname>/scan_result/<bssid> implementing iface:fi.nexus.ScanResult. The connected-card's 'connected BSS' is just one row from prop:fi.nexus.Wifi.ConnectedBss; the alternative-APs list is the rest of the scan, filtered to the same SSID.",
+      "lookup_recipe": [
+        { "step": 1, "do": "Read prop:fi.nexus.Wifi.ConnectedBss → ssid_bytes (the raw ay), bssid (the connected MAC), frequency (the connected channel).",
+          "node": "prop:fi.nexus.Wifi.ConnectedBss",
+          "tip": "Use ssid_bytes for the match key, NOT ssid_utf8_lossy — non-UTF-8 SSIDs are rare but legal and a lossy decode collapses distinct hidden bytes." },
+        { "step": 2, "do": "Read prop:fi.nexus.Wifi.ScanResults → array of object paths. Or, for streaming UIs, listen to ObjectManager InterfacesAdded/Removed under /fi/nexus1/interface/<ifname>/scan_result/.",
+          "node": "prop:fi.nexus.Wifi.ScanResults" },
+        { "step": 3, "do": "For each path, GetAll on iface:fi.nexus.ScanResult. Keep the entries where ScanResult.Ssid (ay) equals ConnectedBss.ssid_bytes byte-for-byte and ScanResult.Bssid (ay) does NOT equal ConnectedBss.bssid.",
+          "node": "iface:fi.nexus.ScanResult" },
+        { "step": 4, "do": "Sort the remaining entries by ScanResult.SignalDbm descending. Render BSSID, channel (derived from ScanResult.Frequency), signal (dBm + bar-count), and security badge (ScanResult.SecurityOffered)." },
+        { "step": 5, "do": "Subscribe PropertiesChanged on each kept ScanResult path so signal/age update live (each ScanResult emits coalesced PropertiesChanged at <=1 Hz — see edge `prop:fi.nexus.ScanResult.AgeMs rel=coalescing_class to coalesce:hot`)." }
+      ],
+      "tap_actions": [
+        "Tap an alternative BSSID → 'Pin to this AP': open the active profile, write Profile.Wifi.BssidPreferred=<MAC>, then call method:fi.nexus.Wifi.Connect(profile_path) to roam onto it. This re-runs flow:connect-known-wifi.",
+        "Long-press alternative BSSID → 'Blacklist': append <MAC> to Profile.Wifi.BssidBlacklist, then call method:fi.nexus.Wifi.Connect to drop the current association if it matches the new blacklist."
+      ],
+      "do_not": [
+        "Don't show this list when prop:fi.nexus.Wifi.State != 'connected'. The diagnostic answer it provides ('alternatives to the AP I'm on') is undefined off-network — show the full scan list instead.",
+        "Don't redo a Wifi.Scan implicitly when opening the disclosure. Honour the operator's explicit gestures; surface a 'Refresh' affordance that calls method:fi.nexus.Wifi.Scan and waits on sig:fi.nexus.Wifi.ScanComplete.",
+        "Don't compare ScanResult.Ssid by lossy UTF-8. Hidden / non-printable SSIDs collide under string equality but are distinct on the wire."
+      ],
+      "see_also": ["ui_design_patterns.connected_card_recipe", "flow:scan-picker-ui", "iface:fi.nexus.ScanResult", "prop:fi.nexus.Wifi.ScanResults", "prop:fi.nexus.Wifi.ConnectedBss"]
     },
 
     "permissions_handling": {
@@ -2263,7 +2302,7 @@
             "transient_ui": "Show 'Connection failed — retrying' for ~2 s while the cool-down elapses; the backend will scan and reattempt the sticky profile."
           }
         },
-        { "n": 9, "ui": "On Wifi.ConnectComplete success (or state=connected), render the connected card per ui_design_patterns.connected_card_recipe: SSID, signal bars (subscribe Wifi.SignalDbm hot updates), security badge, IP / Subnet / Router / DNS rows, Disconnect, Forget.",
+        { "n": 9, "ui": "On Wifi.ConnectComplete success (or state=connected), render the connected card per ui_design_patterns.connected_card_recipe: SSID, signal bars (subscribe Wifi.SignalDbm hot updates), security badge, BSSID + channel (advanced disclosure, decoded from Wifi.ConnectedBss), IP / Subnet / Router / DNS rows, alternative-APs disclosure (per ui_design_patterns.alternative_aps_for_connected_ssid), Disconnect, Forget.",
           "ip_rows": {
             "_about": "Nexus does NOT publish IP-layer state on fi.nexus1 (ADR-001). Read addresses, routes, and DNS from systemd-networkd / systemd-resolved on the same system bus.",
             "go_to_flow": "flow:read-ip-info-for-connected-iface",
