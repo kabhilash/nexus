@@ -24,6 +24,32 @@ Every DD has a §1.1 "Repo Layout" section showing where the code lives, and an 
 
 When asked to draft a new detailed design doc, revise an existing one, or review one, first read `docs/DESIGN-DOCS.md`. It captures conventions for DD structure, the discipline needed to get pseudocode realistic, and the three mechanical passes (name sweep, end-to-end trace, referenced-symbol check) that catch the bulk of drift and oversight issues before a draft goes to review.
 
+## Keeping the integration knowledge graph current — MUST
+
+`docs/integration-knowledge-graph.json` is the machine-readable description of the `fi.nexus1` D-Bus surface that app integrators and UI builders consume. It is **load-bearing**: a graph that lags the code makes external integrators write code against API shapes that don't exist.
+
+**You MUST update the graph in the same commit as any code change that affects:**
+
+- A D-Bus method, signal, property, or interface name (added, removed, renamed, or changed signature).
+- An error variant, polkit action, or rate-limit class that appears on the public surface.
+- A `Manager.NotificationEvent` `kind` value, or the keys carried in its `data` dict.
+- An `Interface.StateChanged` (or technology-specific `StateChanged`) `details` dict key set, or the value enum on any documented key.
+- A profile schema field that is exposed via `fi.nexus.Profile.*` (the on-disk format reaching the wire).
+- The lifecycle / order-of-events for an operator-facing flow (e.g., disconnect-and-forget, recover-credentials-invalid, scan-picker, pair, fix-feed) — even if no method signature changed, if the *durability*, *side-effect*, *retry-window*, or *correlation* semantics shifted.
+
+**The same commit, not a follow-up.** When in doubt about whether a change qualifies, update the graph. A spurious graph edit is cheap; a stale graph misleads every external consumer.
+
+What an update typically looks like, depending on the change:
+
+- New surface → add a method/signal/property node, plus the relevant `defines_*`, `requires_polkit`, `may_return_error`, `may_emit_signal`, `rate_limit_class` edges.
+- Changed semantics → enrich the node's `attrs` (`purpose`, `durability`, `side_effect`, `note`, `see_also`, `equivalent_call`, etc.). Don't fix the bug only in code and leave the graph claiming the old shape.
+- New operator gesture or recovery path → add a `flows[]` entry walking the steps with `node:` references back to the methods/signals it touches.
+- Removed surface → delete the node and every edge that mentions it. Bump `format_version` if the deletion is breaking.
+
+Validate JSON before staging: `python3 -c "import json; json.load(open('docs/integration-knowledge-graph.json'))"`.
+
+The commit message must mention the graph update — either as a bullet in the body of the feature commit, or as a paired `docs(integration): …` commit landed *with* the feature commit, never after merge.
+
 ## Conventions
 
 ### Language and tooling
