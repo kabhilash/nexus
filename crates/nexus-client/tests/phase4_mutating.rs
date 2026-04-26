@@ -11,6 +11,19 @@
 
 use std::sync::{Arc, Mutex};
 
+/// Serializes the three tests that mutate `NEXUSCTL_PSK`. cargo test
+/// runs these concurrently in one process; without this guard, one
+/// test's `set_var` can race against another's `remove_var` and
+/// surface as `NotInteractive` from `resolve_psk`. Poisoned recovery
+/// is intentional — a panicking test shouldn't lock out the others.
+static PSK_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn psk_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    PSK_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 use async_trait::async_trait;
 use nexus_client::commands;
 use nexus_client::errors::NexusctlError;
@@ -372,6 +385,7 @@ async fn wifi_connect_without_psk_and_no_profile_escalates_to_not_interactive() 
     // `NotInteractive` (exit 5) — the correct behaviour for a
     // script that hasn't supplied `--psk` / `NEXUSCTL_PSK`.
     // Ensure NEXUSCTL_PSK isn't set from a previous test.
+    let _env = psk_env_guard();
     unsafe {
         std::env::remove_var("NEXUSCTL_PSK");
     }
@@ -404,6 +418,7 @@ async fn wifi_connect_without_psk_and_no_profile_escalates_to_not_interactive() 
 async fn wifi_connect_without_psk_uses_nexusctl_psk_env() {
     // With NEXUSCTL_PSK in the env, the interactive prompt is
     // skipped and the passphrase flow returns the env value.
+    let _env = psk_env_guard();
     unsafe {
         std::env::set_var("NEXUSCTL_PSK", "env-secret");
     }
@@ -630,6 +645,7 @@ async fn profile_add_wifi_no_psk_no_tty_exits_5() {
     // DD-008 §6.2 exit criterion: `profile add-wifi` without --psk
     // (and without NEXUSCTL_PSK) on a non-TTY must exit 5 with
     // `NotInteractive`.
+    let _env = psk_env_guard();
     unsafe {
         std::env::remove_var("NEXUSCTL_PSK");
     }
