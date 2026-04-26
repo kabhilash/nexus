@@ -91,9 +91,23 @@ impl BluetoothIface {
 
 #[zbus::interface(name = "fi.nexus.Bluetooth")]
 impl BluetoothIface {
+    /// `Address` is the adapter's BD_ADDR. It's a hardware ID — it
+    /// doesn't change at runtime — so we read it from
+    /// `InterfaceInfo.kind` (set once on `InterfaceDiscovered`)
+    /// rather than the mutable `BluetoothAdapterState.address`,
+    /// which only gets populated on the BlueZ-side
+    /// `BtAdapterChanged` event and was empty for adapters whose
+    /// only event was the initial discovery.
     #[zbus(property, name = "Address")]
     async fn address(&self) -> String {
-        self.with_cache(String::new(), |c| c.address.clone()).await
+        use nexus_core::BluetoothAddrExt;
+        let guard = self.services.state.read().await;
+        match guard.interfaces.get(&self.ifname).map(|e| &e.info.kind) {
+            Some(nexus_core::InterfaceKind::Bluetooth { bt_address, .. }) => {
+                bt_address.to_bluez()
+            }
+            _ => String::new(),
+        }
     }
 
     #[zbus(property, name = "Powered")]
