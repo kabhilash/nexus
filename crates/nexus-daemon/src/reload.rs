@@ -189,6 +189,38 @@ impl BackendOps for ReloadOps {
     async fn bt_set_powered(&self, ifname: &str, on: bool) -> nexus_dbus::Result<()> {
         self.inner.bt_set_powered(ifname, on).await
     }
+    async fn bt_set_discoverable(&self, ifname: &str, on: bool) -> nexus_dbus::Result<()> {
+        self.inner.bt_set_discoverable(ifname, on).await
+    }
+    async fn bt_set_pairable(&self, ifname: &str, on: bool) -> nexus_dbus::Result<()> {
+        self.inner.bt_set_pairable(ifname, on).await
+    }
+    async fn bt_start_discovery(
+        &self,
+        ifname: &str,
+        filter: nexus_dbus::BtDiscoveryFilter,
+    ) -> nexus_dbus::Result<()> {
+        self.inner.bt_start_discovery(ifname, filter).await
+    }
+    async fn bt_stop_discovery(&self, ifname: &str) -> nexus_dbus::Result<()> {
+        self.inner.bt_stop_discovery(ifname).await
+    }
+    async fn bt_connect_device(&self, device_path: &str) -> nexus_dbus::Result<()> {
+        self.inner.bt_connect_device(device_path).await
+    }
+    async fn bt_disconnect_device(&self, device_path: &str) -> nexus_dbus::Result<()> {
+        self.inner.bt_disconnect_device(device_path).await
+    }
+    async fn bt_forget_device(
+        &self,
+        adapter_path: &str,
+        device_path: &str,
+    ) -> nexus_dbus::Result<()> {
+        self.inner.bt_forget_device(adapter_path, device_path).await
+    }
+    async fn bt_set_trusted(&self, device_path: &str, on: bool) -> nexus_dbus::Result<()> {
+        self.inner.bt_set_trusted(device_path, on).await
+    }
     async fn wifi_set_roaming_mode(
         &self,
         ifname: &str,

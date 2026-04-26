@@ -6,10 +6,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use nexus_core::BluetoothAddrExt;
+use zbus::fdo;
+use zbus::message::Header;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
+use crate::authz::actions;
+use crate::errors::DbusError;
 use crate::paths::interface_path;
-use crate::services::Services;
+use crate::services::{Feature, Services};
 use crate::state::{BtDeviceState, InterfaceKindData};
 
 pub struct BluetoothDeviceIface {
@@ -47,6 +51,55 @@ impl BluetoothDeviceIface {
                 .map(f)
                 .unwrap_or(default),
             _ => default,
+        }
+    }
+
+    /// Resolve the parent adapter's BlueZ object path, mirroring
+    /// [`BluetoothIface::bluez_path`]. Used to scope `Forget`'s
+    /// adapter-aware cleanup.
+    async fn adapter_bluez_path(&self) -> String {
+        let guard = self.services.state.read().await;
+        guard
+            .interfaces
+            .get(&self.adapter_ifname)
+            .and_then(|e| match &e.info.kind {
+                nexus_core::InterfaceKind::Bluetooth { bluez_path, .. } => {
+                    Some(bluez_path.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("/org/bluez/{}", self.adapter_ifname))
+    }
+
+    /// Build this device's BlueZ object path
+    /// (`<adapter>/dev_AA_BB_…`). Internal nexus-bluetooth callers
+    /// expect the BlueZ-spelled path; the kernel name `hci0` plus
+    /// the underscore-form address is enough to reconstruct it.
+    async fn device_bluez_path(&self) -> String {
+        format!("{}/dev_{}", self.adapter_bluez_path().await, self.device_key)
+    }
+
+    fn check_feature(&self) -> fdo::Result<()> {
+        self.services
+            .enabled
+            .require(Feature::Bluetooth)
+            .map_err(fdo::Error::from)
+    }
+
+    async fn require_auth(&self, hdr: &Header<'_>, action: &str) -> fdo::Result<()> {
+        let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
+        if self
+            .services
+            .auth
+            .check(action, &sender)
+            .await
+            .is_authorized()
+        {
+            Ok(())
+        } else {
+            Err(fdo::Error::from(DbusError::AuthFailed(format!(
+                "policykit denied '{action}' for sender '{sender}'"
+            ))))
         }
     }
 }
@@ -168,5 +221,85 @@ impl BluetoothDeviceIface {
         ObjectPath::try_from(raw)
             .unwrap_or_else(|_| ObjectPath::try_from("/").unwrap())
             .into()
+    }
+
+    /// `Trusted` writable — `fi.nexus.profile.modify` (it persists
+    /// to the device's profile, conceptually a profile attribute).
+    /// Routes to [`crate::BackendOps::bt_set_trusted`].
+    #[zbus(property)]
+    async fn set_trusted(
+        &self,
+        #[zbus(header)] hdr: Option<Header<'_>>,
+        on: bool,
+    ) -> zbus::Result<()> {
+        if !self.services.enabled.is_enabled(Feature::Bluetooth) {
+            return Err(zbus::Error::from(zbus::fdo::Error::from(
+                DbusError::FeatureDisabled("bluetooth".to_owned()),
+            )));
+        }
+        let sender = hdr
+            .as_ref()
+            .and_then(|h| h.sender().map(|s| s.to_string()))
+            .unwrap_or_default();
+        if !self
+            .services
+            .auth
+            .check(actions::PROFILE_MODIFY, &sender)
+            .await
+            .is_authorized()
+        {
+            return Err(zbus::Error::from(zbus::fdo::Error::AuthFailed(format!(
+                "policykit denied '{}' for sender '{sender}'",
+                actions::PROFILE_MODIFY
+            ))));
+        }
+        let path = self.device_bluez_path().await;
+        self.services
+            .ops
+            .bt_set_trusted(&path, on)
+            .await
+            .map_err(|e| zbus::Error::from(zbus::fdo::Error::from(e)))
+    }
+
+    /// `Connect() -> ()` — `fi.nexus.connect`. DD-006 §6.6.
+    /// Forwards to `nexus_bluetooth::BtCommand::Connect` which
+    /// drives BlueZ's `org.bluez.Device1.Connect`.
+    async fn connect(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+        self.check_feature()?;
+        self.require_auth(&hdr, actions::CONNECT).await?;
+        let path = self.device_bluez_path().await;
+        self.services
+            .ops
+            .bt_connect_device(&path)
+            .await
+            .map_err(fdo::Error::from)
+    }
+
+    /// `Disconnect() -> ()` — `fi.nexus.connect`. DD-006 §6.6.
+    async fn disconnect(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+        self.check_feature()?;
+        self.require_auth(&hdr, actions::CONNECT).await?;
+        let path = self.device_bluez_path().await;
+        self.services
+            .ops
+            .bt_disconnect_device(&path)
+            .await
+            .map_err(fdo::Error::from)
+    }
+
+    /// `Forget() -> ()` — `fi.nexus.profile.modify`. DD-006 §6.6.
+    /// Drops the device from BlueZ's registry AND erases the
+    /// matching nexus profile, if any. `nexus_bluetooth::BtCommand::Forget`
+    /// needs both the parent adapter path and the device path.
+    async fn forget(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+        self.check_feature()?;
+        self.require_auth(&hdr, actions::PROFILE_MODIFY).await?;
+        let adapter = self.adapter_bluez_path().await;
+        let device = format!("{adapter}/dev_{}", self.device_key);
+        self.services
+            .ops
+            .bt_forget_device(&adapter, &device)
+            .await
+            .map_err(fdo::Error::from)
     }
 }

@@ -15,16 +15,20 @@
 //!                                   └─ Properties.Set on org.bluez.Adapter1
 //! ```
 //!
-//! Live: `bt_set_powered` only (the smallest slice needed for
-//! `nexusctl bt power on/off`). Discoverable / Pairable / discovery
-//! / device methods stay on `inner` (typically `NoopOps`) until a
-//! follow-up commit grows the surface.
+//! Live: `bt_set_powered`, `bt_set_discoverable`, `bt_set_pairable`,
+//! `bt_set_trusted`, `bt_start_discovery`, `bt_stop_discovery`,
+//! `bt_connect_device`, `bt_disconnect_device`, `bt_forget_device`.
+//! Pairing-flow methods (`Pair` / `AnswerPairingPrompt` /
+//! `CancelPairing`) are deferred — they need the prompt-signal
+//! plumbing landed first.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use nexus_bluetooth::{BtCommand, BtError};
-use nexus_dbus::{BackendOps, DbusError, ReloadReport, Result};
+use nexus_bluetooth::{
+    BtCommand, BtError, DiscoveryFilter, DiscoveryTransport,
+};
+use nexus_dbus::{BackendOps, BtDiscoveryFilter, DbusError, ReloadReport, Result};
 use tokio::sync::{mpsc, oneshot};
 
 /// `BackendOps` impl that forwards Bluetooth commands over a channel
@@ -60,26 +64,150 @@ fn map_bt_error(e: BtError) -> DbusError {
     }
 }
 
+/// Translate the cross-crate [`BtDiscoveryFilter`] view into the
+/// nexus-bluetooth-private [`DiscoveryFilter`]. An unrecognised
+/// `transport` string short-circuits to `InvalidArgument` so the
+/// operator gets a useful error before BlueZ does.
+fn convert_filter(f: BtDiscoveryFilter) -> std::result::Result<DiscoveryFilter, DbusError> {
+    let transport = match f.transport.as_deref() {
+        None => None,
+        Some("auto") => Some(DiscoveryTransport::Auto),
+        Some("bredr") => Some(DiscoveryTransport::Bredr),
+        Some("le") => Some(DiscoveryTransport::Le),
+        Some(other) => {
+            return Err(DbusError::InvalidArgument(format!(
+                "transport must be 'auto'|'bredr'|'le', got '{other}'"
+            )));
+        }
+    };
+    Ok(DiscoveryFilter {
+        transport,
+        rssi: f.rssi,
+        uuids: f.uuids,
+        duplicate_data: f.duplicate_data,
+    })
+}
+
+/// Send a [`BtCommand`] (built by the closure with our oneshot
+/// sender) and wait for its reply. Channel-closed and
+/// reply-dropped both surface as `FeatureDisabled` (matches the
+/// Wi-Fi adapter's vocabulary).
+async fn dispatch(
+    commands: &mpsc::Sender<BtCommand>,
+    make: impl FnOnce(oneshot::Sender<nexus_bluetooth::Result<()>>) -> BtCommand,
+) -> Result<()> {
+    let (tx, rx) = oneshot::channel();
+    commands
+        .send(make(tx))
+        .await
+        .map_err(|_| DbusError::FeatureDisabled("bluetooth: backend channel closed".into()))?;
+    match rx.await {
+        Ok(r) => r.map_err(map_bt_error),
+        Err(_) => Err(DbusError::FeatureDisabled(
+            "bluetooth: backend dropped the reply".into(),
+        )),
+    }
+}
+
 #[async_trait]
 impl BackendOps for BtBackendOps {
-    async fn bt_set_powered(&self, ifname: &str, on: bool) -> Result<()> {
-        let (responder, reply) = oneshot::channel();
-        self.commands
-            .send(BtCommand::SetAdapterPowered {
-                adapter: ifname.to_owned(),
+    async fn bt_set_powered(&self, bluez_path: &str, on: bool) -> Result<()> {
+        let adapter = bluez_path.to_owned();
+        dispatch(&self.commands, |responder| BtCommand::SetAdapterPowered {
+            adapter,
+            on,
+            responder,
+        })
+        .await
+    }
+
+    async fn bt_set_discoverable(&self, bluez_path: &str, on: bool) -> Result<()> {
+        let adapter = bluez_path.to_owned();
+        dispatch(&self.commands, |responder| {
+            BtCommand::SetAdapterDiscoverable {
+                adapter,
                 on,
                 responder,
-            })
-            .await
-            .map_err(|_| {
-                DbusError::FeatureDisabled("bluetooth: backend channel closed".into())
-            })?;
-        match reply.await {
-            Ok(r) => r.map_err(map_bt_error),
-            Err(_) => Err(DbusError::FeatureDisabled(
-                "bluetooth: backend dropped the reply".into(),
-            )),
-        }
+            }
+        })
+        .await
+    }
+
+    async fn bt_set_pairable(&self, bluez_path: &str, on: bool) -> Result<()> {
+        let adapter = bluez_path.to_owned();
+        dispatch(&self.commands, |responder| BtCommand::SetAdapterPairable {
+            adapter,
+            on,
+            responder,
+        })
+        .await
+    }
+
+    async fn bt_start_discovery(
+        &self,
+        bluez_path: &str,
+        filter: BtDiscoveryFilter,
+    ) -> Result<()> {
+        let adapter = bluez_path.to_owned();
+        let filter = convert_filter(filter)?;
+        dispatch(&self.commands, |responder| BtCommand::StartDiscovery {
+            adapter,
+            filter,
+            responder,
+        })
+        .await
+    }
+
+    async fn bt_stop_discovery(&self, bluez_path: &str) -> Result<()> {
+        let adapter = bluez_path.to_owned();
+        dispatch(&self.commands, |responder| BtCommand::StopDiscovery {
+            adapter,
+            responder,
+        })
+        .await
+    }
+
+    async fn bt_connect_device(&self, device_path: &str) -> Result<()> {
+        let device_path = device_path.to_owned();
+        dispatch(&self.commands, |responder| BtCommand::Connect {
+            device_path,
+            responder,
+        })
+        .await
+    }
+
+    async fn bt_disconnect_device(&self, device_path: &str) -> Result<()> {
+        let device_path = device_path.to_owned();
+        dispatch(&self.commands, |responder| BtCommand::Disconnect {
+            device_path,
+            responder,
+        })
+        .await
+    }
+
+    async fn bt_forget_device(
+        &self,
+        adapter_bluez_path: &str,
+        device_path: &str,
+    ) -> Result<()> {
+        let adapter = adapter_bluez_path.to_owned();
+        let device_path = device_path.to_owned();
+        dispatch(&self.commands, |responder| BtCommand::Forget {
+            adapter,
+            device_path,
+            responder,
+        })
+        .await
+    }
+
+    async fn bt_set_trusted(&self, device_path: &str, on: bool) -> Result<()> {
+        let device_path = device_path.to_owned();
+        dispatch(&self.commands, |responder| BtCommand::SetDeviceTrusted {
+            device_path,
+            on,
+            responder,
+        })
+        .await
     }
 
     // ---- Pass-throughs (every other method falls through to
@@ -195,5 +323,137 @@ mod tests {
         let ops = BtBackendOps::new(cmd_tx, NoopOps::arc());
         let err = ops.reload_config().await.unwrap_err();
         assert!(matches!(err, DbusError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn start_discovery_passes_filter_and_dispatches() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<BtCommand>(4);
+        let ops = BtBackendOps::new(cmd_tx, NoopOps::arc());
+        tokio::spawn(async move {
+            if let Some(BtCommand::StartDiscovery {
+                adapter,
+                filter,
+                responder,
+            }) = cmd_rx.recv().await
+            {
+                assert_eq!(adapter, "/org/bluez/hci0");
+                // Filter should be translated 1:1.
+                assert!(matches!(filter.transport, Some(DiscoveryTransport::Le)));
+                assert_eq!(filter.rssi, Some(-70));
+                let _ = responder.send(Ok(()));
+            }
+        });
+        let f = BtDiscoveryFilter {
+            transport: Some("le".into()),
+            rssi: Some(-70),
+            uuids: Vec::new(),
+            duplicate_data: false,
+        };
+        assert!(
+            ops.bt_start_discovery("/org/bluez/hci0", f)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn start_discovery_rejects_unknown_transport() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<BtCommand>(4);
+        let ops = BtBackendOps::new(cmd_tx, NoopOps::arc());
+        let f = BtDiscoveryFilter {
+            transport: Some("infrared".into()),
+            ..Default::default()
+        };
+        let err = ops
+            .bt_start_discovery("/org/bluez/hci0", f)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbusError::InvalidArgument(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn stop_discovery_dispatches_with_adapter() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<BtCommand>(4);
+        let ops = BtBackendOps::new(cmd_tx, NoopOps::arc());
+        tokio::spawn(async move {
+            if let Some(BtCommand::StopDiscovery { adapter, responder }) = cmd_rx.recv().await {
+                assert_eq!(adapter, "/org/bluez/hci0");
+                let _ = responder.send(Ok(()));
+            }
+        });
+        assert!(ops.bt_stop_discovery("/org/bluez/hci0").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_device_dispatches_with_device_path() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<BtCommand>(4);
+        let ops = BtBackendOps::new(cmd_tx, NoopOps::arc());
+        tokio::spawn(async move {
+            if let Some(BtCommand::Connect {
+                device_path,
+                responder,
+            }) = cmd_rx.recv().await
+            {
+                assert_eq!(device_path, "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF");
+                let _ = responder.send(Ok(()));
+            }
+        });
+        assert!(
+            ops.bt_connect_device("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_device_passes_adapter_and_device() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<BtCommand>(4);
+        let ops = BtBackendOps::new(cmd_tx, NoopOps::arc());
+        tokio::spawn(async move {
+            if let Some(BtCommand::Forget {
+                adapter,
+                device_path,
+                responder,
+            }) = cmd_rx.recv().await
+            {
+                assert_eq!(adapter, "/org/bluez/hci0");
+                assert_eq!(device_path, "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF");
+                let _ = responder.send(Ok(()));
+            }
+        });
+        assert!(
+            ops.bt_forget_device(
+                "/org/bluez/hci0",
+                "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_trusted_dispatches_set_device_trusted() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<BtCommand>(4);
+        let ops = BtBackendOps::new(cmd_tx, NoopOps::arc());
+        tokio::spawn(async move {
+            if let Some(BtCommand::SetDeviceTrusted {
+                device_path,
+                on,
+                responder,
+            }) = cmd_rx.recv().await
+            {
+                assert_eq!(device_path, "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF");
+                assert!(on);
+                let _ = responder.send(Ok(()));
+            }
+        });
+        assert!(
+            ops.bt_set_trusted(
+                "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+                true,
+            )
+            .await
+            .is_ok()
+        );
     }
 }

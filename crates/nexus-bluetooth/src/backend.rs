@@ -83,6 +83,17 @@ pub enum BtCommand {
         on: bool,
         responder: oneshot::Sender<Result<()>>,
     },
+    /// Operator-initiated `Trusted` flip on a known device. Routes
+    /// to `BluezClient::set_trusted` (which maps to BlueZ's
+    /// `org.bluez.Device1.Trusted` property setter). Pairing also
+    /// flips Trusted internally based on the profile's
+    /// `auto_connect` flag — this command is the explicit
+    /// operator-driven path.
+    SetDeviceTrusted {
+        device_path: String,
+        on: bool,
+        responder: oneshot::Sender<Result<()>>,
+    },
     StartDiscovery {
         adapter: String,
         filter: DiscoveryFilter,
@@ -778,6 +789,13 @@ impl BluetoothBackend {
                 responder,
             } => {
                 let _ = responder.send(self.bluez.set_pairable(&adapter, on).await);
+            }
+            BtCommand::SetDeviceTrusted {
+                device_path,
+                on,
+                responder,
+            } => {
+                let _ = responder.send(self.bluez.set_trusted(&device_path, on).await);
             }
             BtCommand::StartDiscovery {
                 adapter,

@@ -1614,6 +1614,96 @@ async fn bluetooth_set_powered_allowed_calls_backend() {
 }
 
 #[tokio::test]
+async fn bluetooth_start_discovery_allowed_dispatches_to_ops() {
+    // The original cause of `nexusctl bt scan hci0` →
+    // `UnknownMethod: 'StartDiscovery'`. Asserts the method is
+    // declared, polkit-gated, and reaches the backend with the
+    // adapter's BlueZ object path.
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let (handle, event_tx) = spawn(
+        &bus,
+        "fi.nexus1.test_btscan_ok",
+        always_allow(),
+        Arc::clone(&ops) as Arc<dyn BackendOps>,
+    )
+    .await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(hci_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let mut filter: HashMap<String, OwnedValue> = HashMap::new();
+    filter.insert("transport".into(), str_value("auto"));
+    client
+        .call_method(
+            Some("fi.nexus1.test_btscan_ok"),
+            "/fi/nexus1/interface/hci0",
+            Some("fi.nexus.Bluetooth"),
+            "StartDiscovery",
+            &(filter,),
+        )
+        .await
+        .expect("StartDiscovery");
+
+    let calls = ops.calls();
+    let hit = calls.iter().any(|c| {
+        matches!(
+            c,
+            RecordedCall::BtStartDiscovery { adapter_path, .. }
+                if adapter_path == "/org/bluez/hci0"
+        )
+    });
+    assert!(hit, "expected BtStartDiscovery, got {calls:?}");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn bluetooth_start_discovery_denied_returns_auth_failed() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let (handle, event_tx) = spawn(
+        &bus,
+        "fi.nexus1.test_btscan_deny",
+        always_deny(),
+        Arc::clone(&ops) as Arc<dyn BackendOps>,
+    )
+    .await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(hci_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = bus.connection().await;
+    let empty: HashMap<String, OwnedValue> = HashMap::new();
+    let err = client
+        .call_method(
+            Some("fi.nexus1.test_btscan_deny"),
+            "/fi/nexus1/interface/hci0",
+            Some("fi.nexus.Bluetooth"),
+            "StartDiscovery",
+            &(empty,),
+        )
+        .await
+        .expect_err("StartDiscovery should be denied");
+    let name = err.to_string();
+    assert!(
+        name.contains("AuthFailed") || name.contains("Auth failed"),
+        "expected AuthFailed, got {name}"
+    );
+    assert!(
+        ops.calls()
+            .iter()
+            .all(|c| !matches!(c, RecordedCall::BtStartDiscovery { .. })),
+        "ops saw start_discovery despite deny: {:?}",
+        ops.calls()
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
 async fn bluetooth_set_powered_returns_feature_disabled_when_off() {
     let bus = Bus::spawn().await;
     tokio::time::sleep(Duration::from_millis(50)).await;

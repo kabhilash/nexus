@@ -50,6 +50,23 @@ pub struct ScanParams {
     pub allow_roam: bool,
 }
 
+/// Bluetooth discovery filter parsed from the
+/// `Bluetooth.StartDiscovery(filter: a{sv})` dict — DD-006 §6.4.
+/// Mirrors `nexus_bluetooth::DiscoveryFilter`; kept here so the
+/// `BackendOps` trait stays decoupled from the bluetooth crate. The
+/// daemon's adapter translates this into the bluetooth-crate type
+/// before sending the command.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BtDiscoveryFilter {
+    /// `None` means BlueZ's "auto"; otherwise one of `"auto"`,
+    /// `"bredr"`, `"le"`. Anything else is rejected at the
+    /// translation boundary.
+    pub transport: Option<String>,
+    pub rssi: Option<i16>,
+    pub uuids: Vec<String>,
+    pub duplicate_data: bool,
+}
+
 /// Wi-Fi roaming-mode strings — DD-006 §6.3 `RoamingMode` property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoamingMode {
@@ -114,18 +131,76 @@ pub trait BackendOps: Send + Sync {
         Err(DbusError::Unsupported("wifi_provide_credential".into()))
     }
 
-    // ---- Bluetooth (DD-006 §6.4) ----
+    // ---- Bluetooth (DD-006 §6.4 / §6.6) ----
+    //
+    // Adapter / device path arguments below are always BlueZ object
+    // paths (`/org/bluez/hciN[/dev_AA_BB_…]`), never bare ifnames.
+    // The kernel ifname is not a valid `zbus::ObjectPath` on its own
+    // — the D-Bus interfaces look up the path from the registry
+    // before calling these methods.
 
     /// `fi.nexus.Bluetooth.Powered` setter — flip the BlueZ adapter's
-    /// `Powered` property via the live BlueZ client. The D-Bus layer
-    /// declares `Powered` writable; this routes the call through to
-    /// `nexus_bluetooth::BtCommand::SetAdapterPowered`. `bluez_path`
-    /// is the adapter's BlueZ object path (`/org/bluez/hciN`) — the
-    /// kernel ifname `hci0` is NOT a valid object path on its own,
-    /// so the D-Bus interface looks up the path from the registry
-    /// before calling this.
+    /// `Powered` property via the live BlueZ client. Routes to
+    /// `nexus_bluetooth::BtCommand::SetAdapterPowered`.
     async fn bt_set_powered(&self, _bluez_path: &str, _on: bool) -> Result<()> {
         Err(DbusError::Unsupported("bt_set_powered".into()))
+    }
+
+    /// `fi.nexus.Bluetooth.Discoverable` setter. Routes to
+    /// `nexus_bluetooth::BtCommand::SetAdapterDiscoverable`.
+    async fn bt_set_discoverable(&self, _bluez_path: &str, _on: bool) -> Result<()> {
+        Err(DbusError::Unsupported("bt_set_discoverable".into()))
+    }
+
+    /// `fi.nexus.Bluetooth.Pairable` setter. Routes to
+    /// `nexus_bluetooth::BtCommand::SetAdapterPairable`.
+    async fn bt_set_pairable(&self, _bluez_path: &str, _on: bool) -> Result<()> {
+        Err(DbusError::Unsupported("bt_set_pairable".into()))
+    }
+
+    /// `fi.nexus.Bluetooth.StartDiscovery(filter)`. Routes to
+    /// `nexus_bluetooth::BtCommand::StartDiscovery`.
+    async fn bt_start_discovery(
+        &self,
+        _bluez_path: &str,
+        _filter: BtDiscoveryFilter,
+    ) -> Result<()> {
+        Err(DbusError::Unsupported("bt_start_discovery".into()))
+    }
+
+    /// `fi.nexus.Bluetooth.StopDiscovery()`. Routes to
+    /// `nexus_bluetooth::BtCommand::StopDiscovery`.
+    async fn bt_stop_discovery(&self, _bluez_path: &str) -> Result<()> {
+        Err(DbusError::Unsupported("bt_stop_discovery".into()))
+    }
+
+    /// `fi.nexus.BluetoothDevice.Connect()`. Routes to
+    /// `nexus_bluetooth::BtCommand::Connect`.
+    async fn bt_connect_device(&self, _device_path: &str) -> Result<()> {
+        Err(DbusError::Unsupported("bt_connect_device".into()))
+    }
+
+    /// `fi.nexus.BluetoothDevice.Disconnect()`. Routes to
+    /// `nexus_bluetooth::BtCommand::Disconnect`.
+    async fn bt_disconnect_device(&self, _device_path: &str) -> Result<()> {
+        Err(DbusError::Unsupported("bt_disconnect_device".into()))
+    }
+
+    /// `fi.nexus.BluetoothDevice.Forget()`. Drops the device from
+    /// BlueZ's registry AND from Nexus's profile store. Routes to
+    /// `nexus_bluetooth::BtCommand::Forget`.
+    async fn bt_forget_device(
+        &self,
+        _adapter_bluez_path: &str,
+        _device_path: &str,
+    ) -> Result<()> {
+        Err(DbusError::Unsupported("bt_forget_device".into()))
+    }
+
+    /// `fi.nexus.BluetoothDevice.Trusted` setter. Routes to
+    /// `nexus_bluetooth::BtCommand::SetDeviceTrusted`.
+    async fn bt_set_trusted(&self, _device_path: &str, _on: bool) -> Result<()> {
+        Err(DbusError::Unsupported("bt_set_trusted".into()))
     }
 
     // ---- Manager-level (DD-006 §5) ----
@@ -178,6 +253,20 @@ pub enum RecordedCall {
     WifiRoam { ifname: String, bssid: MacAddr },
     WifiSetPowered { ifname: String, on: bool },
     BtSetPowered { ifname: String, on: bool },
+    BtSetDiscoverable { adapter_path: String, on: bool },
+    BtSetPairable { adapter_path: String, on: bool },
+    BtStartDiscovery {
+        adapter_path: String,
+        filter: BtDiscoveryFilter,
+    },
+    BtStopDiscovery { adapter_path: String },
+    BtConnectDevice { device_path: String },
+    BtDisconnectDevice { device_path: String },
+    BtForgetDevice {
+        adapter_path: String,
+        device_path: String,
+    },
+    BtSetTrusted { device_path: String, on: bool },
     WifiSetRoamingMode { ifname: String, mode: RoamingMode },
     WifiProvideCredential {
         ifname: String,
@@ -268,6 +357,91 @@ impl BackendOps for RecordingOps {
     async fn bt_set_powered(&self, bluez_path: &str, on: bool) -> Result<()> {
         self.record(RecordedCall::BtSetPowered {
             ifname: bluez_path.to_owned(),
+            on,
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn bt_set_discoverable(&self, bluez_path: &str, on: bool) -> Result<()> {
+        self.record(RecordedCall::BtSetDiscoverable {
+            adapter_path: bluez_path.to_owned(),
+            on,
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn bt_set_pairable(&self, bluez_path: &str, on: bool) -> Result<()> {
+        self.record(RecordedCall::BtSetPairable {
+            adapter_path: bluez_path.to_owned(),
+            on,
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn bt_start_discovery(
+        &self,
+        bluez_path: &str,
+        filter: BtDiscoveryFilter,
+    ) -> Result<()> {
+        self.record(RecordedCall::BtStartDiscovery {
+            adapter_path: bluez_path.to_owned(),
+            filter,
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn bt_stop_discovery(&self, bluez_path: &str) -> Result<()> {
+        self.record(RecordedCall::BtStopDiscovery {
+            adapter_path: bluez_path.to_owned(),
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn bt_connect_device(&self, device_path: &str) -> Result<()> {
+        self.record(RecordedCall::BtConnectDevice {
+            device_path: device_path.to_owned(),
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn bt_disconnect_device(&self, device_path: &str) -> Result<()> {
+        self.record(RecordedCall::BtDisconnectDevice {
+            device_path: device_path.to_owned(),
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn bt_forget_device(
+        &self,
+        adapter_bluez_path: &str,
+        device_path: &str,
+    ) -> Result<()> {
+        self.record(RecordedCall::BtForgetDevice {
+            adapter_path: adapter_bluez_path.to_owned(),
+            device_path: device_path.to_owned(),
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn bt_set_trusted(&self, device_path: &str, on: bool) -> Result<()> {
+        self.record(RecordedCall::BtSetTrusted {
+            device_path: device_path.to_owned(),
             on,
         });
         if let Some(e) = self.consume_error() {

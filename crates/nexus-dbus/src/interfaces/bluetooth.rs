@@ -1,14 +1,17 @@
-//! `fi.nexus.Bluetooth` — DD-006 §6.4. Read-only properties plus a
-//! writable `Powered` (so `nexusctl bt power on/off` can flip the
-//! BlueZ adapter through the daemon).
+//! `fi.nexus.Bluetooth` — DD-006 §6.4. Properties + the operator
+//! mutating surface (`Powered` / `Discoverable` / `Pairable`
+//! setters, `StartDiscovery` / `StopDiscovery` methods).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use nexus_core::PairingAnswer;
+use zbus::fdo;
 use zbus::message::Header;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use crate::authz::actions;
+use crate::backend_ops::BtDiscoveryFilter;
 use crate::errors::DbusError;
 use crate::paths::bluetooth_device_path;
 use crate::services::{Feature, Services};
@@ -60,6 +63,30 @@ impl BluetoothIface {
             })
             .unwrap_or_else(|| format!("/org/bluez/{}", self.ifname))
     }
+
+    fn check_feature(&self) -> fdo::Result<()> {
+        self.services
+            .enabled
+            .require(Feature::Bluetooth)
+            .map_err(fdo::Error::from)
+    }
+
+    async fn require_auth(&self, hdr: &Header<'_>, action: &str) -> fdo::Result<()> {
+        let sender = hdr.sender().map(|s| s.to_string()).unwrap_or_default();
+        if self
+            .services
+            .auth
+            .check(action, &sender)
+            .await
+            .is_authorized()
+        {
+            Ok(())
+        } else {
+            Err(fdo::Error::from(DbusError::AuthFailed(format!(
+                "policykit denied '{action}' for sender '{sender}'"
+            ))))
+        }
+    }
 }
 
 #[zbus::interface(name = "fi.nexus.Bluetooth")]
@@ -87,32 +114,84 @@ impl BluetoothIface {
         #[zbus(header)] hdr: Option<Header<'_>>,
         on: bool,
     ) -> zbus::Result<()> {
-        if !self.services.enabled.is_enabled(Feature::Bluetooth) {
-            return Err(zbus::Error::from(zbus::fdo::Error::from(
-                DbusError::FeatureDisabled("bluetooth".to_owned()),
-            )));
-        }
-        let sender = hdr
-            .as_ref()
-            .and_then(|h| h.sender().map(|s| s.to_string()))
-            .unwrap_or_default();
-        if !self
-            .services
-            .auth
-            .check(actions::SET_POWER, &sender)
-            .await
-            .is_authorized()
-        {
-            return Err(zbus::Error::from(zbus::fdo::Error::AuthFailed(
-                "Powered set denied".into(),
-            )));
-        }
+        gate_property_setter(self, hdr.as_ref(), actions::SET_POWER).await?;
         let path = self.bluez_path().await;
         self.services
             .ops
             .bt_set_powered(&path, on)
             .await
             .map_err(|e| zbus::Error::from(zbus::fdo::Error::from(e)))
+    }
+
+    /// `Discoverable` writable — `fi.nexus.connect`. Routes to
+    /// [`crate::BackendOps::bt_set_discoverable`].
+    #[zbus(property)]
+    async fn set_discoverable(
+        &self,
+        #[zbus(header)] hdr: Option<Header<'_>>,
+        on: bool,
+    ) -> zbus::Result<()> {
+        gate_property_setter(self, hdr.as_ref(), actions::CONNECT).await?;
+        let path = self.bluez_path().await;
+        self.services
+            .ops
+            .bt_set_discoverable(&path, on)
+            .await
+            .map_err(|e| zbus::Error::from(zbus::fdo::Error::from(e)))
+    }
+
+    /// `Pairable` writable — `fi.nexus.connect`. Routes to
+    /// [`crate::BackendOps::bt_set_pairable`].
+    #[zbus(property)]
+    async fn set_pairable(
+        &self,
+        #[zbus(header)] hdr: Option<Header<'_>>,
+        on: bool,
+    ) -> zbus::Result<()> {
+        gate_property_setter(self, hdr.as_ref(), actions::CONNECT).await?;
+        let path = self.bluez_path().await;
+        self.services
+            .ops
+            .bt_set_pairable(&path, on)
+            .await
+            .map_err(|e| zbus::Error::from(zbus::fdo::Error::from(e)))
+    }
+
+    /// `StartDiscovery(filter: a{sv}) -> ()` — DD-006 §6.4.
+    /// Recognised keys: `transport` (s), `rssi` (n), `uuids` (as),
+    /// `duplicate_data` (b). Unknown keys are ignored — clients can
+    /// probe future-added knobs without server-side validation churn.
+    async fn start_discovery(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        filter: HashMap<String, OwnedValue>,
+    ) -> fdo::Result<()> {
+        self.check_feature()?;
+        self.require_auth(&hdr, actions::CONNECT).await?;
+        let parsed = decode_discovery_filter(&filter).map_err(|e| {
+            fdo::Error::from(DbusError::InvalidArgument(e))
+        })?;
+        let path = self.bluez_path().await;
+        self.services
+            .ops
+            .bt_start_discovery(&path, parsed)
+            .await
+            .map_err(fdo::Error::from)
+    }
+
+    /// `StopDiscovery() -> ()` — DD-006 §6.4. The bluetooth backend
+    /// only stops the radio when *every* nexus-driven discovery
+    /// session has been stopped (BlueZ handles ref-counting across
+    /// senders).
+    async fn stop_discovery(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+        self.check_feature()?;
+        self.require_auth(&hdr, actions::CONNECT).await?;
+        let path = self.bluez_path().await;
+        self.services
+            .ops
+            .bt_stop_discovery(&path)
+            .await
+            .map_err(fdo::Error::from)
     }
 
     #[zbus(property, name = "Discoverable")]
@@ -154,6 +233,72 @@ impl BluetoothIface {
     async fn state(&self) -> String {
         self.with_cache(String::new(), |c| c.state.clone()).await
     }
+}
+
+/// Common gate for the property setters on `BluetoothIface`:
+/// feature-disabled short-circuit + polkit deny → `AuthFailed`.
+/// Returns the same `zbus::Result<()>` shape every property setter
+/// uses, so each one can `?`-propagate.
+async fn gate_property_setter(
+    iface: &BluetoothIface,
+    hdr: Option<&Header<'_>>,
+    action: &str,
+) -> zbus::Result<()> {
+    if !iface.services.enabled.is_enabled(Feature::Bluetooth) {
+        return Err(zbus::Error::from(zbus::fdo::Error::from(
+            DbusError::FeatureDisabled("bluetooth".to_owned()),
+        )));
+    }
+    let sender = hdr
+        .and_then(|h| h.sender().map(|s| s.to_string()))
+        .unwrap_or_default();
+    if iface
+        .services
+        .auth
+        .check(action, &sender)
+        .await
+        .is_authorized()
+    {
+        Ok(())
+    } else {
+        Err(zbus::Error::from(zbus::fdo::Error::AuthFailed(format!(
+            "policykit denied '{action}' for sender '{sender}'"
+        ))))
+    }
+}
+
+/// Decode the `Bluetooth.StartDiscovery(filter: a{sv})` dict into
+/// the cross-crate [`BtDiscoveryFilter`] view. Unknown keys are
+/// silently ignored — clients can probe new fields without
+/// breaking the call. Type mismatches return a human-readable
+/// reason (mapped to `InvalidArgument` by the caller).
+fn decode_discovery_filter(
+    dict: &HashMap<String, OwnedValue>,
+) -> std::result::Result<BtDiscoveryFilter, String> {
+    let mut out = BtDiscoveryFilter::default();
+    if let Some(v) = dict.get("transport") {
+        let s: &str = <&str>::try_from(v)
+            .map_err(|e| format!("'transport' must be a string: {e}"))?;
+        out.transport = Some(s.to_owned());
+    }
+    if let Some(v) = dict.get("rssi") {
+        let n = i16::try_from(v)
+            .map_err(|e| format!("'rssi' must be int16: {e}"))?;
+        out.rssi = Some(n);
+    }
+    if let Some(v) = dict.get("uuids") {
+        let arr = <&zbus::zvariant::Array>::try_from(v)
+            .map_err(|e| format!("'uuids' must be a string array: {e}"))?;
+        out.uuids = arr
+            .iter()
+            .filter_map(|item| <&str>::try_from(item).ok().map(str::to_owned))
+            .collect();
+    }
+    if let Some(v) = dict.get("duplicate_data") {
+        out.duplicate_data = bool::try_from(v)
+            .map_err(|e| format!("'duplicate_data' must be a boolean: {e}"))?;
+    }
+    Ok(out)
 }
 
 /// Decode a D-Bus variant payload into a neutral [`PairingAnswer`].
