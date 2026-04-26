@@ -13,6 +13,7 @@
 //! integration tests can exercise them without re-implementing the
 //! glue. The `nexusd` binary wires them together in `main.rs`.
 
+pub mod bt_ops;
 pub mod bus;
 pub mod config;
 pub mod preflight;
@@ -20,6 +21,7 @@ pub mod reload;
 pub mod supervision;
 pub mod wifi_ops;
 
+pub use bt_ops::BtBackendOps;
 pub use bus::spawn_bus;
 pub use config::{
     BluetoothSection, Config, ConfigError, DbusSection, EthernetSection, GnssDefaultsSection,

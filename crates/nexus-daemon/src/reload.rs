@@ -186,6 +186,9 @@ impl BackendOps for ReloadOps {
     async fn wifi_set_powered(&self, ifname: &str, on: bool) -> nexus_dbus::Result<()> {
         self.inner.wifi_set_powered(ifname, on).await
     }
+    async fn bt_set_powered(&self, ifname: &str, on: bool) -> nexus_dbus::Result<()> {
+        self.inner.bt_set_powered(ifname, on).await
+    }
     async fn wifi_set_roaming_mode(
         &self,
         ifname: &str,

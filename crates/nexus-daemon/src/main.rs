@@ -18,10 +18,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
-use nexus_bluetooth::{BluetoothConfig, MockBluezClient, ZbusBluezClient, spawn_bluetooth_backend};
+use nexus_bluetooth::{BluetoothConfig, MockBluezClient, ZbusBluezClient};
 use nexus_core::NexusEvent;
 use nexus_daemon::{
-    Config, LogLevelSetter, ReloadCoordinator, ReloadOps, SubsystemName, WifiBackendOps, preflight,
+    BtBackendOps, Config, LogLevelSetter, ReloadCoordinator, ReloadOps, SubsystemName,
+    WifiBackendOps, preflight,
     spawn_bus, spawn_supervised,
 };
 use nexus_dbus::{
@@ -546,11 +547,23 @@ async fn spawn_all(
         info!("wifi disabled — skipping");
     }
 
+    // Same pattern as `wifi_cmd_tx` above: create the bluetooth
+    // command channel here so the D-Bus layer (built below) can hold
+    // a clone of the sender while the supervised bluetooth task owns
+    // the receiver. `Option<...>` so the dbus arm can tell whether
+    // bluetooth is live and swap in `BtBackendOps` accordingly.
+    let mut bt_cmd_tx: Option<tokio::sync::mpsc::Sender<nexus_bluetooth::BtCommand>> = None;
     if config.bluetooth.enabled {
         let ev = event_tx.clone();
         let store = Arc::clone(&profile_store);
         let bt_cfg = build_bluetooth_config(&config.bluetooth);
         let mock = config.bluetooth.mock;
+        let (cmd_tx, cmd_rx) = nexus_bluetooth::command_channel();
+        bt_cmd_tx = Some(cmd_tx.clone());
+        // `cmd_rx` is !Clone — wrap in Option so the FnMut closure
+        // can `take()` it on first call. The supervisor only invokes
+        // the closure once per lifecycle start.
+        let cmd_rx = Arc::new(tokio::sync::Mutex::new(Some(cmd_rx)));
         out.push((
             SubsystemName::Bluetooth,
             spawn_supervised(
@@ -562,13 +575,22 @@ async fn spawn_all(
                     let ev = ev.clone();
                     let store = Arc::clone(&store);
                     let bt_cfg = bt_cfg.clone();
+                    let cmd_tx = cmd_tx.clone();
+                    let cmd_rx = Arc::clone(&cmd_rx);
                     async move {
                         let bluez: Arc<dyn nexus_bluetooth::BluezClient> = if mock {
                             Arc::new(MockBluezClient::new(ev.clone()))
                         } else {
                             Arc::new(ZbusBluezClient::new(ev.clone()))
                         };
-                        let handle = spawn_bluetooth_backend(bluez, store, ev, bt_cfg);
+                        let cmd_rx = cmd_rx
+                            .lock()
+                            .await
+                            .take()
+                            .ok_or_else(|| anyhow!("bluetooth cmd_rx already consumed"))?;
+                        let handle = nexus_bluetooth::spawn_bluetooth_backend_with_channel(
+                            bluez, store, ev, bt_cfg, cmd_tx, cmd_rx,
+                        );
                         let mut join = handle.join;
                         let inner = handle.shutdown;
                         let res = tokio::select! {
@@ -631,8 +653,13 @@ async fn spawn_all(
 
     if config.dbus.enabled {
         let store = Arc::clone(&profile_store);
-        let dbus_cfg =
-            build_dbus_config(config, Arc::clone(&reload_coordinator), wifi_cmd_tx.clone()).await?;
+        let dbus_cfg = build_dbus_config(
+            config,
+            Arc::clone(&reload_coordinator),
+            wifi_cmd_tx.clone(),
+            bt_cmd_tx.clone(),
+        )
+        .await?;
         // Subscribe now, before any event-producing subsystem starts
         // (interface_monitor's cold-boot dump fires during bootstrap).
         // If we subscribed inside the supervised closure, the dbus
@@ -807,6 +834,7 @@ async fn build_dbus_config(
     config: &Config,
     reload_coordinator: Arc<ReloadCoordinator>,
     wifi_commands: Option<tokio::sync::mpsc::Sender<nexus_wifi::WifiCommand>>,
+    bt_commands: Option<tokio::sync::mpsc::Sender<nexus_bluetooth::BtCommand>>,
 ) -> Result<DbusConfig> {
     let auth = if config.dbus.allow_all_authz {
         always_allow()
@@ -833,17 +861,23 @@ async fn build_dbus_config(
     };
     // BackendOps layering, bottom → top:
     //   NoopOps              — every method returns Unsupported by default.
-    //   WifiBackendOps       — overrides wifi_scan; only present when the
+    //   WifiBackendOps       — overrides wifi_*; only present when the
     //                          wifi subsystem is enabled.
+    //   BtBackendOps         — overrides bt_set_powered; only present
+    //                          when the bluetooth subsystem is enabled.
     //   ReloadOps            — always on top; routes Manager.ReloadConfig
     //                          into the daemon's ReloadCoordinator and
     //                          passes every other method through.
     let noop: Arc<dyn BackendOps> = NoopOps::arc();
-    let mid: Arc<dyn BackendOps> = match wifi_commands {
+    let with_wifi: Arc<dyn BackendOps> = match wifi_commands {
         Some(tx) => WifiBackendOps::new(tx, noop),
         None => noop,
     };
-    let ops: Arc<dyn BackendOps> = ReloadOps::new(reload_coordinator, mid);
+    let with_bt: Arc<dyn BackendOps> = match bt_commands {
+        Some(tx) => BtBackendOps::new(tx, with_wifi),
+        None => with_wifi,
+    };
+    let ops: Arc<dyn BackendOps> = ReloadOps::new(reload_coordinator, with_bt);
     let ethernet_auth_backend = if config.ethernet.enabled {
         config.ethernet.auth_backend.clone()
     } else {

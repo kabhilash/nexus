@@ -465,7 +465,12 @@
     { "id": "prop:fi.nexus.Bluetooth.Address", "type": "Property", "label": "Bluetooth.Address",
       "attrs": { "sig": "s", "access": "read", "format": "XX:XX:XX:XX:XX:XX" } },
     { "id": "prop:fi.nexus.Bluetooth.Powered", "type": "Property", "label": "Bluetooth.Powered (adapter)",
-      "attrs": { "sig": "b", "access": "read/write" } },
+      "attrs": {
+        "sig": "b",
+        "access": "read/write",
+        "polkit_action": "fi.nexus.set_power",
+        "note": "Writable since nexus-dbus 0.11. Properties.Set on this property routes through nexusd to BlueZ's org.bluez.Adapter1.Powered. The setter is gated by the polkit fi.nexus.set_power action (same as Manager.SetPowerState and Wifi.Powered)."
+      } },
     { "id": "prop:fi.nexus.Bluetooth.Discoverable", "type": "Property", "label": "Bluetooth.Discoverable",
       "attrs": { "sig": "b", "access": "read/write" } },
     { "id": "prop:fi.nexus.Bluetooth.Pairable", "type": "Property", "label": "Bluetooth.Pairable",
@@ -1050,6 +1055,11 @@
     { "from": "method:fi.nexus.Wifi.ProvideCredential", "rel": "may_return_error", "to": "err:fi.nexus.Error.AuthFailed" },
     { "from": "method:fi.nexus.Wifi.ProvideCredential", "rel": "may_return_error", "to": "err:fi.nexus.Error.NotFound" },
     { "from": "method:fi.nexus.Wifi.ProvideCredential", "rel": "may_return_error", "to": "err:fi.nexus.Error.InvalidArgument" },
+
+    { "from": "prop:fi.nexus.Bluetooth.Powered", "rel": "requires_polkit", "to": "polkit:fi.nexus.set_power" },
+    { "from": "prop:fi.nexus.Bluetooth.Powered", "rel": "may_return_error", "to": "err:fi.nexus.Error.AuthFailed" },
+    { "from": "prop:fi.nexus.Bluetooth.Powered", "rel": "may_return_error", "to": "err:fi.nexus.Error.FeatureDisabled" },
+    { "from": "prop:fi.nexus.Bluetooth.Powered", "rel": "may_return_error", "to": "err:fi.nexus.Error.BluezUnavailable" },
 
     { "from": "method:fi.nexus.Bluetooth.StartDiscovery", "rel": "requires_polkit", "to": "polkit:fi.nexus.connect" },
     { "from": "method:fi.nexus.Bluetooth.StartDiscovery", "rel": "may_return_error", "to": "err:fi.nexus.Error.NotPowered" },

@@ -114,6 +114,18 @@ pub trait BackendOps: Send + Sync {
         Err(DbusError::Unsupported("wifi_provide_credential".into()))
     }
 
+    // ---- Bluetooth (DD-006 §6.4) ----
+
+    /// `fi.nexus.Bluetooth.Powered` setter — flip the BlueZ adapter's
+    /// `Powered` property via the live BlueZ client. The D-Bus layer
+    /// declares `Powered` writable; this routes the call through to
+    /// `nexus_bluetooth::BtCommand::SetAdapterPowered`. `ifname` is
+    /// the adapter's BlueZ name (`hci0`, etc.) — the daemon's adapter
+    /// resolves it to the BlueZ object path.
+    async fn bt_set_powered(&self, _ifname: &str, _on: bool) -> Result<()> {
+        Err(DbusError::Unsupported("bt_set_powered".into()))
+    }
+
     // ---- Manager-level (DD-006 §5) ----
     async fn set_power_state(&self, _state: PowerState) -> Result<()> {
         Err(DbusError::Unsupported("set_power_state".into()))
@@ -163,6 +175,7 @@ pub enum RecordedCall {
     WifiDisconnect { ifname: String, pause_auto_connect: bool },
     WifiRoam { ifname: String, bssid: MacAddr },
     WifiSetPowered { ifname: String, on: bool },
+    BtSetPowered { ifname: String, on: bool },
     WifiSetRoamingMode { ifname: String, mode: RoamingMode },
     WifiProvideCredential {
         ifname: String,
@@ -250,6 +263,16 @@ impl BackendOps for RecordingOps {
         }
         Ok(())
     }
+    async fn bt_set_powered(&self, ifname: &str, on: bool) -> Result<()> {
+        self.record(RecordedCall::BtSetPowered {
+            ifname: ifname.to_owned(),
+            on,
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
     async fn wifi_set_roaming_mode(&self, ifname: &str, mode: RoamingMode) -> Result<()> {
         self.record(RecordedCall::WifiSetRoamingMode {
             ifname: ifname.to_owned(),
@@ -310,6 +333,21 @@ mod tests {
             calls[1],
             RecordedCall::SetPowerState(PowerState::Sleep)
         ));
+    }
+
+    #[tokio::test]
+    async fn recording_captures_bt_set_powered() {
+        let ops = RecordingOps::new();
+        ops.bt_set_powered("hci0", true).await.unwrap();
+        let calls = ops.calls();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            RecordedCall::BtSetPowered { ifname, on } => {
+                assert_eq!(ifname, "hci0");
+                assert!(*on);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

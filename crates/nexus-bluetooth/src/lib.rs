@@ -44,18 +44,34 @@ pub struct BtBackendHandle {
     pub cmd_tx: mpsc::Sender<BtCommand>,
 }
 
-/// Spawn the Bluetooth Backend event loop. See DD-004 §§3, 7. The
-/// Agent registration is deferred to the caller — production
-/// code calls [`spawn_agent`] against a live zbus `Connection` once
-/// the backend is up.
-pub fn spawn_bluetooth_backend(
+/// Default depth for callers that use [`command_channel`]. Sized so
+/// a burst of operator commands queues without backpressure but a
+/// stuck backend eventually surfaces "channel full" rather than
+/// silently growing memory.
+pub const COMMAND_CHANNEL_DEPTH: usize = 64;
+
+/// Convenience constructor for the command channel. Callers that
+/// need to hold the sender outside the supervised bluetooth task
+/// (the daemon's D-Bus layer does, so `bt power` etc. can land
+/// while the backend is running) create the channel here and pass
+/// the receiver into [`spawn_bluetooth_backend_with_channel`].
+pub fn command_channel() -> (mpsc::Sender<BtCommand>, mpsc::Receiver<BtCommand>) {
+    mpsc::channel(COMMAND_CHANNEL_DEPTH)
+}
+
+/// Spawn the Bluetooth Backend event loop with a caller-supplied
+/// command channel. See DD-004 §§3, 7. The Agent registration is
+/// deferred to the caller — production code calls [`spawn_agent`]
+/// against a live zbus `Connection` once the backend is up.
+pub fn spawn_bluetooth_backend_with_channel(
     bluez: Arc<dyn BluezClient>,
     profile_store: Arc<dyn ProfileStore>,
     event_tx: broadcast::Sender<NexusEvent>,
     config: BluetoothConfig,
+    cmd_tx: mpsc::Sender<BtCommand>,
+    cmd_rx: mpsc::Receiver<BtCommand>,
 ) -> BtBackendHandle {
     metrics::register();
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let backend = BluetoothBackend::new(
         bluez,
         profile_store,
@@ -72,4 +88,17 @@ pub fn spawn_bluetooth_backend(
         shutdown,
         cmd_tx,
     }
+}
+
+/// Spawn the Bluetooth Backend event loop with an internally-owned
+/// command channel. Convenience wrapper for callers that don't need
+/// to share the sender outside the backend (tests, the demo binary).
+pub fn spawn_bluetooth_backend(
+    bluez: Arc<dyn BluezClient>,
+    profile_store: Arc<dyn ProfileStore>,
+    event_tx: broadcast::Sender<NexusEvent>,
+    config: BluetoothConfig,
+) -> BtBackendHandle {
+    let (cmd_tx, cmd_rx) = command_channel();
+    spawn_bluetooth_backend_with_channel(bluez, profile_store, event_tx, config, cmd_tx, cmd_rx)
 }

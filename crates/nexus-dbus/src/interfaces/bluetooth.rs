@@ -1,13 +1,17 @@
-//! `fi.nexus.Bluetooth` — DD-006 §6.4. Read-only for phase 2.
+//! `fi.nexus.Bluetooth` — DD-006 §6.4. Read-only properties plus a
+//! writable `Powered` (so `nexusctl bt power on/off` can flip the
+//! BlueZ adapter through the daemon).
 
 use std::sync::Arc;
 
 use nexus_core::PairingAnswer;
+use zbus::message::Header;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
 
+use crate::authz::actions;
 use crate::errors::DbusError;
 use crate::paths::bluetooth_device_path;
-use crate::services::Services;
+use crate::services::{Feature, Services};
 use crate::state::InterfaceKindData;
 
 pub struct BluetoothIface {
@@ -46,6 +50,46 @@ impl BluetoothIface {
     #[zbus(property, name = "Powered")]
     async fn powered(&self) -> bool {
         self.with_cache(false, |c| c.powered).await
+    }
+
+    /// `Powered` writable side — `fi.nexus.set_power`. Mirrors the
+    /// Wi-Fi pattern: feature-gated, polkit-checked against the
+    /// caller's unique bus name (which zbus threads in via
+    /// `#[zbus(header)]`), then routed through
+    /// [`crate::BackendOps::bt_set_powered`] to BlueZ. The setter
+    /// returns `zbus::Result<()>` per zbus's property contract;
+    /// `DbusError` flows through `zbus::fdo::Error::from`.
+    #[zbus(property)]
+    async fn set_powered(
+        &self,
+        #[zbus(header)] hdr: Option<Header<'_>>,
+        on: bool,
+    ) -> zbus::Result<()> {
+        if !self.services.enabled.is_enabled(Feature::Bluetooth) {
+            return Err(zbus::Error::from(zbus::fdo::Error::from(
+                DbusError::FeatureDisabled("bluetooth".to_owned()),
+            )));
+        }
+        let sender = hdr
+            .as_ref()
+            .and_then(|h| h.sender().map(|s| s.to_string()))
+            .unwrap_or_default();
+        if !self
+            .services
+            .auth
+            .check(actions::SET_POWER, &sender)
+            .await
+            .is_authorized()
+        {
+            return Err(zbus::Error::from(zbus::fdo::Error::AuthFailed(
+                "Powered set denied".into(),
+            )));
+        }
+        self.services
+            .ops
+            .bt_set_powered(&self.ifname, on)
+            .await
+            .map_err(|e| zbus::Error::from(zbus::fdo::Error::from(e)))
     }
 
     #[zbus(property, name = "Discoverable")]

@@ -89,6 +89,24 @@ fn wlan_info() -> InterfaceInfo {
     }
 }
 
+fn hci_info() -> InterfaceInfo {
+    InterfaceInfo {
+        ifindex: 0x8000_0000,
+        ifname: "hci0".into(),
+        mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01],
+        mtu: 0,
+        operstate: OperState::Up,
+        carrier: false,
+        kind: InterfaceKind::Bluetooth {
+            hci_name: "hci0".into(),
+            hci_index: 0,
+            bt_address: MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01]),
+            bluez_path: "/org/bluez/hci0".into(),
+        },
+        discovered_at: std::time::Instant::now(),
+    }
+}
+
 async fn spawn(
     bus: &Bus,
     bus_name: &str,
@@ -1488,6 +1506,162 @@ async fn wifi_state_changed_signal_emitted_on_each_transition() {
     assert!(
         got.iter().any(|s| s == "connected"),
         "expected `connected` state, got {got:?}"
+    );
+    handle.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// DD-006 §6.4 — fi.nexus.Bluetooth.Powered (writable property).
+//
+// Mirrors the Wi-Fi `Powered` setter coverage: PolicyKit-deny path
+// surfaces AuthFailed; allow path reaches BackendOps::bt_set_powered;
+// disabling the bluetooth feature returns FeatureDisabled.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bluetooth_set_powered_denied_returns_auth_failed() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let (handle, event_tx) = spawn(
+        &bus,
+        "fi.nexus1.test_btpwr_deny",
+        always_deny(),
+        Arc::clone(&ops) as Arc<dyn BackendOps>,
+    )
+    .await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(hci_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let err = client
+        .call_method(
+            Some("fi.nexus1.test_btpwr_deny"),
+            "/fi/nexus1/interface/hci0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Set",
+            &(
+                "fi.nexus.Bluetooth",
+                "Powered",
+                Value::new(true),
+            ),
+        )
+        .await
+        .expect_err("Set should be rejected");
+    let name = err.to_string();
+    assert!(
+        name.contains("AuthFailed") || name.contains("Auth failed"),
+        "expected AuthFailed, got {name}"
+    );
+    // Backend must NOT see the call when polkit denied.
+    assert!(
+        ops.calls()
+            .iter()
+            .all(|c| !matches!(c, RecordedCall::BtSetPowered { .. })),
+        "ops saw bt_set_powered despite deny: {:?}",
+        ops.calls()
+    );
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn bluetooth_set_powered_allowed_calls_backend() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let policy = Arc::new(PolicyMapChecker::new(nexus_dbus::AuthDecision::Denied));
+    policy.allow(actions::SET_POWER);
+    let ops = RecordingOps::new();
+    let (handle, event_tx) = spawn(
+        &bus,
+        "fi.nexus1.test_btpwr_ok",
+        policy as Arc<dyn nexus_dbus::AuthChecker>,
+        Arc::clone(&ops) as Arc<dyn BackendOps>,
+    )
+    .await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(hci_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    client
+        .call_method(
+            Some("fi.nexus1.test_btpwr_ok"),
+            "/fi/nexus1/interface/hci0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Set",
+            &(
+                "fi.nexus.Bluetooth",
+                "Powered",
+                Value::new(true),
+            ),
+        )
+        .await
+        .expect("Set Powered=true should succeed");
+
+    let calls = ops.calls();
+    let hit = calls.iter().any(|c| matches!(
+        c,
+        RecordedCall::BtSetPowered { ifname, on: true } if ifname == "hci0"
+    ));
+    assert!(hit, "expected BtSetPowered{{hci0,true}}, got {calls:?}");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn bluetooth_set_powered_returns_feature_disabled_when_off() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
+    let (_tmp, st) = store().await;
+    let cfg = DbusConfig {
+        bus_name: "fi.nexus1.test_btpwr_off".to_owned(),
+        address: Some(bus.addr.clone()),
+        use_session_bus: false,
+        version: "0.1.0-test".into(),
+        auth: always_allow(),
+        ops: NoopOps::arc(),
+        rate_limits: nexus_dbus::RateLimits::default(),
+        // Bluetooth feature off — Powered set must short-circuit.
+        enabled_features: nexus_dbus::EnabledFeatures {
+            ethernet: true,
+            wifi: true,
+            bluetooth: false,
+            gnss: true,
+        },
+        ethernet_auth_backend: "none".to_owned(),
+        wifi_supplicant: "wpa_supplicant".to_owned(),
+        wifi_roaming_mode: "supplicant".to_owned(),
+    };
+    let handle = spawn_dbus_service(event_tx.subscribe(), st, cfg)
+        .await
+        .unwrap();
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(hci_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let err = client
+        .call_method(
+            Some("fi.nexus1.test_btpwr_off"),
+            "/fi/nexus1/interface/hci0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Set",
+            &(
+                "fi.nexus.Bluetooth",
+                "Powered",
+                Value::new(true),
+            ),
+        )
+        .await
+        .expect_err("Set should reject when bluetooth feature is off");
+    let name = err.to_string();
+    assert!(
+        name.contains("FeatureDisabled") || name.contains("feature_disabled"),
+        "expected FeatureDisabled, got {name}"
     );
     handle.stop().await;
 }
