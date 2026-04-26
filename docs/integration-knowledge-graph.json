@@ -1,6 +1,6 @@
 {
   "format": "nexus-integration-knowledge-graph",
-  "format_version": "0.2.0",
+  "format_version": "0.3.0",
   "audience": [
     "App integrators consuming the fi.nexus1 D-Bus API",
     "UI builders implementing operator-facing flows (pair, connect, scan picker, fix display, recovery)"
@@ -160,6 +160,44 @@
     { "id": "iface:org.freedesktop.DBus.ObjectManager", "type": "Interface", "label": "Standard ObjectManager",
       "attrs": { "mounted_on": "obj:/fi/nexus1",
                  "note": "Canonical source of truth for the current object set. Convenience properties (Manager.WifiProfiles, Wifi.ScanResults) may lag during concurrent modifications." } },
+
+    { "id": "iface:org.freedesktop.network1.Manager", "type": "Interface", "label": "systemd-networkd Manager (external)",
+      "attrs": {
+        "service": "org.freedesktop.network1",
+        "mounted_on": "/org/freedesktop/network1",
+        "ownership": "external — systemd-networkd, NOT nexusd. Lives on the same system bus.",
+        "purpose": "Layer-3 source of truth: IPv4 / IPv6 addresses, routes, DHCP lease, etc. nexusd delegates IP management here per nexus-architecture.md ADR-001 (`No built-in IP management`). Clients that need IP rows on a connected card read them from this service, not from fi.nexus1.",
+        "key_method": "Describe(ifindex:i) -> (json:s) — returns a JSON blob with full per-link state (Addresses[], Routes[], DHCPv4{}, DHCPv6{}). networkctl status parses this same blob.",
+        "see_also": ["iface:org.freedesktop.network1.Link", "flow:read-ip-info-for-connected-iface"]
+      } },
+    { "id": "iface:org.freedesktop.network1.Link", "type": "Interface", "label": "systemd-networkd per-link object (external)",
+      "attrs": {
+        "service": "org.freedesktop.network1",
+        "mounted_on": "/org/freedesktop/network1/link/_<ifindex>",
+        "path_escape": "ifindex is rendered as `_<n>` (underscore + decimal int). Resolve via Interface.Ifindex on the matching fi.nexus1 interface.",
+        "ownership": "external — systemd-networkd.",
+        "key_properties_for_ui": [
+          "OperationalState (s) — 'off' | 'no-carrier' | 'dormant' | 'degraded' | 'enslaved' | 'carrier' | 'degraded-carrier' | 'routable' | 'enslaved-routable' (becomes 'routable' once IPv4/IPv6 routing is up)",
+          "AddressState (s) — 'off' | 'degraded' | 'routable'",
+          "IPv4AddressState (s) / IPv6AddressState (s) — same enum as AddressState but per family",
+          "OnlineState (s) — 'offline' | 'partial' | 'online'"
+        ],
+        "subscription_pattern": "PropertiesChanged on this object is the trigger to re-call org.freedesktop.network1.Manager.Describe(ifindex) and refresh the rendered Address / Route rows. The Link interface itself does NOT expose Addresses[] / Routes[] as bus properties — Describe() is the authoritative source.",
+        "see_also": ["iface:org.freedesktop.network1.Manager", "iface:org.freedesktop.resolve1.Link", "flow:read-ip-info-for-connected-iface"]
+      } },
+    { "id": "iface:org.freedesktop.resolve1.Link", "type": "Interface", "label": "systemd-resolved per-link object (external)",
+      "attrs": {
+        "service": "org.freedesktop.resolve1",
+        "mounted_on": "/org/freedesktop/resolve1/link/_<ifindex>",
+        "ownership": "external — systemd-resolved.",
+        "key_properties_for_ui": [
+          "DNS (a(iay)) — array of (family:i, address:ay). family=2 (AF_INET) for IPv4, family=10 (AF_INET6) for IPv6.",
+          "Domains (a(sb)) — search domains.",
+          "DNSSEC (s), DNSOverTLS (s) — capability strings; render only if the UI surfaces secure-DNS state."
+        ],
+        "subscription_pattern": "PropertiesChanged on this object fires when DNS configuration changes. Reliable for DNS-row updates without re-resolving the whole IP block.",
+        "see_also": ["iface:org.freedesktop.network1.Link", "flow:read-ip-info-for-connected-iface"]
+      } },
 
     { "id": "prop:fi.nexus.Manager.Version", "type": "Property", "label": "Manager.Version",
       "attrs": { "sig": "s", "access": "read" } },
@@ -1192,7 +1230,9 @@
         { "do": "Optionally, for progress-UI animation, watch Wifi.StateChanged or fi.nexus.Interface.StateChanged on the interface path — both carry the same args and details",
           "node": "sig:fi.nexus.Wifi.StateChanged",
           "alt_node": "sig:fi.nexus.Interface.StateChanged",
-          "expected_states": ["connecting", "authenticating", "handshaking", "connected"] }
+          "expected_states": ["connecting", "authenticating", "handshaking", "connected"] },
+        { "do": "Once Wifi.ConnectComplete success has fired, render the IP rows (IPv4 / IPv6 address, gateway, DNS) on the connected card by following flow:read-ip-info-for-connected-iface — Nexus does NOT publish IP-layer state on fi.nexus1; addresses, routes, and DNS live on systemd-networkd and systemd-resolved per nexus-architecture.md ADR-001.",
+          "go_to_flow": "flow:read-ip-info-for-connected-iface" }
       ],
       "branches": [
         { "when": "ConnectComplete reason == credentials_invalid",
@@ -1222,7 +1262,9 @@
           "node": "method:fi.nexus.Wifi.Connect",
           "yields": "job_id:s" },
         { "do": "Wait for Wifi.ConnectComplete(job_id, success, reason) — canonical terminal edge; do not roll a separate watchdog timer",
-          "node": "sig:fi.nexus.Wifi.ConnectComplete" }
+          "node": "sig:fi.nexus.Wifi.ConnectComplete" },
+        { "do": "Once ConnectComplete success has fired, render the IP rows on the connected card via flow:read-ip-info-for-connected-iface (systemd-networkd Manager.Describe + systemd-resolved Link.DNS). fi.nexus1 itself does not expose IP-layer state — see ADR-001.",
+          "go_to_flow": "flow:read-ip-info-for-connected-iface" }
       ],
       "ui_notes": [
         "On AlreadyExists, fetch the existing profile via FindWifiProfile and offer Profile.Update instead.",
@@ -1480,6 +1522,53 @@
         "Duration scales with profile count (~10 ms per profile + ~100 ms fixed overhead).",
         "Watch Manager.NotificationEvent kind=master_key_degraded if rotation fails — it indicates the store is running without decryption."
       ]
+    },
+
+    {
+      "id": "flow:read-ip-info-for-connected-iface",
+      "name": "Read IP / route / DNS for a connected interface (off-Nexus, on systemd-networkd + systemd-resolved)",
+      "audience": ["app integrator", "ui builder"],
+      "trigger": "Want to render IPv4/IPv6 address, gateway, and DNS rows on a connected card after Wifi.ConnectComplete (or Ethernet authenticated/link_ready) has fired.",
+      "preconditions": [
+        "Connected to the system bus.",
+        "systemd-networkd is running (the Nexus deployment requires it — see nexus-architecture.md ADR-001).",
+        "systemd-resolved is running for DNS rows. If it isn't, DNS rows are unavailable; the address/route rows still resolve via networkd."
+      ],
+      "_about": "Nexus deliberately does NOT expose IP-layer state on fi.nexus1 — ADR-001 (`No built-in IP management`) keeps the daemon's surface at the kernel-carrier boundary. systemd-networkd and systemd-resolved both publish on the same system bus you already have open. This flow names the exact paths and methods so a UI can read addresses/routes/DNS without leaving D-Bus.",
+      "steps": [
+        { "do": "Resolve the kernel ifindex for the interface you're rendering: read prop:fi.nexus.Interface.Ifindex.",
+          "node": "prop:fi.nexus.Interface.Ifindex",
+          "yields": "ifindex:u" },
+        { "do": "Build the per-link object paths once. networkd: `/org/freedesktop/network1/link/_<ifindex>` (decimal int, underscore-prefixed). resolved: `/org/freedesktop/resolve1/link/_<ifindex>` (same convention).",
+          "tip": "Both paths use the same ifindex escape; compute once and reuse." },
+        { "do": "Open subscriptions BEFORE the first read so a property change between reads doesn't slip through.",
+          "subscriptions": [
+            "PropertiesChanged on /org/freedesktop/network1/link/_<ifindex> (member-filtered to interface=org.freedesktop.network1.Link). Triggers a re-Describe() on each fire.",
+            "PropertiesChanged on /org/freedesktop/resolve1/link/_<ifindex> (member-filtered to interface=org.freedesktop.resolve1.Link). Triggers a DNS re-read."
+          ] },
+        { "do": "Call org.freedesktop.network1.Manager.Describe(ifindex:i) on /org/freedesktop/network1.",
+          "node": "iface:org.freedesktop.network1.Manager",
+          "yields": "(json:s) — parse as JSON. Fields used by the connected-card recipe: `Addresses` (array of {Family:i, Address:ay, PrefixLength:u, Scope:i}); `Routes` (array of {Family:i, Destination:ay, DestinationPrefixLength:u, Gateway:ay, Scope:i, Type:i}); `DHCPv4`/`DHCPv6` (lease metadata — out of scope for the first cut, see notes).",
+          "ipv4_address_extract": "Filter Addresses where Family==2 (AF_INET) AND Scope==0 (RT_SCOPE_UNIVERSE / global). Decode 4-byte arrays to dotted-quad. Use PrefixLength as the subnet mask length.",
+          "ipv4_gateway_extract": "Filter Routes where Family==2 AND DestinationPrefixLength==0 (default route). Decode 4-byte Gateway. If multiple, prefer the lowest-Metric or first match — render whichever is winning the kernel's tie-break.",
+          "ipv6_address_extract": "Filter Addresses where Family==10 (AF_INET6). For the connected card, prefer Scope==0 (global) over Scope==253 (link). Render the link-local separately if at all.",
+          "ipv6_gateway_extract": "Filter Routes where Family==10 AND DestinationPrefixLength==0."
+        },
+        { "do": "Read DNS from systemd-resolved: Properties.Get on /org/freedesktop/resolve1/link/_<ifindex>, interface=org.freedesktop.resolve1.Link, property=DNS.",
+          "node": "iface:org.freedesktop.resolve1.Link",
+          "yields": "a(iay) — array of (family, address-bytes). Decode family=2 → IPv4 dotted-quad, family=10 → IPv6 colon-hex. Show as a comma-joined list in the DNS row." },
+        { "do": "On any subsequent PropertiesChanged from networkd's Link object, re-call Describe(ifindex) and re-extract. On PropertiesChanged from resolved's Link object, re-read DNS.",
+          "tip": "Address state can churn during DHCP renewal — debounce the re-Describe by ~200 ms if the PropertiesChanged firehose is noisy. networkd already coalesces per-state-summary changes."
+        }
+      ],
+      "ui_notes": [
+        "Connect-flow ordering: subscribe BEFORE Wifi.Connect; first Describe() lands AFTER Wifi.ConnectComplete success — but networkd's IPv4AddressState transition to 'routable' may fire either before or after ConnectComplete depending on DHCP timing. Treat the two as independent edges; the IP row renders when networkd tells you so.",
+        "On disconnected interfaces, Describe() still works but Addresses[] is empty (or contains only link-local IPv6). Don't fall back to fi.nexus.Interface for an IP — there is no IP property there by design.",
+        "Match systemd version expectations: Manager.Describe(ifindex) is available since systemd 245. resolved.Link.DNS is available since systemd 232. Both are present on every systemd-based deployment Nexus targets.",
+        "Path-permissions: both calls are open to unprivileged readers on default systemd policy. Writes (Manager.Reload, etc.) are not used here.",
+        "Out of scope for this flow (file separately when the UI wants them): DHCP lease lifetime / renew timestamp (DHCPv4.LeaseEnd inside Describe()), IPv6 SLAAC vs DHCPv6 distinguisher (Addresses[].Flags / DHCPv6 dict), and per-link metric stats."
+      ],
+      "see_also": ["iface:org.freedesktop.network1.Manager", "iface:org.freedesktop.network1.Link", "iface:org.freedesktop.resolve1.Link", "ui_design_patterns.connected_card_recipe", "consumer_recommendations.ip_layer_data_source"]
     }
   ],
 
@@ -1505,7 +1594,8 @@
     "subscriptions_first": "Open all signal subscriptions BEFORE issuing the method that triggers them. Otherwise you can race past the first ScanCompleted, PairingPrompt, or StateChanged.",
     "hot_vs_cold": "Treat SignalDbm/Frequency/AgeMs as a polled cache (~1Hz). Treat State/OperState/ManagedProfile as event-driven; act on every transition.",
     "object_path_strings": "Never parse object paths to extract ifname or ulid for business logic — the escaping rules can produce surprises (eth0:1 -> eth0_3a1). Read Interface.Ifname or Profile.Id instead.",
-    "rate_limit_etiquette": "Honour retry_after_ms on RateLimited; do not retry on Timeout (the call may have succeeded — reconcile via state)."
+    "rate_limit_etiquette": "Honour retry_after_ms on RateLimited; do not retry on Timeout (the call may have succeeded — reconcile via state).",
+    "ip_layer_data_source": "fi.nexus1's surface stops at link-layer state — carrier, association, signal, security, profile management. IPv4 / IPv6 addresses, default gateway, and DNS are NOT exposed on fi.nexus.Interface; they live on systemd-networkd (org.freedesktop.network1) and systemd-resolved (org.freedesktop.resolve1) on the same system bus. This is a deliberate architectural delegation, ADR-001 in nexus-architecture.md (`No built-in IP management`). To render the IP rows on a connected card, read org.freedesktop.network1.Manager.Describe(ifindex) for Addresses[] / Routes[] and org.freedesktop.resolve1.Link.DNS at /org/freedesktop/resolve1/link/_<ifindex> for DNS — see flow:read-ip-info-for-connected-iface and ui_design_patterns.connected_card_recipe for the full pattern. Subscribe PropertiesChanged on the per-link networkd / resolved objects for change notifications; do not poll."
   },
 
   "open_questions": [
@@ -2039,6 +2129,62 @@
       ]
     },
 
+    "connected_card_recipe": {
+      "title": "Render an iOS-style 'connected network' detail card",
+      "purpose": "Operators expect a familiar row order on the connected detail card (Wi-Fi or Ethernet). The data is split across three D-Bus services on the same system bus: fi.nexus1 (link-layer + signal/security), org.freedesktop.network1 (IP address + routes), and org.freedesktop.resolve1 (DNS). This recipe encodes the canonical row order and points at the right source for each row.",
+      "preconditions": [
+        "The interface is in the 'connected' state — Wi-Fi: prop:fi.nexus.Wifi.State == 'connected'; Ethernet: prop:fi.nexus.Ethernet.State == 'link_ready' (no 802.1X) or 'authenticated' (with 802.1X).",
+        "systemd-networkd and systemd-resolved are running on the same system bus (true on every Nexus deployment per ADR-001)."
+      ],
+      "row_order_top_to_bottom": [
+        { "row": "Network name (Wi-Fi only)",
+          "source": "prop:fi.nexus.Wifi.ConnectedBss → ssid_utf8_lossy field. Display the lossy string; keep the raw ssid_bytes for matching.",
+          "live_update": "PropertiesChanged on fi.nexus.Wifi.ConnectedBss (rare — fires on roam)." },
+        { "row": "Signal (Wi-Fi only)",
+          "source": "prop:fi.nexus.Wifi.SignalDbm + prop:fi.nexus.Wifi.Frequency",
+          "live_update": "Hot — coalesced PropertiesChanged at <=1 Hz; or sig:fi.nexus.Wifi.SignalLevel for level-change spikes.",
+          "render": "Bar count from dBm thresholds (>=-55 = 4 bars, -55..-65 = 3, -65..-75 = 2, < -75 = 1). 2.4G/5G/6G band tag from frequency." },
+        { "row": "Security (Wi-Fi only)",
+          "source": "prop:fi.nexus.Wifi.ConnectedBss → security field ('open', 'owe', 'wpa2_personal', 'wpa3_personal', 'wpa2_enterprise', 'wpa3_enterprise', etc.)",
+          "render": "Lock icon for any non-open value; copy-text matches the operator's vocabulary ('WPA2', 'WPA3', 'Enterprise')." },
+        { "row": "IP address",
+          "source": "Off-Nexus: org.freedesktop.network1.Manager.Describe(ifindex) → JSON.Addresses[] with Family==2 (IPv4) and Scope==0 (global). See flow:read-ip-info-for-connected-iface.",
+          "render": "'192.0.2.42 / 24' — dotted-quad + PrefixLength as CIDR. If multiple global IPv4 addresses, render the first; show a 'show all' affordance only if the device has multi-address use cases.",
+          "live_update": "PropertiesChanged on /org/freedesktop/network1/link/_<ifindex> → re-call Describe()." },
+        { "row": "Subnet mask",
+          "source": "Same Describe() blob — derive from the same Addresses[] entry's PrefixLength (e.g. 24 → 255.255.255.0). Not a separate D-Bus field.",
+          "render": "Dotted-quad. Some operators prefer the CIDR-only display (collapsing IP + Subnet into one row); pick one and stay consistent." },
+        { "row": "Router (default gateway)",
+          "source": "Off-Nexus: org.freedesktop.network1.Manager.Describe(ifindex) → JSON.Routes[] with Family==2 AND DestinationPrefixLength==0. Decode the Gateway 4-byte array.",
+          "render": "Dotted-quad. Empty when no default route via this interface (rare on a 'connected' Wi-Fi card; common on a secondary management link)." },
+        { "row": "DNS servers",
+          "source": "Off-Nexus: org.freedesktop.resolve1.Link at /org/freedesktop/resolve1/link/_<ifindex>, property DNS (a(iay)).",
+          "render": "Comma-joined list of decoded addresses. If the list is empty, fall back to the Manager-level resolved DNS or hide the row entirely — don't render a literal '(none)' on what is normally a working connection.",
+          "live_update": "PropertiesChanged on the resolved Link object." },
+        { "row": "IPv6 address (if present and the UI shows v6)",
+          "source": "Same Describe() blob, Family==10 entries.",
+          "render": "Prefer Scope==0 (global) over Scope==253 (link-local). Render the link-local separately under a 'show details' disclosure if at all." },
+        { "row": "Disconnect",
+          "source": "method:fi.nexus.Wifi.Disconnect (Wi-Fi) — returns a job_id; resolve via sig:fi.nexus.Wifi.DisconnectComplete. For Ethernet, there is no direct Disconnect — operator removes the profile via Manager.RemoveProfile or toggles Powered.",
+          "tap_action": "Wi-Fi: Wifi.Disconnect({}) and follow flow:disconnect-and-pause-wifi if the operator picks the 'don't auto-rejoin' variant." },
+        { "row": "Forget (Wi-Fi only)",
+          "source": "Composite: Wifi.Disconnect → Manager.RemoveProfile (or Profile.Delete on the profile object).",
+          "tap_action": "flow:disconnect-and-forget-wifi — destructive, prompt for confirmation." }
+      ],
+      "subscriptions_needed": [
+        "fi.nexus1: PropertiesChanged on the fi.nexus.Wifi (or fi.nexus.Ethernet) interface object. Drives Signal / Security / State rows.",
+        "fi.nexus1: sig:fi.nexus.Interface.StateChanged on the same path, OR sig:fi.nexus.Wifi.StateChanged for the typed mirror — recipients of either should ignore the other to avoid double-counting.",
+        "network1: PropertiesChanged on /org/freedesktop/network1/link/_<ifindex>. Triggers a re-Describe() and re-render of IP / Subnet / Router rows.",
+        "resolve1: PropertiesChanged on /org/freedesktop/resolve1/link/_<ifindex>. Triggers a re-read of DNS row only."
+      ],
+      "do_not": [
+        "Don't poll. Every row above is event-driven. Polling Describe() in a tight loop is wasted CPU on the device.",
+        "Don't expect fi.nexus.Interface.* properties to grow IPv4Addresses / Ipv4Gateway / Ipv4DnsServers — Nexus deliberately does not publish IP-layer state. ADR-001 (`No built-in IP management`) keeps the daemon's surface at the kernel-carrier boundary; the IP rows live on networkd / resolved.",
+        "Don't conflate 'connected' (Wifi.State or Ethernet.State) with 'online' (networkd OnlineState). A network can be associated and keyed without a working DHCP lease. The connected card should render with whatever IP state networkd has at the moment, even if that's 'no IPv4 yet'."
+      ],
+      "see_also": ["flow:read-ip-info-for-connected-iface", "flow:connect-known-wifi", "flow:disconnect-and-pause-wifi", "flow:disconnect-and-forget-wifi", "consumer_recommendations.ip_layer_data_source"]
+    },
+
     "permissions_handling": {
       "title": "Handling AuthFailed (polkit denial) without surprising the operator",
       "purpose": "Almost every mutating method requires a polkit action. AuthFailed is policy denial, not an authentication failure of the operator's typed credentials. UIs must not conflate the two.",
@@ -2062,9 +2208,12 @@
         "ObjectManager InterfacesAdded/Removed at /fi/nexus1 (path-prefix filter on /fi/nexus1/interface/<ifname>/scan_result/)",
         "PropertiesChanged on the Wi-Fi interface object (filter member=PropertiesChanged, path=<wifi-iface>)",
         "fi.nexus.Wifi.ScanComplete on the Wi-Fi interface object",
+        "fi.nexus.Wifi.ConnectComplete on the Wi-Fi interface object",
         "fi.nexus.Interface.StateChanged on the Wi-Fi interface object",
         "fi.nexus.Wifi.NetworkRequest on the Wi-Fi interface object",
-        "fi.nexus.Manager.NotificationEvent at /fi/nexus1"
+        "fi.nexus.Manager.NotificationEvent at /fi/nexus1",
+        "(off-Nexus, for the connected-card IP rows) PropertiesChanged on /org/freedesktop/network1/link/_<ifindex> on org.freedesktop.network1 — open the same moment the picker opens; ifindex comes from prop:fi.nexus.Interface.Ifindex on the Wi-Fi interface.",
+        "(off-Nexus, for the DNS row) PropertiesChanged on /org/freedesktop/resolve1/link/_<ifindex> on org.freedesktop.resolve1."
       ],
       "steps": [
         { "n": 1, "ui": "Render 'Wi-Fi' screen header. Read Wifi.Powered; show toggle.", "calls": ["Properties.Get fi.nexus.Wifi.Powered"] },
@@ -2114,9 +2263,23 @@
             "transient_ui": "Show 'Connection failed — retrying' for ~2 s while the cool-down elapses; the backend will scan and reattempt the sticky profile."
           }
         },
-        { "n": 9, "ui": "On state=connected, render the connected card: SSID, signal bars (subscribe Wifi.SignalDbm hot updates), frequency band, security badge. Offer 'Disconnect'." }
+        { "n": 9, "ui": "On Wifi.ConnectComplete success (or state=connected), render the connected card per ui_design_patterns.connected_card_recipe: SSID, signal bars (subscribe Wifi.SignalDbm hot updates), security badge, IP / Subnet / Router / DNS rows, Disconnect, Forget.",
+          "ip_rows": {
+            "_about": "Nexus does NOT publish IP-layer state on fi.nexus1 (ADR-001). Read addresses, routes, and DNS from systemd-networkd / systemd-resolved on the same system bus.",
+            "go_to_flow": "flow:read-ip-info-for-connected-iface",
+            "calls": [
+              "org.freedesktop.network1.Manager.Describe(ifindex:i) on /org/freedesktop/network1 — yields a JSON blob with Addresses[] / Routes[]; extract IPv4 / IPv6 address, prefix, default gateway.",
+              "Properties.Get on /org/freedesktop/resolve1/link/_<ifindex>, interface=org.freedesktop.resolve1.Link, property=DNS — yields a(iay); decode per family for the DNS row."
+            ],
+            "rerender_triggers": [
+              "PropertiesChanged on /org/freedesktop/network1/link/_<ifindex> → re-Describe() and refresh IP / Subnet / Router.",
+              "PropertiesChanged on /org/freedesktop/resolve1/link/_<ifindex> → re-read DNS only."
+            ]
+          },
+          "actions": ["Disconnect (Wifi.Disconnect → DisconnectComplete)", "Forget (flow:disconnect-and-forget-wifi)"]
+        }
       ],
-      "post_conditions": ["Profile saved (auto_connect:true means it will reconnect automatically)", "Interface in state=connected"],
+      "post_conditions": ["Profile saved (auto_connect:true means it will reconnect automatically)", "Interface in state=connected", "Connected card renders SSID/Signal/Security from fi.nexus1 plus IP/Subnet/Router/DNS from networkd+resolved"],
       "telemetry_to_render_continuously": ["Wifi.SignalDbm (hot, ~1 Hz)", "Wifi.Frequency", "Wifi.SignalLevel signal for level-change spikes"]
     },
 
