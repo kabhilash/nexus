@@ -268,13 +268,20 @@ fn check_external_daemons(
     }
 
     // Bluetooth: the real backend talks to BlueZ over D-Bus. BlueZ
-    // ships `bluetoothd` — its presence on PATH is a reasonable proxy
-    // for "the platform has BlueZ installed." The subsystem's own
-    // reconnect loop handles the "installed but not running" case.
-    if config.bluetooth.enabled && !config.bluetooth.mock && !binary_in("bluetoothd", path_var) {
+    // ships `bluetoothd`, but its install location varies by distro:
+    //   - Debian / Ubuntu / most desktop distros: /usr/sbin/bluetoothd
+    //     (on $PATH)
+    //   - Yocto / NXP i.MX images / many embedded builds:
+    //     /usr/libexec/bluetooth/bluetoothd (NOT on $PATH for a
+    //     systemd-sandboxed unit)
+    //   - Arch / Fedora variants: /usr/lib/bluetooth/bluetoothd
+    // The subsystem's own reconnect loop handles the "installed but
+    // not running" case. This preflight only flags "almost certainly
+    // not installed at all."
+    if config.bluetooth.enabled && !config.bluetooth.mock && !bluetoothd_present(path_var) {
         out.push(Finding::warn(
             "bluetooth",
-            "bluetoothd not found on PATH — BlueZ is probably not installed",
+            "bluetoothd not found on PATH or in /usr/libexec/bluetooth, /usr/lib/bluetooth — BlueZ is probably not installed",
             "install BlueZ (apt install bluez, or dnf install bluez) and enable its service: \
              systemctl enable --now bluetooth",
         ));
@@ -393,6 +400,43 @@ fn binary_in(name: &str, path_var: Option<&std::ffi::OsStr>) -> bool {
     false
 }
 
+/// Well-known libexec / sbin locations that ship `bluetoothd` but
+/// don't sit on the default `$PATH` (systemd's sandboxed unit
+/// doesn't pick these up either). Probed in addition to `$PATH` in
+/// the bluetooth preflight check.
+const BLUETOOTHD_LIBEXEC_PATHS: &[&str] = &[
+    // Yocto / OpenEmbedded / NXP i.MX images, recent BlueZ layouts.
+    "/usr/libexec/bluetooth/bluetoothd",
+    // Arch / Fedora pre-libexec migration, some buildroot images.
+    "/usr/lib/bluetooth/bluetoothd",
+    "/usr/lib64/bluetooth/bluetoothd",
+    // Older sysroots and a few embedded SDKs that don't extend PATH.
+    "/usr/sbin/bluetoothd",
+    "/sbin/bluetoothd",
+];
+
+/// Probe `$PATH` first, then a curated list of well-known libexec
+/// paths. Returns `true` as soon as any candidate is a regular
+/// file — symlink resolution is left to the kernel (BlueZ's own
+/// installer often drops a symlink in `/usr/sbin/`).
+fn bluetoothd_present(path_var: Option<&std::ffi::OsStr>) -> bool {
+    bluetoothd_present_in(path_var, BLUETOOTHD_LIBEXEC_PATHS)
+}
+
+/// Inner form that takes the libexec list as a parameter, so unit
+/// tests can point it at a tempdir without writing to /usr/libexec.
+fn bluetoothd_present_in(
+    path_var: Option<&std::ffi::OsStr>,
+    libexec_paths: &[&str],
+) -> bool {
+    if binary_in("bluetoothd", path_var) {
+        return true;
+    }
+    libexec_paths
+        .iter()
+        .any(|p| std::path::Path::new(p).is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,16 +533,21 @@ mod tests {
     }
 
     #[test]
-    fn bluetooth_and_gnss_warn_when_daemons_missing() {
+    fn gnss_warns_when_daemon_missing() {
+        // Bluetooth's preflight now also probes /usr/libexec/bluetooth
+        // and friends, which are filesystem paths we can't suppress
+        // through `run_with`'s `path_var` parameter — the dev-host
+        // running this test usually has BlueZ installed there.
+        // Bluetooth-specific coverage moved to
+        // `bluetoothd_present_*` unit tests against the inner helper;
+        // here we keep the loop-fires-warnings smoke test against
+        // gnss, which is `binary_in($PATH)`-only.
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = base_config(tmp.path().join("store"));
-        cfg.bluetooth.enabled = true;
-        cfg.bluetooth.mock = false;
         cfg.gnss.enabled = true;
         cfg.gnss.mock = false;
         let findings = run_with(&cfg, Some(&empty_path()), &all_groups());
         let subjects: Vec<_> = findings.iter().map(|f| f.subject).collect();
-        assert!(subjects.contains(&"bluetooth"), "got: {subjects:?}");
         assert!(subjects.contains(&"gnss"), "got: {subjects:?}");
     }
 
@@ -562,6 +611,41 @@ mod tests {
 
         let findings = run_with(&cfg, Some(&path_var), &all_groups());
         assert!(findings.is_empty(), "findings: {findings:?}");
+    }
+
+    #[test]
+    fn bluetoothd_present_falls_back_to_libexec_when_not_on_path() {
+        // Yocto / NXP i.MX layout: bluetoothd lives at
+        // /usr/libexec/bluetooth/bluetoothd, which isn't on $PATH
+        // for a sandboxed systemd unit. Stage a fake one in a
+        // tempdir and pass it as the libexec list — PATH stays
+        // empty so the first probe misses.
+        let tmp = tempfile::tempdir().unwrap();
+        let libexec = tmp.path().join("libexec/bluetooth");
+        std::fs::create_dir_all(&libexec).unwrap();
+        let bin = libexec.join("bluetoothd");
+        std::fs::write(&bin, b"").unwrap();
+        let bin_str = bin.to_string_lossy().into_owned();
+        let empty_path = std::ffi::OsString::from("");
+
+        assert!(bluetoothd_present_in(
+            Some(&empty_path),
+            &[bin_str.as_str()],
+        ));
+        // Sanity: with no fallback paths it would still be missing.
+        assert!(!bluetoothd_present_in(Some(&empty_path), &[]));
+    }
+
+    #[test]
+    fn bluetoothd_present_finds_via_path_first() {
+        // Path probe takes precedence — if PATH has bluetoothd we
+        // never even consult the libexec list.
+        let tmp = tempfile::tempdir().unwrap();
+        let bindir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        std::fs::write(bindir.join("bluetoothd"), b"").unwrap();
+        let path_var = std::ffi::OsString::from(bindir.as_os_str());
+        assert!(bluetoothd_present_in(Some(&path_var), &[]));
     }
 
     #[test]

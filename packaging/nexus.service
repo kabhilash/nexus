@@ -17,8 +17,20 @@ Wants=bluetooth.service
 # Wi-Fi backend defaults to wpa_supplicant. Soft dep for the same
 # reason — integrators can disable the Wi-Fi subsystem in config
 # without needing wpa_supplicant installed.
+#
+# Note: `After=` orders the start command, NOT readiness. On cold
+# boot wpa_supplicant typically reports started seconds before it
+# finishes claiming the wireless interface, so an `Interface.Scan`
+# issued by nexusd in that window can come back as
+# `fi.w1.wpa_supplicant1.Interface.ScanError: Scan request rejected`.
+# The wifi backend retries — the message in the journal is benign.
 After=wpa_supplicant.service
 Wants=wpa_supplicant.service
+# GNSS backend talks to gpsd. Soft dep — nexus starts fine on
+# devices without GNSS, and the gnss subsystem is `enabled = false`
+# by default in nexus.toml.
+After=gpsd.service
+Wants=gpsd.service
 
 [Service]
 Type=notify
