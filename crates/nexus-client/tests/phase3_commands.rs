@@ -13,7 +13,7 @@ use nexus_client::proxy::{
     BluetoothAdapterSummary, BluetoothDeviceDetail, BluetoothDeviceSummary, BluetoothListFilter,
     EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix, GnssSatellitesView,
     InterfaceDetail, InterfaceSummary, ManagerOps, ManagerStatus, MasterKeyInfo, ProfileDetail,
-    ProfileSummary, WifiDetail, WifiProfileDetail,
+    ProfileSummary, WifiDetail, WifiProfileDetail, WifiProfileSummary,
 };
 
 /// A stub that serves pre-canned responses to every `ManagerOps`
@@ -27,6 +27,7 @@ struct Stub {
     bt_device_detail: Option<BluetoothDeviceDetail>,
     gnss_sats: Option<GnssSatellitesView>,
     profiles: Vec<ProfileSummary>,
+    wifi_profiles: Vec<WifiProfileSummary>,
     profile_detail: Option<ProfileDetail>,
     profile_toml: Option<String>,
     master_key: Option<MasterKeyInfo>,
@@ -94,6 +95,9 @@ impl ManagerOps for Stub {
         _kind: Option<&str>,
     ) -> Result<Vec<ProfileSummary>, NexusctlError> {
         Ok(self.profiles.clone())
+    }
+    async fn list_wifi_profiles(&self) -> Result<Vec<WifiProfileSummary>, NexusctlError> {
+        Ok(self.wifi_profiles.clone())
     }
     async fn show_profile(&self, _reference: &str) -> Result<ProfileDetail, NexusctlError> {
         self.profile_detail.clone().ok_or(NexusctlError::NotFound {
@@ -615,6 +619,112 @@ async fn snapshot_profile_show_wifi_human() {
     assert!(s.contains("corp-net"));
     assert!(s.contains("Stored creds:"));
     assert!(s.contains("passphrase"));
+}
+
+// ---------------------------------------------------------------------------
+// wifi profiles
+// ---------------------------------------------------------------------------
+
+fn wifi_profiles_fixture() -> Vec<WifiProfileSummary> {
+    vec![
+        WifiProfileSummary {
+            id: "01HPQY8S2N0Z8K9M7V3Y2F4T5W".into(),
+            ssid: "corp-net".into(),
+            label: "corp".into(),
+            security_type: "wpa2_enterprise".into(),
+            priority: 20,
+            auto_connect: true,
+            hidden: false,
+            credentials_invalid: false,
+        },
+        WifiProfileSummary {
+            id: "01HPQY8S2N0Z8K9M7V3Y2F4T5X".into(),
+            ssid: "home".into(),
+            label: "".into(),
+            security_type: "wpa2_personal".into(),
+            priority: 10,
+            auto_connect: true,
+            hidden: false,
+            credentials_invalid: true,
+        },
+        WifiProfileSummary {
+            id: "01HPQY8S2N0Z8K9M7V3Y2F4T5Y".into(),
+            ssid: "iot-stealth".into(),
+            label: "iot".into(),
+            security_type: "wpa3_personal".into(),
+            priority: 0,
+            auto_connect: false,
+            hidden: true,
+            credentials_invalid: false,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn snapshot_wifi_profiles_human() {
+    let stub = Stub {
+        wifi_profiles: wifi_profiles_fixture(),
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    commands::wifi::profiles(
+        &stub,
+        OutputFormat::Human,
+        &RenderContext::default(),
+        &mut buf,
+    )
+    .await
+    .unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    assert_snapshot!(s, @r"
+     SSID                  LABEL  SECURITY         PRIORITY  AUTO  CREDS    ID
+     corp-net              corp   wpa2_enterprise  20        yes   ok       01HPQY8S2N0Z8K9M7V3Y2F4T5W
+     home                         wpa2_personal    10        yes   invalid  01HPQY8S2N0Z8K9M7V3Y2F4T5X
+     iot-stealth (hidden)  iot    wpa3_personal    0         no    ok       01HPQY8S2N0Z8K9M7V3Y2F4T5Y
+    ");
+}
+
+#[tokio::test]
+async fn wifi_profiles_human_shows_empty_message() {
+    let stub = Stub::default();
+    let mut buf = Vec::new();
+    commands::wifi::profiles(
+        &stub,
+        OutputFormat::Human,
+        &RenderContext::default(),
+        &mut buf,
+    )
+    .await
+    .unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    assert_eq!(s, "no wifi profiles\n");
+}
+
+#[tokio::test]
+async fn wifi_profiles_json_round_trips_every_field() {
+    let stub = Stub {
+        wifi_profiles: wifi_profiles_fixture(),
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    commands::wifi::profiles(
+        &stub,
+        OutputFormat::Json,
+        &RenderContext::default(),
+        &mut buf,
+    )
+    .await
+    .unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    // Spot-check that every Wi-Fi-specific field made it through
+    // the pretty-printed JSON. Whitespace around `:` matches
+    // `serde_json::to_writer_pretty` output.
+    assert!(s.contains("\"ssid\": \"corp-net\""), "got: {s}");
+    assert!(s.contains("\"security_type\": \"wpa2_enterprise\""));
+    assert!(s.contains("\"priority\": 20"));
+    assert!(s.contains("\"auto_connect\": true"));
+    assert!(s.contains("\"hidden\": true"));
+    assert!(s.contains("\"credentials_invalid\": true"));
 }
 
 // ---------------------------------------------------------------------------

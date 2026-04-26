@@ -24,6 +24,7 @@ use crate::proxy::{
     BluetoothAdapterDetail, BluetoothAdapterSummary, BluetoothDeviceDetail, BluetoothDeviceSummary,
     EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix, GnssSatellitesView,
     InterfaceDetail, MasterKeyInfo, ProfileDetail, ProfileSummary, WifiDetail, WifiProfileDetail,
+    WifiProfileSummary,
 };
 
 // ---------------------------------------------------------------------------
@@ -558,6 +559,99 @@ impl Render for Vec<ProfileSummary> {
                         "ok".into()
                     },
                 ),
+            ];
+            vertical_block(&pairs, w)?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vec<WifiProfileSummary> — `wifi profiles`
+// ---------------------------------------------------------------------------
+
+impl Render for Vec<WifiProfileSummary> {
+    fn render_human(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        if self.is_empty() {
+            writeln!(w, "no wifi profiles")?;
+            return Ok(());
+        }
+        table_with(
+            &["SSID", "LABEL", "SECURITY", "PRIORITY", "AUTO", "CREDS", "ID"],
+            |t| {
+                for r in self {
+                    let auto = if r.auto_connect { "yes" } else { "no" };
+                    let creds = if r.credentials_invalid {
+                        "invalid"
+                    } else {
+                        "ok"
+                    };
+                    let ssid = if r.hidden {
+                        format!("{} (hidden)", r.ssid)
+                    } else {
+                        r.ssid.clone()
+                    };
+                    t.add_row(vec![
+                        Cell::new(&ssid),
+                        Cell::new(&r.label),
+                        Cell::new(&r.security_type),
+                        Cell::new(r.priority),
+                        Cell::new(auto),
+                        Cell::new(creds),
+                        Cell::new(&r.id),
+                    ]);
+                }
+            },
+            w,
+        )
+    }
+
+    fn render_terse(&self, ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        for r in self {
+            let pairs: Vec<(&'static str, String)> = vec![
+                ("id", r.id.clone()),
+                ("ssid", r.ssid.clone()),
+                ("label", r.label.clone()),
+                ("security", r.security_type.clone()),
+                ("priority", r.priority.to_string()),
+                ("auto_connect", fmt_bool(r.auto_connect)),
+                ("hidden", fmt_bool(r.hidden)),
+                ("credentials_invalid", fmt_bool(r.credentials_invalid)),
+            ];
+            terse_pairs(&pairs, ctx, w)?;
+        }
+        Ok(())
+    }
+
+    fn render_json(&self, w: &mut dyn Write) -> io::Result<()> {
+        super::json::write(self, w)
+    }
+
+    fn render_pretty(&self, _ctx: &RenderContext, w: &mut dyn Write) -> io::Result<()> {
+        if self.is_empty() {
+            writeln!(w, "no wifi profiles")?;
+            return Ok(());
+        }
+        for (i, r) in self.iter().enumerate() {
+            if i > 0 {
+                writeln!(w)?;
+            }
+            let pairs = vec![
+                ("SSID", r.ssid.clone()),
+                ("Label", r.label.clone()),
+                ("Security", r.security_type.clone()),
+                ("Priority", r.priority.to_string()),
+                ("Auto-connect", fmt_bool(r.auto_connect)),
+                ("Hidden", fmt_bool(r.hidden)),
+                (
+                    "Credentials",
+                    if r.credentials_invalid {
+                        "invalid".into()
+                    } else {
+                        "ok".into()
+                    },
+                ),
+                ("ID", r.id.clone()),
             ];
             vertical_block(&pairs, w)?;
         }

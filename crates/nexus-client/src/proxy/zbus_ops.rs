@@ -32,7 +32,7 @@ use crate::proxy::{
     BluetoothAdapterDetail, BluetoothAdapterSummary, BluetoothDeviceDetail, BluetoothDeviceSummary,
     BluetoothListFilter, EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix,
     GnssSatellitesView, InterfaceDetail, InterfaceSummary, ManagerOps, ManagerStatus,
-    MasterKeyInfo, ProfileDetail, ProfileSummary, WifiDetail, WifiProfileDetail,
+    MasterKeyInfo, ProfileDetail, ProfileSummary, WifiDetail, WifiProfileDetail, WifiProfileSummary,
 };
 
 pub struct ZbusManagerOps {
@@ -364,6 +364,46 @@ impl ManagerOps for ZbusManagerOps {
                 credentials_invalid: p.credentials_invalid().await.map_err(from_zbus_error)?,
                 created_at: p.created_at().await.map_err(from_zbus_error)?,
                 updated_at: p.updated_at().await.map_err(from_zbus_error)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn list_wifi_profiles(&self) -> Result<Vec<WifiProfileSummary>, NexusctlError> {
+        let mgr = ManagerProxy::new(&self.connection)
+            .await
+            .map_err(from_zbus_error)?;
+        let paths = mgr.wifi_profiles().await.map_err(from_zbus_error)?;
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let common = ProfileProxy::builder(&self.connection)
+                .path(path.clone())
+                .map_err(from_zbus_error)?
+                .build()
+                .await
+                .map_err(from_zbus_error)?;
+            let wifi = WifiProfileProxy::builder(&self.connection)
+                .path(path)
+                .map_err(from_zbus_error)?
+                .build()
+                .await
+                .map_err(from_zbus_error)?;
+            let security = wifi.security().await.map_err(from_zbus_error)?;
+            let security_type = security
+                .get("type")
+                .and_then(|v| <&str>::try_from(v).ok())
+                .map(str::to_owned)
+                .unwrap_or_default();
+            let ssid_bytes = wifi.ssid().await.map_err(from_zbus_error)?;
+            out.push(WifiProfileSummary {
+                id: common.id().await.map_err(from_zbus_error)?,
+                ssid: String::from_utf8_lossy(&ssid_bytes).into_owned(),
+                label: common.label().await.map_err(from_zbus_error)?,
+                security_type,
+                priority: wifi.priority().await.map_err(from_zbus_error)?,
+                auto_connect: wifi.auto_connect().await.map_err(from_zbus_error)?,
+                hidden: wifi.hidden().await.map_err(from_zbus_error)?,
+                credentials_invalid: common.credentials_invalid().await.map_err(from_zbus_error)?,
             });
         }
         Ok(out)

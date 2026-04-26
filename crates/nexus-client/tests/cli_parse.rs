@@ -324,3 +324,15 @@ fn config_path_is_optional() {
         Some(std::path::Path::new("/tmp/nexusctl.toml"))
     );
 }
+
+#[test]
+fn wifi_profiles_subcommand_parses() {
+    use nexus_client::cli::WifiSub;
+    let cli = parse(&["wifi", "profiles"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Wifi {
+            sub: WifiSub::Profiles
+        })
+    ));
+}

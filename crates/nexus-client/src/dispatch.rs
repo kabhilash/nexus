@@ -147,6 +147,7 @@ pub async fn dispatch(
             WifiSub::Forget { reference } => {
                 commands::wifi::forget(ops, reference, format, &ctx, stdout).await
             }
+            WifiSub::Profiles => commands::wifi::profiles(ops, format, &ctx, stdout).await,
         },
 
         Some(Command::Bt { sub }) => match sub {

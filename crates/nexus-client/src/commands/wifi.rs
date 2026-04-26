@@ -155,6 +155,20 @@ pub async fn disconnect(
     render(&outcome, format, ctx, w).map_err(io_err)
 }
 
+/// `wifi profiles` — lists saved Wi-Fi profiles with Wi-Fi-specific
+/// columns. Differs from `profile list --kind wifi` (kind-agnostic
+/// generic table) by surfacing SSID / security / priority /
+/// auto-connect / hidden flags inline.
+pub async fn profiles(
+    ops: &dyn ManagerOps,
+    format: OutputFormat,
+    ctx: &RenderContext,
+    w: &mut dyn Write,
+) -> Result<(), NexusctlError> {
+    let rows = ops.list_wifi_profiles().await?;
+    render(&rows, format, ctx, w).map_err(io_err)
+}
+
 /// `wifi forget <ssid|ulid>` — removes a stored Wi-Fi profile.
 pub async fn forget(
     ops: &dyn ManagerOps,

@@ -422,6 +422,11 @@ pub enum WifiSub {
     },
     /// Delete a stored Wi-Fi profile (matched by SSID or ULID).
     Forget { reference: String },
+    /// List saved Wi-Fi profiles with SSID, security, priority,
+    /// auto-connect, and credential status. The kind-agnostic
+    /// `nexusctl profile list --kind wifi` returns a generic row;
+    /// this subcommand returns Wi-Fi-specific columns.
+    Profiles,
 }
 
 #[derive(Debug, Subcommand)]

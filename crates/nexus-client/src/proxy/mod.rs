@@ -242,6 +242,20 @@ pub struct WifiProfileDetail {
     pub scan_frequencies: Vec<u32>,
 }
 
+/// `nexusctl wifi profiles` row. Wi-Fi-scoped projection over the
+/// generic `ProfileSummary` enriched with per-Wi-Fi properties.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WifiProfileSummary {
+    pub id: String,
+    pub ssid: String,
+    pub label: String,
+    pub security_type: String,
+    pub priority: i32,
+    pub auto_connect: bool,
+    pub hidden: bool,
+    pub credentials_invalid: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct EthernetProfileDetail {
     pub ifname: String,
@@ -373,6 +387,15 @@ pub trait ManagerOps: Send + Sync {
     ) -> Result<Vec<ProfileSummary>, NexusctlError> {
         Err(NexusctlError::Unsupported {
             detail: "list_profiles".into(),
+        })
+    }
+    /// Wi-Fi-scoped listing — returns every saved Wi-Fi profile
+    /// enriched with `fi.nexus.Profile.Wifi` properties (SSID,
+    /// security type, priority, auto-connect, hidden) on top of
+    /// the common `ProfileSummary` fields.
+    async fn list_wifi_profiles(&self) -> Result<Vec<WifiProfileSummary>, NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "list_wifi_profiles".into(),
         })
     }
     async fn show_profile(&self, _reference: &str) -> Result<ProfileDetail, NexusctlError> {
