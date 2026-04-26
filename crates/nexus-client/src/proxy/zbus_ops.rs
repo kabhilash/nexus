@@ -26,13 +26,17 @@ use crate::proxy::ethernet::EthernetProxy;
 use crate::proxy::gnss::GnssProxy;
 use crate::proxy::interface::InterfaceProxy;
 use crate::proxy::manager::ManagerProxy;
+use crate::proxy::networkd::NetworkdManagerProxy;
 use crate::proxy::profile::{EthernetProfileProxy, ProfileProxy, WifiProfileProxy};
+use crate::proxy::resolve1::ResolveLinkProxy;
+use crate::proxy::scan_result::ScanResultProxy;
 use crate::proxy::wifi::WifiProxy;
 use crate::proxy::{
-    BluetoothAdapterDetail, BluetoothAdapterSummary, BluetoothDeviceDetail, BluetoothDeviceSummary,
-    BluetoothListFilter, EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix,
-    GnssSatellitesView, InterfaceDetail, InterfaceSummary, ManagerOps, ManagerStatus,
-    MasterKeyInfo, ProfileDetail, ProfileSummary, WifiDetail, WifiProfileDetail, WifiProfileSummary,
+    AltBss, BluetoothAdapterDetail, BluetoothAdapterSummary, BluetoothDeviceDetail,
+    BluetoothDeviceSummary, BluetoothListFilter, EthernetDetail, EthernetProfileDetail, GnssDetail,
+    GnssFix, GnssSatellitesView, InterfaceDetail, InterfaceSummary, IpDetail, ManagerOps,
+    ManagerStatus, MasterKeyInfo, ProfileDetail, ProfileSummary, WifiDetail, WifiProfileDetail,
+    WifiProfileSummary,
 };
 
 pub struct ZbusManagerOps {
@@ -171,6 +175,7 @@ impl ManagerOps for ZbusManagerOps {
             ethernet: None,
             bluetooth: None,
             gnss: None,
+            ip: None,
         };
         match summary.kind.as_str() {
             "wifi" | "wireless" => {
@@ -181,10 +186,15 @@ impl ManagerOps for ZbusManagerOps {
                     .await
                     .map_err(from_zbus_error)?;
                 let bss = w.connected_bss().await.map_err(from_zbus_error)?;
-                let (ssid_str, _bytes, bssid_bytes, freq, rssi, sec) = bss;
+                let (ssid_str, ssid_bytes, bssid_bytes, freq, rssi, sec) = bss;
                 let state = w.state().await.map_err(from_zbus_error)?;
+                let alt_bsses = if state == "connected" {
+                    read_alt_bsses(&self.connection, &w, &ssid_bytes, &bssid_bytes).await
+                } else {
+                    Vec::new()
+                };
                 detail.wifi = Some(WifiDetail {
-                    state,
+                    state: state.clone(),
                     ssid: non_empty(ssid_str),
                     bssid: format_mac(&bssid_bytes),
                     frequency_mhz: freq,
@@ -193,7 +203,13 @@ impl ManagerOps for ZbusManagerOps {
                     supplicant: w.supplicant().await.map_err(from_zbus_error)?,
                     roaming_mode: w.roaming_mode().await.map_err(from_zbus_error)?,
                     powered: w.powered().await.map_err(from_zbus_error)?,
+                    alt_bsses,
                 });
+                if state == "connected" {
+                    if let Some(idx) = ifindex {
+                        detail.ip = Some(read_ip_detail(&self.connection, idx).await);
+                    }
+                }
             }
             "ethernet" => {
                 let e = EthernetProxy::builder(&self.connection)
@@ -202,12 +218,18 @@ impl ManagerOps for ZbusManagerOps {
                     .build()
                     .await
                     .map_err(from_zbus_error)?;
+                let state = e.state().await.map_err(from_zbus_error)?;
                 detail.ethernet = Some(EthernetDetail {
-                    state: e.state().await.map_err(from_zbus_error)?,
+                    state: state.clone(),
                     auth_backend: e.auth_backend().await.map_err(from_zbus_error)?,
                     auth_failure_reason: e.auth_failure_reason().await.map_err(from_zbus_error)?,
                     eap_method: e.eap_method().await.map_err(from_zbus_error)?,
                 });
+                if state == "link_ready" || state == "authenticated" {
+                    if let Some(idx) = ifindex {
+                        detail.ip = Some(read_ip_detail(&self.connection, idx).await);
+                    }
+                }
             }
             "bluetooth" => {
                 let b = BluetoothProxy::builder(&self.connection)
@@ -1179,6 +1201,250 @@ fn profile_to_toml(detail: &ProfileDetail) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// IP-layer + alt-BSS readers (off-Nexus / scan-cache walks)
+// ---------------------------------------------------------------------------
+
+/// Walk the connected interface's `Wifi.ScanResults`, keep entries
+/// whose `Ssid` (ay) is byte-equal to the connected `ssid_bytes`
+/// and whose `Bssid` is NOT the connected BSSID, sort by signal
+/// desc, return one [`AltBss`] row each. Errors at any layer
+/// degrade to "no alternatives" rather than failing the show
+/// command — the recipe is best-effort UI enrichment.
+async fn read_alt_bsses(
+    conn: &Connection,
+    wifi: &WifiProxy<'_>,
+    ssid_bytes: &[u8],
+    connected_bssid: &[u8],
+) -> Vec<AltBss> {
+    let paths = match wifi.scan_results().await {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<AltBss> = Vec::with_capacity(paths.len());
+    for p in paths {
+        let proxy = match ScanResultProxy::builder(conn).path(p) {
+            Ok(b) => match b.build().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        let ssid = match proxy.ssid().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if ssid != ssid_bytes {
+            continue;
+        }
+        let bssid = match proxy.bssid().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if bssid == connected_bssid {
+            continue;
+        }
+        let bssid_str = match format_mac(&bssid) {
+            Some(s) => s,
+            None => continue,
+        };
+        let frequency_mhz = proxy.frequency().await.unwrap_or(0);
+        let signal_dbm = proxy.signal_dbm().await.unwrap_or(0);
+        let security = proxy.security_offered().await.unwrap_or_default();
+        out.push(AltBss {
+            bssid: bssid_str,
+            frequency_mhz,
+            signal_dbm,
+            security,
+        });
+    }
+    out.sort_by_key(|r| std::cmp::Reverse(r.signal_dbm));
+    out
+}
+
+/// Read networkd `Manager.DescribeLink(ifindex)` + resolved
+/// `Link.DNS` and decode them into an [`IpDetail`]. Best-effort:
+/// a missing daemon turns into the appropriate `*_unavailable`
+/// marker rather than a hard failure, per the
+/// connected-card-recipe contract.
+async fn read_ip_detail(conn: &Connection, ifindex: u32) -> IpDetail {
+    let mut detail = IpDetail::default();
+    match NetworkdManagerProxy::new(conn).await {
+        Ok(mgr) => match read_networkd_link_json(&mgr, ifindex).await {
+            Ok(v) => decode_networkd_describe(&v, &mut detail),
+            Err(reason) => detail.networkd_unavailable = Some(reason),
+        },
+        Err(_) => {
+            detail.networkd_unavailable = Some("networkd not on bus".into());
+        }
+    }
+    // Try resolved second. When it answers we OVERRIDE the
+    // networkd-derived DNS list (resolved aggregates per-link
+    // configuration with global / fallback / system entries). When
+    // resolved is missing, leave the networkd-derived DNS in place
+    // and only emit the "resolved not on bus" marker if networkd
+    // didn't surface DNS either — otherwise the row would falsely
+    // report no DNS on a working device.
+    let resolve_path = format!("/org/freedesktop/resolve1/link/_{ifindex}");
+    let resolved_dns = read_resolved_dns(conn, &resolve_path).await;
+    match resolved_dns {
+        Ok(list) => detail.dns = list,
+        Err(_) if !detail.dns.is_empty() => { /* networkd DNS suffices */ }
+        Err(_) => {
+            detail.resolved_unavailable = Some("resolved not on bus".into());
+        }
+    }
+    detail
+}
+
+async fn read_resolved_dns(conn: &Connection, path: &str) -> Result<Vec<String>, ()> {
+    let object_path = zbus::zvariant::ObjectPath::try_from(path).map_err(|_| ())?;
+    let proxy = ResolveLinkProxy::builder(conn)
+        .path(object_path)
+        .map_err(|_| ())?
+        .build()
+        .await
+        .map_err(|_| ())?;
+    let entries = proxy.dns().await.map_err(|_| ())?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|(family, bytes)| format_ip_address(family, &bytes))
+        .collect())
+}
+
+/// Fetch the per-link JSON blob, preferring `DescribeLink(ifindex)`
+/// (systemd 250+) and falling back to the no-arg `Describe()`
+/// manager dump on older systemds — the latter returns a manager
+/// state with `Interfaces[]`, from which we pluck the entry whose
+/// `Index` matches our ifindex.
+async fn read_networkd_link_json(
+    mgr: &NetworkdManagerProxy<'_>,
+    ifindex: u32,
+) -> Result<serde_json::Value, String> {
+    match mgr.describe_link(ifindex as i32).await {
+        Ok(json) => serde_json::from_str(&json)
+            .map_err(|e| format!("DescribeLink JSON parse failed: {e}")),
+        Err(link_err) => match mgr.describe().await {
+            Ok(json) => {
+                let v: serde_json::Value = serde_json::from_str(&json)
+                    .map_err(|e| format!("Describe JSON parse failed: {e}"))?;
+                v.get("Interfaces")
+                    .and_then(|a| a.as_array())
+                    .and_then(|arr| {
+                        arr.iter().find(|item| {
+                            item.get("Index")
+                                .and_then(|i| i.as_u64())
+                                .map(|i| i as u32)
+                                == Some(ifindex)
+                        })
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("ifindex {ifindex} not found in networkd Describe()")
+                    })
+            }
+            Err(_) => Err(format!("DescribeLink failed: {link_err}")),
+        },
+    }
+}
+
+/// Pull IPv4/IPv6 address + default-gateway + DNS rows out of the
+/// JSON blob returned by
+/// `org.freedesktop.network1.Manager.DescribeLink` (or extracted
+/// from the manager-wide `Describe()` fallback). Field rules per
+/// integration-knowledge-graph
+/// `flow:read-ip-info-for-connected-iface`:
+///   - IPv4 address: `Family==2 && Scope==0`, decode 4 bytes.
+///   - IPv6 address: `Family==10`, prefer `Scope==0` (global)
+///     over `Scope==253` (link-local).
+///   - Default route: `DestinationPrefixLength==0`.
+///   - DNS: per-link `DNS[]` array (each entry `{Family, Address}`).
+///     Used as the DNS-row fallback when systemd-resolved isn't on
+///     the bus (stripped-down rootfs); when resolved is reachable
+///     its `Link.DNS` overrides this list.
+fn decode_networkd_describe(v: &serde_json::Value, out: &mut IpDetail) {
+    if let Some(addrs) = v.get("Addresses").and_then(|a| a.as_array()) {
+        let mut ipv6_global: Option<String> = None;
+        let mut ipv6_link: Option<String> = None;
+        for a in addrs {
+            let family = a.get("Family").and_then(|x| x.as_i64()).unwrap_or(0);
+            let scope = a.get("Scope").and_then(|x| x.as_i64()).unwrap_or(0);
+            let prefix = a
+                .get("PrefixLength")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as u8;
+            let bytes = parse_addr_bytes(a.get("Address"));
+            if family == 2 && scope == 0 && bytes.len() == 4 && out.ipv4_address.is_none() {
+                out.ipv4_address = Some(format_ipv4(&bytes));
+                out.ipv4_prefix_length = Some(prefix);
+            } else if family == 10 && bytes.len() == 16 {
+                let s = format_ipv6(&bytes);
+                if scope == 0 && ipv6_global.is_none() {
+                    ipv6_global = Some(s);
+                } else if scope == 253 && ipv6_link.is_none() {
+                    ipv6_link = Some(s);
+                }
+            }
+        }
+        out.ipv6_address = ipv6_global.or(ipv6_link);
+    }
+    if let Some(routes) = v.get("Routes").and_then(|a| a.as_array()) {
+        for r in routes {
+            let family = r.get("Family").and_then(|x| x.as_i64()).unwrap_or(0);
+            let dpl = r
+                .get("DestinationPrefixLength")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(u64::MAX);
+            if dpl != 0 {
+                continue;
+            }
+            let gw = parse_addr_bytes(r.get("Gateway"));
+            if family == 2 && gw.len() == 4 && out.ipv4_gateway.is_none() {
+                out.ipv4_gateway = Some(format_ipv4(&gw));
+            } else if family == 10 && gw.len() == 16 && out.ipv6_gateway.is_none() {
+                out.ipv6_gateway = Some(format_ipv6(&gw));
+            }
+        }
+    }
+    if let Some(dns) = v.get("DNS").and_then(|a| a.as_array()) {
+        for d in dns {
+            let family = d.get("Family").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let bytes = parse_addr_bytes(d.get("Address"));
+            if let Some(s) = format_ip_address(family, &bytes) {
+                out.dns.push(s);
+            }
+        }
+    }
+}
+
+fn parse_addr_bytes(v: Option<&serde_json::Value>) -> Vec<u8> {
+    v.and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.as_u64().map(|n| n as u8))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn format_ipv4(bytes: &[u8]) -> String {
+    std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string()
+}
+
+fn format_ipv6(bytes: &[u8]) -> String {
+    let mut a = [0u8; 16];
+    a.copy_from_slice(bytes);
+    std::net::Ipv6Addr::from(a).to_string()
+}
+
+fn format_ip_address(family: i32, bytes: &[u8]) -> Option<String> {
+    match family {
+        2 if bytes.len() == 4 => Some(format_ipv4(bytes)),
+        10 if bytes.len() == 16 => Some(format_ipv6(bytes)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1242,6 +1508,107 @@ mod tests {
         assert_eq!(
             normalise_profile_path("/fi/nexus1/profile/wifi/X"),
             Some("/fi/nexus1/profile/wifi/X".to_owned())
+        );
+    }
+
+    #[test]
+    fn decode_networkd_describe_extracts_v4_v6_and_default_route() {
+        let json = serde_json::json!({
+            "Addresses": [
+                {
+                    "Family": 2, "Scope": 0, "PrefixLength": 24,
+                    "Address": [192, 0, 2, 42]
+                },
+                {
+                    "Family": 10, "Scope": 253, "PrefixLength": 64,
+                    "Address": [
+                        0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+                        0xda, 0x3a, 0xdd, 0xff, 0xfe, 0xbb, 0x34, 0x74
+                    ]
+                },
+                {
+                    "Family": 10, "Scope": 0, "PrefixLength": 64,
+                    "Address": [
+                        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0x01
+                    ]
+                }
+            ],
+            "Routes": [
+                {
+                    "Family": 2, "DestinationPrefixLength": 24,
+                    "Destination": [192, 0, 2, 0],
+                    "Gateway": [192, 0, 2, 1]
+                },
+                {
+                    "Family": 2, "DestinationPrefixLength": 0,
+                    "Destination": [0, 0, 0, 0],
+                    "Gateway": [192, 0, 2, 1]
+                },
+                {
+                    "Family": 10, "DestinationPrefixLength": 0,
+                    "Destination": [
+                        0, 0, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0
+                    ],
+                    "Gateway": [
+                        0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0x01
+                    ]
+                }
+            ]
+        });
+        let mut d = IpDetail::default();
+        decode_networkd_describe(&json, &mut d);
+        assert_eq!(d.ipv4_address.as_deref(), Some("192.0.2.42"));
+        assert_eq!(d.ipv4_prefix_length, Some(24));
+        assert_eq!(d.ipv4_gateway.as_deref(), Some("192.0.2.1"));
+        // Global IPv6 wins over link-local when both are present.
+        assert_eq!(d.ipv6_address.as_deref(), Some("2001:db8::1"));
+        assert_eq!(d.ipv6_gateway.as_deref(), Some("fe80::1"));
+    }
+
+    #[test]
+    fn decode_networkd_describe_pulls_dns_when_present() {
+        let json = serde_json::json!({
+            "DNS": [
+                { "Family": 2, "Address": [10, 11, 12, 1] },
+                { "Family": 10, "Address": [
+                    0xfd, 0x00, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0x01
+                ] }
+            ]
+        });
+        let mut d = IpDetail::default();
+        decode_networkd_describe(&json, &mut d);
+        assert_eq!(d.dns, vec!["10.11.12.1".to_owned(), "fd00::1".to_owned()]);
+    }
+
+    #[test]
+    fn decode_networkd_describe_falls_back_to_link_local_v6() {
+        let json = serde_json::json!({
+            "Addresses": [
+                {
+                    "Family": 10, "Scope": 253, "PrefixLength": 64,
+                    "Address": [
+                        0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+                        0, 0, 0, 0, 0, 0, 0, 0x02
+                    ]
+                }
+            ]
+        });
+        let mut d = IpDetail::default();
+        decode_networkd_describe(&json, &mut d);
+        assert_eq!(d.ipv6_address.as_deref(), Some("fe80::2"));
+    }
+
+    #[test]
+    fn format_ip_address_rejects_wrong_lengths() {
+        assert!(format_ip_address(2, &[1, 2, 3]).is_none());
+        assert!(format_ip_address(10, &[0; 8]).is_none());
+        assert_eq!(
+            format_ip_address(2, &[1, 1, 1, 1]).as_deref(),
+            Some("1.1.1.1")
         );
     }
 }

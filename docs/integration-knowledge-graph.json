@@ -167,7 +167,8 @@
         "mounted_on": "/org/freedesktop/network1",
         "ownership": "external — systemd-networkd, NOT nexusd. Lives on the same system bus.",
         "purpose": "Layer-3 source of truth: IPv4 / IPv6 addresses, routes, DHCP lease, etc. nexusd delegates IP management here per nexus-architecture.md ADR-001 (`No built-in IP management`). Clients that need IP rows on a connected card read them from this service, not from fi.nexus1.",
-        "key_method": "Describe(ifindex:i) -> (json:s) — returns a JSON blob with full per-link state (Addresses[], Routes[], DHCPv4{}, DHCPv6{}). networkctl status parses this same blob.",
+        "key_method": "DescribeLink(ifindex:i) -> (json:s) — per-link JSON dump with Addresses[], Routes[], DHCPv4{}, DHCPv6{}. networkctl status parses the same shape. (Older systemds (<250) only expose the no-arg `Describe() -> (json:s)` manager-wide dump; in that case extract the per-link blob from JSON.Interfaces[] by Index.)",
+        "fallback_method": "Describe() -> (json:s) — manager-wide JSON dump. Returned blob has `Interfaces` (array of per-link objects, each with `Index`, `Addresses`, `Routes`, …). Use as a fallback on systemd <250.",
         "see_also": ["iface:org.freedesktop.network1.Link", "flow:read-ip-info-for-connected-iface"]
       } },
     { "id": "iface:org.freedesktop.network1.Link", "type": "Interface", "label": "systemd-networkd per-link object (external)",
@@ -182,7 +183,7 @@
           "IPv4AddressState (s) / IPv6AddressState (s) — same enum as AddressState but per family",
           "OnlineState (s) — 'offline' | 'partial' | 'online'"
         ],
-        "subscription_pattern": "PropertiesChanged on this object is the trigger to re-call org.freedesktop.network1.Manager.Describe(ifindex) and refresh the rendered Address / Route rows. The Link interface itself does NOT expose Addresses[] / Routes[] as bus properties — Describe() is the authoritative source.",
+        "subscription_pattern": "PropertiesChanged on this object is the trigger to re-call org.freedesktop.network1.Manager.DescribeLink(ifindex) and refresh the rendered Address / Route rows. The Link interface itself does NOT expose Addresses[] / Routes[] as bus properties — DescribeLink() (or, on systemd <250, the manager-wide Describe()) is the authoritative source.",
         "see_also": ["iface:org.freedesktop.network1.Manager", "iface:org.freedesktop.resolve1.Link", "flow:read-ip-info-for-connected-iface"]
       } },
     { "id": "iface:org.freedesktop.resolve1.Link", "type": "Interface", "label": "systemd-resolved per-link object (external)",
@@ -1543,10 +1544,10 @@
           "tip": "Both paths use the same ifindex escape; compute once and reuse." },
         { "do": "Open subscriptions BEFORE the first read so a property change between reads doesn't slip through.",
           "subscriptions": [
-            "PropertiesChanged on /org/freedesktop/network1/link/_<ifindex> (member-filtered to interface=org.freedesktop.network1.Link). Triggers a re-Describe() on each fire.",
+            "PropertiesChanged on /org/freedesktop/network1/link/_<ifindex> (member-filtered to interface=org.freedesktop.network1.Link). Triggers a re-DescribeLink() on each fire.",
             "PropertiesChanged on /org/freedesktop/resolve1/link/_<ifindex> (member-filtered to interface=org.freedesktop.resolve1.Link). Triggers a DNS re-read."
           ] },
-        { "do": "Call org.freedesktop.network1.Manager.Describe(ifindex:i) on /org/freedesktop/network1.",
+        { "do": "Call org.freedesktop.network1.Manager.DescribeLink(ifindex:i) on /org/freedesktop/network1. (Older systemds (<250) only expose the no-arg `Describe() -> (json:s)` manager-wide dump — fall back to that and pluck the entry whose `Index` matches your ifindex out of `JSON.Interfaces[]`.)",
           "node": "iface:org.freedesktop.network1.Manager",
           "yields": "(json:s) — parse as JSON. Fields used by the connected-card recipe: `Addresses` (array of {Family:i, Address:ay, PrefixLength:u, Scope:i}); `Routes` (array of {Family:i, Destination:ay, DestinationPrefixLength:u, Gateway:ay, Scope:i, Type:i}); `DHCPv4`/`DHCPv6` (lease metadata — out of scope for the first cut, see notes).",
           "ipv4_address_extract": "Filter Addresses where Family==2 (AF_INET) AND Scope==0 (RT_SCOPE_UNIVERSE / global). Decode 4-byte arrays to dotted-quad. Use PrefixLength as the subnet mask length.",
@@ -1554,19 +1555,19 @@
           "ipv6_address_extract": "Filter Addresses where Family==10 (AF_INET6). For the connected card, prefer Scope==0 (global) over Scope==253 (link). Render the link-local separately if at all.",
           "ipv6_gateway_extract": "Filter Routes where Family==10 AND DestinationPrefixLength==0."
         },
-        { "do": "Read DNS from systemd-resolved: Properties.Get on /org/freedesktop/resolve1/link/_<ifindex>, interface=org.freedesktop.resolve1.Link, property=DNS.",
+        { "do": "Read DNS from systemd-resolved: Properties.Get on /org/freedesktop/resolve1/link/_<ifindex>, interface=org.freedesktop.resolve1.Link, property=DNS. When resolved is NOT on the bus (stripped-down rootfs without systemd-resolved), fall back to the per-link `DNS[]` array carried in the same DescribeLink JSON blob from the previous step — every entry is `{Family:i, Address:ay}`, decoded the same way.",
           "node": "iface:org.freedesktop.resolve1.Link",
           "yields": "a(iay) — array of (family, address-bytes). Decode family=2 → IPv4 dotted-quad, family=10 → IPv6 colon-hex. Show as a comma-joined list in the DNS row." },
-        { "do": "On any subsequent PropertiesChanged from networkd's Link object, re-call Describe(ifindex) and re-extract. On PropertiesChanged from resolved's Link object, re-read DNS.",
-          "tip": "Address state can churn during DHCP renewal — debounce the re-Describe by ~200 ms if the PropertiesChanged firehose is noisy. networkd already coalesces per-state-summary changes."
+        { "do": "On any subsequent PropertiesChanged from networkd's Link object, re-call DescribeLink(ifindex) and re-extract. On PropertiesChanged from resolved's Link object, re-read DNS.",
+          "tip": "Address state can churn during DHCP renewal — debounce the re-DescribeLink by ~200 ms if the PropertiesChanged firehose is noisy. networkd already coalesces per-state-summary changes."
         }
       ],
       "ui_notes": [
-        "Connect-flow ordering: subscribe BEFORE Wifi.Connect; first Describe() lands AFTER Wifi.ConnectComplete success — but networkd's IPv4AddressState transition to 'routable' may fire either before or after ConnectComplete depending on DHCP timing. Treat the two as independent edges; the IP row renders when networkd tells you so.",
-        "On disconnected interfaces, Describe() still works but Addresses[] is empty (or contains only link-local IPv6). Don't fall back to fi.nexus.Interface for an IP — there is no IP property there by design.",
-        "Match systemd version expectations: Manager.Describe(ifindex) is available since systemd 245. resolved.Link.DNS is available since systemd 232. Both are present on every systemd-based deployment Nexus targets.",
+        "Connect-flow ordering: subscribe BEFORE Wifi.Connect; first DescribeLink() lands AFTER Wifi.ConnectComplete success — but networkd's IPv4AddressState transition to 'routable' may fire either before or after ConnectComplete depending on DHCP timing. Treat the two as independent edges; the IP row renders when networkd tells you so.",
+        "On disconnected interfaces, DescribeLink() still works but Addresses[] is empty (or contains only link-local IPv6). Don't fall back to fi.nexus.Interface for an IP — there is no IP property there by design.",
+        "Match systemd version expectations: Manager.DescribeLink(ifindex) is available since systemd 250; the no-arg manager-wide Manager.Describe() has been around since systemd 219 and is the fallback path on older releases (Debian 12 / systemd 252 already exposes both). resolved.Link.DNS is available since systemd 232. Both are present on every systemd-based deployment Nexus targets.",
         "Path-permissions: both calls are open to unprivileged readers on default systemd policy. Writes (Manager.Reload, etc.) are not used here.",
-        "Out of scope for this flow (file separately when the UI wants them): DHCP lease lifetime / renew timestamp (DHCPv4.LeaseEnd inside Describe()), IPv6 SLAAC vs DHCPv6 distinguisher (Addresses[].Flags / DHCPv6 dict), and per-link metric stats."
+        "Out of scope for this flow (file separately when the UI wants them): DHCP lease lifetime / renew timestamp (DHCPv4.LeaseEnd inside DescribeLink()), IPv6 SLAAC vs DHCPv6 distinguisher (Addresses[].Flags / DHCPv6 dict), and per-link metric stats."
       ],
       "see_also": ["iface:org.freedesktop.network1.Manager", "iface:org.freedesktop.network1.Link", "iface:org.freedesktop.resolve1.Link", "ui_design_patterns.connected_card_recipe", "ui_design_patterns.alternative_aps_for_connected_ssid", "consumer_recommendations.ip_layer_data_source"]
     }
@@ -1595,7 +1596,7 @@
     "hot_vs_cold": "Treat SignalDbm/Frequency/AgeMs as a polled cache (~1Hz). Treat State/OperState/ManagedProfile as event-driven; act on every transition.",
     "object_path_strings": "Never parse object paths to extract ifname or ulid for business logic — the escaping rules can produce surprises (eth0:1 -> eth0_3a1). Read Interface.Ifname or Profile.Id instead.",
     "rate_limit_etiquette": "Honour retry_after_ms on RateLimited; do not retry on Timeout (the call may have succeeded — reconcile via state).",
-    "ip_layer_data_source": "fi.nexus1's surface stops at link-layer state — carrier, association, signal, security, profile management. IPv4 / IPv6 addresses, default gateway, and DNS are NOT exposed on fi.nexus.Interface; they live on systemd-networkd (org.freedesktop.network1) and systemd-resolved (org.freedesktop.resolve1) on the same system bus. This is a deliberate architectural delegation, ADR-001 in nexus-architecture.md (`No built-in IP management`). To render the IP rows on a connected card, read org.freedesktop.network1.Manager.Describe(ifindex) for Addresses[] / Routes[] and org.freedesktop.resolve1.Link.DNS at /org/freedesktop/resolve1/link/_<ifindex> for DNS — see flow:read-ip-info-for-connected-iface and ui_design_patterns.connected_card_recipe for the full pattern. Subscribe PropertiesChanged on the per-link networkd / resolved objects for change notifications; do not poll."
+    "ip_layer_data_source": "fi.nexus1's surface stops at link-layer state — carrier, association, signal, security, profile management. IPv4 / IPv6 addresses, default gateway, and DNS are NOT exposed on fi.nexus.Interface; they live on systemd-networkd (org.freedesktop.network1) and systemd-resolved (org.freedesktop.resolve1) on the same system bus. This is a deliberate architectural delegation, ADR-001 in nexus-architecture.md (`No built-in IP management`). To render the IP rows on a connected card, read org.freedesktop.network1.Manager.DescribeLink(ifindex) for Addresses[] / Routes[] (or, on systemd <250, the no-arg Manager.Describe() and pluck the per-link entry from JSON.Interfaces[]) and org.freedesktop.resolve1.Link.DNS at /org/freedesktop/resolve1/link/_<ifindex> for DNS — see flow:read-ip-info-for-connected-iface and ui_design_patterns.connected_card_recipe for the full pattern. Subscribe PropertiesChanged on the per-link networkd / resolved objects for change notifications; do not poll."
   },
 
   "open_questions": [
@@ -2156,19 +2157,19 @@
           "render": "Stacked rows: 'aa:bb:cc:dd:ee:ff  Ch 36 (5 GHz)  −67 dBm'. Empty list is a normal state — most home deployments have one AP per SSID. Tap-to-pin opens flow:wifi-bssid-pinning (writes Profile.Wifi.BssidPreferred = MAC and re-Connects).",
           "live_update": "Driven by ObjectManager InterfacesAdded/Removed on /fi/nexus1/interface/<ifname>/scan_result/* and per-row PropertiesChanged on each ScanResult object. The list freshness is the freshness of the last Wi-Fi scan; surface a 'Last scanned: Ns ago' affordance derived from min(ScanResult.AgeMs)." },
         { "row": "IP address",
-          "source": "Off-Nexus: org.freedesktop.network1.Manager.Describe(ifindex) → JSON.Addresses[] with Family==2 (IPv4) and Scope==0 (global). See flow:read-ip-info-for-connected-iface.",
+          "source": "Off-Nexus: org.freedesktop.network1.Manager.DescribeLink(ifindex) → JSON.Addresses[] with Family==2 (IPv4) and Scope==0 (global). See flow:read-ip-info-for-connected-iface.",
           "render": "'192.0.2.42 / 24' — dotted-quad + PrefixLength as CIDR. If multiple global IPv4 addresses, render the first; show a 'show all' affordance only if the device has multi-address use cases.",
-          "live_update": "PropertiesChanged on /org/freedesktop/network1/link/_<ifindex> → re-call Describe()." },
+          "live_update": "PropertiesChanged on /org/freedesktop/network1/link/_<ifindex> → re-call DescribeLink()." },
         { "row": "Subnet mask",
-          "source": "Same Describe() blob — derive from the same Addresses[] entry's PrefixLength (e.g. 24 → 255.255.255.0). Not a separate D-Bus field.",
+          "source": "Same DescribeLink() blob — derive from the same Addresses[] entry's PrefixLength (e.g. 24 → 255.255.255.0). Not a separate D-Bus field.",
           "render": "Dotted-quad. Some operators prefer the CIDR-only display (collapsing IP + Subnet into one row); pick one and stay consistent." },
         { "row": "Router (default gateway)",
-          "source": "Off-Nexus: org.freedesktop.network1.Manager.Describe(ifindex) → JSON.Routes[] with Family==2 AND DestinationPrefixLength==0. Decode the Gateway 4-byte array.",
+          "source": "Off-Nexus: org.freedesktop.network1.Manager.DescribeLink(ifindex) → JSON.Routes[] with Family==2 AND DestinationPrefixLength==0. Decode the Gateway 4-byte array.",
           "render": "Dotted-quad. Empty when no default route via this interface (rare on a 'connected' Wi-Fi card; common on a secondary management link)." },
         { "row": "DNS servers",
-          "source": "Off-Nexus: org.freedesktop.resolve1.Link at /org/freedesktop/resolve1/link/_<ifindex>, property DNS (a(iay)).",
+          "source": "Off-Nexus: org.freedesktop.resolve1.Link at /org/freedesktop/resolve1/link/_<ifindex>, property DNS (a(iay)). Fallback: when resolved is not running, the same DescribeLink() blob from networkd carries a per-link `DNS[]` array (entries `{Family:i, Address:ay}`); use it for the DNS row.",
           "render": "Comma-joined list of decoded addresses. If the list is empty, fall back to the Manager-level resolved DNS or hide the row entirely — don't render a literal '(none)' on what is normally a working connection.",
-          "live_update": "PropertiesChanged on the resolved Link object." },
+          "live_update": "PropertiesChanged on the resolved Link object (or, on the networkd-DNS fallback, on the networkd Link object)." },
         { "row": "IPv6 address (if present and the UI shows v6)",
           "source": "Same Describe() blob, Family==10 entries.",
           "render": "Prefer Scope==0 (global) over Scope==253 (link-local). Render the link-local separately under a 'show details' disclosure if at all." },
@@ -2307,11 +2308,11 @@
             "_about": "Nexus does NOT publish IP-layer state on fi.nexus1 (ADR-001). Read addresses, routes, and DNS from systemd-networkd / systemd-resolved on the same system bus.",
             "go_to_flow": "flow:read-ip-info-for-connected-iface",
             "calls": [
-              "org.freedesktop.network1.Manager.Describe(ifindex:i) on /org/freedesktop/network1 — yields a JSON blob with Addresses[] / Routes[]; extract IPv4 / IPv6 address, prefix, default gateway.",
+              "org.freedesktop.network1.Manager.DescribeLink(ifindex:i) on /org/freedesktop/network1 — yields a JSON blob with Addresses[] / Routes[]; extract IPv4 / IPv6 address, prefix, default gateway. (On systemd <250, fall back to the no-arg Manager.Describe() and pluck the per-link entry from JSON.Interfaces[] by Index.)",
               "Properties.Get on /org/freedesktop/resolve1/link/_<ifindex>, interface=org.freedesktop.resolve1.Link, property=DNS — yields a(iay); decode per family for the DNS row."
             ],
             "rerender_triggers": [
-              "PropertiesChanged on /org/freedesktop/network1/link/_<ifindex> → re-Describe() and refresh IP / Subnet / Router.",
+              "PropertiesChanged on /org/freedesktop/network1/link/_<ifindex> → re-DescribeLink() and refresh IP / Subnet / Router.",
               "PropertiesChanged on /org/freedesktop/resolve1/link/_<ifindex> → re-read DNS only."
             ]
           },

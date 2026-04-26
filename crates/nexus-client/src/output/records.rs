@@ -21,10 +21,10 @@ use comfy_table::{Cell, ContentArrangement, Table, presets::NOTHING};
 
 use crate::output::{Render, RenderContext, escape_terse};
 use crate::proxy::{
-    BluetoothAdapterDetail, BluetoothAdapterSummary, BluetoothDeviceDetail, BluetoothDeviceSummary,
-    EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix, GnssSatellitesView,
-    InterfaceDetail, MasterKeyInfo, ProfileDetail, ProfileSummary, WifiDetail, WifiProfileDetail,
-    WifiProfileSummary,
+    AltBss, BluetoothAdapterDetail, BluetoothAdapterSummary, BluetoothDeviceDetail,
+    BluetoothDeviceSummary, EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix,
+    GnssSatellitesView, InterfaceDetail, IpDetail, MasterKeyInfo, ProfileDetail, ProfileSummary,
+    WifiDetail, WifiProfileDetail, WifiProfileSummary,
 };
 
 // ---------------------------------------------------------------------------
@@ -145,6 +145,16 @@ impl Render for InterfaceDetail {
             writeln!(w)?;
             render_gnss_block(gnss, w)?;
         }
+        if let Some(ip) = &self.ip {
+            writeln!(w)?;
+            render_ip_block(ip, w)?;
+        }
+        if let Some(wifi) = &self.wifi {
+            if wifi.state == "connected" {
+                writeln!(w)?;
+                render_alt_aps_block(&wifi.alt_bsses, w)?;
+            }
+        }
         Ok(())
     }
 
@@ -182,6 +192,95 @@ fn render_wifi_block(wifi: &WifiDetail, w: &mut dyn Write) -> io::Result<()> {
         ("Powered", fmt_bool(wifi.powered)),
     ];
     vertical_block(&pairs, w)
+}
+
+/// `[ip]` block — IPv4 / prefix / gateway / IPv6 / IPv6 gateway /
+/// DNS rows. Sourced off-Nexus from systemd-networkd + resolved
+/// (integration-knowledge-graph
+/// `flow:read-ip-info-for-connected-iface` and
+/// `ui_design_patterns.connected_card_recipe`). Empty values render
+/// as "—"; missing services collapse to a single "unavailable: …"
+/// line so a stripped-down rootfs doesn't fail the whole command.
+fn render_ip_block(ip: &IpDetail, w: &mut dyn Write) -> io::Result<()> {
+    writeln!(w, "[ip]")?;
+    if let Some(reason) = &ip.networkd_unavailable {
+        writeln!(w, "  unavailable: {reason}")?;
+        return Ok(());
+    }
+    let dns_value = if let Some(reason) = &ip.resolved_unavailable {
+        format!("unavailable: {reason}")
+    } else if ip.dns.is_empty() {
+        "—".into()
+    } else {
+        ip.dns.join(", ")
+    };
+    let ipv4 = ip.ipv4_address.clone().unwrap_or_else(|| "—".into());
+    let prefix = ip
+        .ipv4_prefix_length
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "—".into());
+    let v4gw = ip.ipv4_gateway.clone().unwrap_or_else(|| "—".into());
+    let ipv6 = ip.ipv6_address.clone().unwrap_or_else(|| "—".into());
+    let v6gw = ip.ipv6_gateway.clone().unwrap_or_else(|| "—".into());
+    let pairs = vec![
+        ("IPv4", ipv4),
+        ("IPv4 prefix", prefix),
+        ("IPv4 gateway", v4gw),
+        ("IPv6", ipv6),
+        ("IPv6 gateway", v6gw),
+        ("DNS", dns_value),
+    ];
+    vertical_block(&pairs, w)
+}
+
+/// `[alt aps]` block — every BSSID visible in the scan cache for
+/// the connected SSID, minus the connected one. Up to 8 rows; the
+/// rest collapse into "(N more)" per integration-knowledge-graph
+/// `ui_design_patterns.alternative_aps_for_connected_ssid`.
+fn render_alt_aps_block(alts: &[AltBss], w: &mut dyn Write) -> io::Result<()> {
+    writeln!(w, "[alt aps]")?;
+    if alts.is_empty() {
+        writeln!(w, "  none")?;
+        return Ok(());
+    }
+    const MAX: usize = 8;
+    for row in alts.iter().take(MAX) {
+        let chan = freq_to_channel(row.frequency_mhz)
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".into());
+        let security = if row.security.is_empty() {
+            "open".into()
+        } else {
+            row.security.join(",")
+        };
+        writeln!(
+            w,
+            "  {}  Ch {}  {} MHz  {} dBm  {}",
+            row.bssid, chan, row.frequency_mhz, row.signal_dbm, security
+        )?;
+    }
+    if alts.len() > MAX {
+        writeln!(w, "  ({} more)", alts.len() - MAX)?;
+    }
+    Ok(())
+}
+
+/// Map a centre frequency in MHz to its channel number for the
+/// 2.4 GHz, 5 GHz, and 6 GHz bands. Returns `None` for anything
+/// outside the standard plans (some hardware reports zero before a
+/// scan completes — render as "?" upstream).
+fn freq_to_channel(freq_mhz: u32) -> Option<u32> {
+    match freq_mhz {
+        0 => None,
+        2412..=2472 => Some((freq_mhz - 2407) / 5),
+        2484 => Some(14),
+        // 5 GHz UNII bands.
+        5180..=5885 if freq_mhz % 5 == 0 => Some((freq_mhz - 5000) / 5),
+        // 6 GHz (5945–7125 MHz, channels 1–233 spaced 5 MHz apart
+        // starting at 5950).
+        5945..=7125 if freq_mhz % 5 == 0 && freq_mhz >= 5955 => Some((freq_mhz - 5950) / 5),
+        _ => None,
+    }
 }
 
 fn render_ethernet_block(eth: &EthernetDetail, w: &mut dyn Write) -> io::Result<()> {

@@ -21,7 +21,9 @@ pub mod ethernet;
 pub mod gnss;
 pub mod interface;
 pub mod manager;
+pub mod networkd;
 pub mod profile;
+pub mod resolve1;
 pub mod scan_result;
 pub mod wifi;
 pub mod zbus_ops;
@@ -93,6 +95,14 @@ pub struct InterfaceDetail {
     pub bluetooth: Option<BluetoothAdapterDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gnss: Option<GnssDetail>,
+    /// IP-layer rows for the connected card, sourced from
+    /// systemd-networkd + systemd-resolved (off-Nexus, per
+    /// nexus-architecture.md ADR-001 and
+    /// integration-knowledge-graph `flow:read-ip-info-for-connected-iface`).
+    /// Populated only when the interface is in a connected /
+    /// link-ready / authenticated state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<IpDetail>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -106,6 +116,56 @@ pub struct WifiDetail {
     pub supplicant: String,
     pub roaming_mode: String,
     pub powered: bool,
+    /// Per-BSSID alternatives for the connected SSID, sorted by
+    /// `signal_dbm` desc. Populated only when `state == "connected"`
+    /// (otherwise the "alternatives to the AP I'm on" question is
+    /// undefined — see integration-knowledge-graph
+    /// `ui_design_patterns.alternative_aps_for_connected_ssid`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alt_bsses: Vec<AltBss>,
+}
+
+/// One row of the per-BSSID alternatives list rendered under the
+/// `[alt aps]` block of `wifi show`. Filtered from
+/// `prop:fi.nexus.Wifi.ScanResults` by byte-equal SSID match against
+/// the connected `ConnectedBss.ssid_bytes` (non-UTF-8 SSIDs are
+/// legal — string compare collapses distinct hidden bytes).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AltBss {
+    pub bssid: String,
+    pub frequency_mhz: u32,
+    pub signal_dbm: i32,
+    pub security: Vec<String>,
+}
+
+/// IP-layer snapshot for the connected detail card. The fields map
+/// to the rows in `ui_design_patterns.connected_card_recipe`:
+/// IPv4 / IPv4 prefix / IPv4 gateway / IPv6 / IPv6 gateway / DNS.
+///
+/// `networkd_unavailable` and `resolved_unavailable` are sticky
+/// markers used by the renderer to print
+/// "unavailable: networkd not on bus" / "unavailable" in the DNS
+/// row when those services aren't reachable on the system bus
+/// (stripped-down test rootfs, etc.). Empty values (no IPv4
+/// assigned yet, no default route) render as "—".
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct IpDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub networkd_unavailable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_unavailable: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv4_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv4_prefix_length: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv4_gateway: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv6_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv6_gateway: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

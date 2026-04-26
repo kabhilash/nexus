@@ -10,10 +10,10 @@ use nexus_client::commands;
 use nexus_client::errors::NexusctlError;
 use nexus_client::output::{OutputFormat, RenderContext};
 use nexus_client::proxy::{
-    BluetoothAdapterSummary, BluetoothDeviceDetail, BluetoothDeviceSummary, BluetoothListFilter,
-    EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix, GnssSatellitesView,
-    InterfaceDetail, InterfaceSummary, ManagerOps, ManagerStatus, MasterKeyInfo, ProfileDetail,
-    ProfileSummary, WifiDetail, WifiProfileDetail, WifiProfileSummary,
+    AltBss, BluetoothAdapterSummary, BluetoothDeviceDetail, BluetoothDeviceSummary,
+    BluetoothListFilter, EthernetDetail, EthernetProfileDetail, GnssDetail, GnssFix,
+    GnssSatellitesView, InterfaceDetail, InterfaceSummary, IpDetail, ManagerOps, ManagerStatus,
+    MasterKeyInfo, ProfileDetail, ProfileSummary, WifiDetail, WifiProfileDetail, WifiProfileSummary,
 };
 
 /// A stub that serves pre-canned responses to every `ManagerOps`
@@ -133,6 +133,12 @@ where
 // ---------------------------------------------------------------------------
 
 fn wifi_detail_fixture() -> InterfaceDetail {
+    // Mirrors the production fallback path: state==connected but
+    // neither systemd-networkd nor systemd-resolved is reachable on
+    // the bus (stripped-down rootfs). The renderer collapses the
+    // [ip] block to a single "unavailable" line and prints the
+    // empty [alt aps] block as "none" — the existing snapshot
+    // anchors this no-IP-context shape.
     InterfaceDetail {
         summary: InterfaceSummary {
             iface: "wlan0".into(),
@@ -154,11 +160,46 @@ fn wifi_detail_fixture() -> InterfaceDetail {
             supplicant: "wpa_supplicant".into(),
             roaming_mode: "supplicant".into(),
             powered: true,
+            alt_bsses: Vec::new(),
         }),
         ethernet: None,
         bluetooth: None,
         gnss: None,
+        ip: Some(IpDetail {
+            networkd_unavailable: Some("networkd not on bus".into()),
+            ..IpDetail::default()
+        }),
     }
+}
+
+fn wifi_detail_fixture_with_ip_and_alts() -> InterfaceDetail {
+    let mut base = wifi_detail_fixture();
+    base.ip = Some(IpDetail {
+        ipv4_address: Some("192.0.2.42".into()),
+        ipv4_prefix_length: Some(24),
+        ipv4_gateway: Some("192.0.2.1".into()),
+        ipv6_address: Some("2001:db8::1".into()),
+        ipv6_gateway: Some("fe80::1".into()),
+        dns: vec!["192.0.2.1".into(), "1.1.1.1".into()],
+        ..IpDetail::default()
+    });
+    if let Some(wifi) = &mut base.wifi {
+        wifi.alt_bsses = vec![
+            AltBss {
+                bssid: "aa:11:bb:22:cc:34".into(),
+                frequency_mhz: 5180,
+                signal_dbm: -58,
+                security: vec!["wpa2".into()],
+            },
+            AltBss {
+                bssid: "aa:11:bb:22:cc:35".into(),
+                frequency_mhz: 2437,
+                signal_dbm: -73,
+                security: vec!["wpa2".into()],
+            },
+        ];
+    }
+    base
 }
 
 #[tokio::test]
@@ -198,6 +239,64 @@ async fn snapshot_wifi_show_human() {
     Supplicant: wpa_supplicant
     Roaming:    supplicant
     Powered:    yes
+
+    [ip]
+      unavailable: networkd not on bus
+
+    [alt aps]
+      none
+    ");
+}
+
+#[tokio::test]
+async fn snapshot_wifi_show_human_with_ip_and_alts() {
+    let stub = Stub {
+        interface_detail: Some(wifi_detail_fixture_with_ip_and_alts()),
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    commands::iface::show(
+        &stub,
+        "wlan0",
+        Some("wifi"),
+        OutputFormat::Human,
+        &RenderContext::default(),
+        &mut buf,
+    )
+    .await
+    .unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    assert_snapshot!(s, @r"
+    Interface: wlan0
+    Kind:      wifi
+    State:     connected
+    MAC:       aa:bb:cc:dd:ee:03
+    Carrier:   yes
+    Ifindex:   5
+    Profile:   /fi/nexus1/profile/wifi/X
+
+    [wifi]
+    State:      connected
+    SSID:       corp-net
+    BSSID:      aa:11:bb:22:cc:33
+    Frequency:  5180 MHz
+    Signal:     -51 dBm
+    Security:   wpa2-personal
+    Supplicant: wpa_supplicant
+    Roaming:    supplicant
+    Powered:    yes
+
+    [ip]
+    IPv4:         192.0.2.42
+    IPv4 prefix:  24
+    IPv4 gateway: 192.0.2.1
+    IPv6:         2001:db8::1
+    IPv6 gateway: fe80::1
+    DNS:          192.0.2.1, 1.1.1.1
+
+    [alt aps]
+      aa:11:bb:22:cc:34  Ch 36  5180 MHz  -58 dBm  wpa2
+      aa:11:bb:22:cc:35  Ch 6  2437 MHz  -73 dBm  wpa2
     ");
 }
 
@@ -252,6 +351,13 @@ async fn snapshot_eth_show_human_authenticated() {
             }),
             bluetooth: None,
             gnss: None,
+            ip: Some(IpDetail {
+                ipv4_address: Some("198.51.100.7".into()),
+                ipv4_prefix_length: Some(24),
+                ipv4_gateway: Some("198.51.100.1".into()),
+                dns: vec!["198.51.100.1".into()],
+                ..IpDetail::default()
+            }),
         }),
         ..Default::default()
     };
@@ -281,6 +387,14 @@ async fn snapshot_eth_show_human_authenticated() {
     Auth backend: wpa_supplicant
     Auth failure: —
     EAP method:   PEAP
+
+    [ip]
+    IPv4:         198.51.100.7
+    IPv4 prefix:  24
+    IPv4 gateway: 198.51.100.1
+    IPv6:         —
+    IPv6 gateway: —
+    DNS:          198.51.100.1
     ");
 }
 
@@ -461,6 +575,7 @@ async fn snapshot_gnss_show_human_with_fix() {
                     satellites_used: 9,
                 }),
             }),
+            ip: None,
         }),
         ..Default::default()
     };
