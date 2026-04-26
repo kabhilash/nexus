@@ -1604,9 +1604,12 @@ async fn bluetooth_set_powered_allowed_calls_backend() {
     let calls = ops.calls();
     let hit = calls.iter().any(|c| matches!(
         c,
-        RecordedCall::BtSetPowered { ifname, on: true } if ifname == "hci0"
+        RecordedCall::BtSetPowered { ifname, on: true } if ifname == "/org/bluez/hci0"
     ));
-    assert!(hit, "expected BtSetPowered{{hci0,true}}, got {calls:?}");
+    assert!(
+        hit,
+        "expected BtSetPowered{{/org/bluez/hci0,true}}, got {calls:?}"
+    );
     handle.stop().await;
 }
 

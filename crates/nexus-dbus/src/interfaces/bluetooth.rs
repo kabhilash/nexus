@@ -38,6 +38,28 @@ impl BluetoothIface {
             _ => default,
         }
     }
+
+    /// Resolve this adapter's BlueZ object path (`/org/bluez/hciN`)
+    /// from the registry cache. Internal nexus-bluetooth callers pass
+    /// the path everywhere (`adapter_proxy` parses it as an
+    /// `ObjectPath`); the kernel ifname `hci0` is NOT a valid object
+    /// path on its own. When the cache hasn't seen this adapter yet
+    /// (rare, but possible during cold-boot races), fall back to the
+    /// canonical BlueZ scheme so the call still has a chance of
+    /// landing.
+    async fn bluez_path(&self) -> String {
+        let guard = self.services.state.read().await;
+        guard
+            .interfaces
+            .get(&self.ifname)
+            .and_then(|e| match &e.info.kind {
+                nexus_core::InterfaceKind::Bluetooth { bluez_path, .. } => {
+                    Some(bluez_path.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("/org/bluez/{}", self.ifname))
+    }
 }
 
 #[zbus::interface(name = "fi.nexus.Bluetooth")]
@@ -85,9 +107,10 @@ impl BluetoothIface {
                 "Powered set denied".into(),
             )));
         }
+        let path = self.bluez_path().await;
         self.services
             .ops
-            .bt_set_powered(&self.ifname, on)
+            .bt_set_powered(&path, on)
             .await
             .map_err(|e| zbus::Error::from(zbus::fdo::Error::from(e)))
     }

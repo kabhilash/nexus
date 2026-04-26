@@ -146,12 +146,19 @@ mod tests {
                 responder,
             }) = cmd_rx.recv().await
             {
-                assert_eq!(adapter, "hci0");
+                // The adapter argument is a BlueZ object path —
+                // nexus-bluetooth's adapter_proxy parses it as an
+                // ObjectPath. Bare ifnames would fail validation.
+                assert_eq!(adapter, "/org/bluez/hci0");
                 assert!(on);
                 let _ = responder.send(Ok(()));
             }
         });
-        assert!(ops.bt_set_powered("hci0", true).await.is_ok());
+        assert!(
+            ops.bt_set_powered("/org/bluez/hci0", true)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -160,10 +167,13 @@ mod tests {
         let ops = BtBackendOps::new(cmd_tx, NoopOps::arc());
         tokio::spawn(async move {
             if let Some(BtCommand::SetAdapterPowered { responder, .. }) = cmd_rx.recv().await {
-                let _ = responder.send(Err(BtError::UnknownAdapter("hci9".into())));
+                let _ = responder.send(Err(BtError::UnknownAdapter("/org/bluez/hci9".into())));
             }
         });
-        let err = ops.bt_set_powered("hci9", true).await.unwrap_err();
+        let err = ops
+            .bt_set_powered("/org/bluez/hci9", true)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbusError::NotFound(_)), "{err:?}");
     }
 
@@ -172,7 +182,10 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<BtCommand>(4);
         drop(cmd_rx);
         let ops = BtBackendOps::new(cmd_tx, NoopOps::arc());
-        let err = ops.bt_set_powered("hci0", false).await.unwrap_err();
+        let err = ops
+            .bt_set_powered("/org/bluez/hci0", false)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbusError::FeatureDisabled(_)), "{err:?}");
     }
 

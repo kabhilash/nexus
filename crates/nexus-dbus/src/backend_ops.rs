@@ -119,10 +119,12 @@ pub trait BackendOps: Send + Sync {
     /// `fi.nexus.Bluetooth.Powered` setter — flip the BlueZ adapter's
     /// `Powered` property via the live BlueZ client. The D-Bus layer
     /// declares `Powered` writable; this routes the call through to
-    /// `nexus_bluetooth::BtCommand::SetAdapterPowered`. `ifname` is
-    /// the adapter's BlueZ name (`hci0`, etc.) — the daemon's adapter
-    /// resolves it to the BlueZ object path.
-    async fn bt_set_powered(&self, _ifname: &str, _on: bool) -> Result<()> {
+    /// `nexus_bluetooth::BtCommand::SetAdapterPowered`. `bluez_path`
+    /// is the adapter's BlueZ object path (`/org/bluez/hciN`) — the
+    /// kernel ifname `hci0` is NOT a valid object path on its own,
+    /// so the D-Bus interface looks up the path from the registry
+    /// before calling this.
+    async fn bt_set_powered(&self, _bluez_path: &str, _on: bool) -> Result<()> {
         Err(DbusError::Unsupported("bt_set_powered".into()))
     }
 
@@ -263,9 +265,9 @@ impl BackendOps for RecordingOps {
         }
         Ok(())
     }
-    async fn bt_set_powered(&self, ifname: &str, on: bool) -> Result<()> {
+    async fn bt_set_powered(&self, bluez_path: &str, on: bool) -> Result<()> {
         self.record(RecordedCall::BtSetPowered {
-            ifname: ifname.to_owned(),
+            ifname: bluez_path.to_owned(),
             on,
         });
         if let Some(e) = self.consume_error() {
@@ -338,12 +340,12 @@ mod tests {
     #[tokio::test]
     async fn recording_captures_bt_set_powered() {
         let ops = RecordingOps::new();
-        ops.bt_set_powered("hci0", true).await.unwrap();
+        ops.bt_set_powered("/org/bluez/hci0", true).await.unwrap();
         let calls = ops.calls();
         assert_eq!(calls.len(), 1);
         match &calls[0] {
             RecordedCall::BtSetPowered { ifname, on } => {
-                assert_eq!(ifname, "hci0");
+                assert_eq!(ifname, "/org/bluez/hci0");
                 assert!(*on);
             }
             other => panic!("unexpected: {other:?}"),
