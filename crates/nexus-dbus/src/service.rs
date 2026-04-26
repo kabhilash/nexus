@@ -453,11 +453,25 @@ async fn handle_event(
             state: wifi_state,
         } => {
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
-                if let Some(e) = state.write().await.interfaces.get_mut(&ifname) {
-                    if let InterfaceKindData::Wifi(c) = &mut e.kind_data {
-                        c.apply_state(&wifi_state);
+                let managed_profile = {
+                    let mut guard = state.write().await;
+                    let mp = guard
+                        .interfaces
+                        .get(&ifname)
+                        .and_then(|e| e.managed_profile.clone());
+                    if let Some(e) = guard.interfaces.get_mut(&ifname) {
+                        if let InterfaceKindData::Wifi(c) = &mut e.kind_data {
+                            c.apply_state(&wifi_state);
+                        }
                     }
-                }
+                    mp
+                };
+                let (label, details) = wifi_state_label_and_details(
+                    &wifi_state,
+                    managed_profile.as_deref(),
+                );
+                emit_wifi_state_changed(connection, &ifname, &label, &details).await;
+                resolve_connect_job(connection, services, &ifname, &wifi_state).await;
             }
         }
         NexusEvent::WifiSignalPoll {
@@ -1127,6 +1141,204 @@ async fn emit_eth_state_changed(
     }
 }
 
+
+/// Build the `(state_label, details)` payload for a Wi-Fi state
+/// transition (DD-006 §9). The same struct is emitted on
+/// `fi.nexus.Wifi.StateChanged` and `fi.nexus.Interface.StateChanged`
+/// so client UIs can subscribe to either channel.
+fn wifi_state_label_and_details(
+    s: &nexus_core::WifiState,
+    managed_profile: Option<&str>,
+) -> (String, std::collections::HashMap<String, zbus::zvariant::OwnedValue>) {
+    use nexus_core::WifiState;
+    use std::collections::HashMap;
+    use zbus::zvariant::{OwnedValue, Value};
+
+    let label = match s {
+        WifiState::Idle => "idle",
+        WifiState::Scanning => "scanning",
+        WifiState::Connecting { .. } => "connecting",
+        WifiState::Authenticating { .. } => "authenticating",
+        WifiState::Handshaking { .. } => "handshaking",
+        WifiState::Connected { .. } => "connected",
+        WifiState::Roaming { .. } => "roaming",
+        WifiState::Disconnected { .. } => "disconnected",
+        WifiState::Gone => "gone",
+    }
+    .to_owned();
+
+    let mut details: HashMap<String, OwnedValue> = HashMap::new();
+
+    let insert_bssid = |details: &mut HashMap<String, OwnedValue>, bssid: &nexus_core::MacAddr| {
+        if let Ok(v) = OwnedValue::try_from(Value::new(bssid.0.to_vec())) {
+            details.insert("bssid".into(), v);
+        }
+    };
+    let insert_ssid = |details: &mut HashMap<String, OwnedValue>, ssid: &nexus_core::Ssid| {
+        if let Ok(v) = OwnedValue::try_from(Value::new(ssid.as_bytes().to_vec())) {
+            details.insert("ssid_bytes".into(), v);
+        }
+    };
+
+    match s {
+        WifiState::Connecting { bssid, ssid }
+        | WifiState::Authenticating { bssid, ssid }
+        | WifiState::Handshaking { bssid, ssid } => {
+            insert_bssid(&mut details, bssid);
+            insert_ssid(&mut details, ssid);
+        }
+        WifiState::Connected {
+            bssid,
+            ssid,
+            frequency,
+            signal_dbm,
+            security,
+        } => {
+            insert_bssid(&mut details, bssid);
+            insert_ssid(&mut details, ssid);
+            if let Ok(v) = OwnedValue::try_from(Value::new(*frequency)) {
+                details.insert("frequency".into(), v);
+            }
+            if let Ok(v) = OwnedValue::try_from(Value::new(*signal_dbm)) {
+                details.insert("signal_dbm".into(), v);
+            }
+            if let Ok(v) = OwnedValue::try_from(Value::new(crate::state::security_label(*security)))
+            {
+                details.insert("security".into(), v);
+            }
+        }
+        WifiState::Roaming { from: _, to, ssid } => {
+            insert_bssid(&mut details, to);
+            insert_ssid(&mut details, ssid);
+        }
+        WifiState::Disconnected { reason } => {
+            if let Ok(v) = OwnedValue::try_from(Value::new(disconnect_reason_wire(reason).to_owned()))
+            {
+                details.insert("reason".into(), v);
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(profile) = managed_profile {
+        if profile != "/" && !profile.is_empty() {
+            if let Ok(p) = ObjectPath::try_from(profile.to_owned()) {
+                if let Ok(v) = OwnedValue::try_from(Value::ObjectPath(p)) {
+                    details.insert("profile".into(), v);
+                }
+            }
+        }
+    }
+
+    (label, details)
+}
+
+/// Map a [`nexus_core::DisconnectReason`] to the wire string
+/// documented in DD-006 §9 (also used by `Wifi.ConnectComplete`).
+fn disconnect_reason_wire(r: &nexus_core::DisconnectReason) -> &'static str {
+    use nexus_core::DisconnectReason::*;
+    match r {
+        CredentialsInvalid | EapFailure | AuthExpired => "credentials_invalid",
+        HandshakeTimeout => "handshake_timeout",
+        RfKilled => "rf_killed",
+        SupplicantUnavailable => "supplicant_unavailable",
+        LocalRequest => "cancelled",
+        ApInitiated | Inactivity | ProtocolError | PostSleepRecovery | DriverWedge
+        | Unspecified | Other(_) => "other",
+    }
+}
+
+/// Emit `fi.nexus.Wifi.StateChanged(new_state: s, details: a{sv})`
+/// AND `fi.nexus.Interface.StateChanged(new_state: s, details: a{sv})`
+/// on the interface's object path. Both signals carry identical
+/// payloads — clients pick one and ignore the other (DD-006 §9).
+async fn emit_wifi_state_changed(
+    connection: &zbus::Connection,
+    ifname: &str,
+    state_label: &str,
+    details: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+) {
+    let path = interface_path(ifname);
+    let Ok(obj_path) = ObjectPath::try_from(path.clone()) else {
+        return;
+    };
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            &obj_path,
+            "fi.nexus.Wifi",
+            "StateChanged",
+            &(state_label, details),
+        )
+        .await
+    {
+        tracing::debug!(
+            error = ?e,
+            ifname,
+            state = state_label,
+            "fi.nexus.Wifi.StateChanged emit failed",
+        );
+    }
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            &obj_path,
+            "fi.nexus.Interface",
+            "StateChanged",
+            &(state_label, details),
+        )
+        .await
+    {
+        tracing::debug!(
+            error = ?e,
+            ifname,
+            state = state_label,
+            "fi.nexus.Interface.StateChanged (wifi) emit failed",
+        );
+    }
+}
+
+/// If a `Wifi.Connect` job is pending for `ifname`, resolve it
+/// against this state transition and emit `Wifi.ConnectComplete`.
+/// `Connected` resolves with success; `Disconnected{reason}` with
+/// the mapped `reason`. Other states leave the job pending.
+async fn resolve_connect_job(
+    connection: &zbus::Connection,
+    services: &Arc<Services>,
+    ifname: &str,
+    s: &nexus_core::WifiState,
+) {
+    use nexus_core::WifiState;
+    let (success, reason): (bool, &str) = match s {
+        WifiState::Connected { .. } => (true, ""),
+        WifiState::Disconnected { reason } => (false, disconnect_reason_wire(reason)),
+        _ => return,
+    };
+    let Some(job_id) = services.wifi_jobs.take_connect(ifname) else {
+        return;
+    };
+    let path = interface_path(ifname);
+    let Ok(obj_path) = ObjectPath::try_from(path.clone()) else {
+        return;
+    };
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            &obj_path,
+            "fi.nexus.Wifi",
+            "ConnectComplete",
+            &(job_id.as_str(), success, reason),
+        )
+        .await
+    {
+        tracing::debug!(
+            error = ?e,
+            ifname,
+            job_id = job_id,
+            "fi.nexus.Wifi.ConnectComplete emit failed",
+        );
+    }
+}
 
 async fn apply_gnss_event(state: &Arc<RwLock<State>>, event: NexusEvent) {
     match event {

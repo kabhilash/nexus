@@ -1,6 +1,6 @@
 {
   "format": "nexus-integration-knowledge-graph",
-  "format_version": "0.1.0",
+  "format_version": "0.2.0",
   "audience": [
     "App integrators consuming the fi.nexus1 D-Bus API",
     "UI builders implementing operator-facing flows (pair, connect, scan picker, fix display, recovery)"
@@ -346,17 +346,25 @@
     { "id": "method:fi.nexus.Wifi.Connect", "type": "Method", "label": "Wifi.Connect",
       "attrs": {
         "in": "profile:o",
+        "out": "job_id:s",
+        "completion_signal": "sig:fi.nexus.Wifi.ConnectComplete",
+        "progress_signal": "sig:fi.nexus.Wifi.StateChanged",
         "constraint": "profile path must be under /fi/nexus1/profile/wifi/",
-        "stickiness": "Explicit Connect on a non-auto-connect profile makes it sticky until explicit Disconnect or daemon restart, even across transient Disconnected states."
+        "stickiness": "Explicit Connect on a non-auto-connect profile makes it sticky until explicit Disconnect or daemon restart, even across transient Disconnected states.",
+        "completion_semantics": "Returns the job_id immediately after auth/rate/feature gates pass. ConnectComplete fires once on the first terminal edge for the attempt: success on transition to Connected, failure (with mapped reason) on transition to Disconnected{reason}. The backend's sticky retry loop continues independently — each operator-initiated Connect resolves to exactly one ConnectComplete. An explicit Disconnect before either edge resolves the job with reason='cancelled'."
       } },
     { "id": "method:fi.nexus.Wifi.Disconnect", "type": "Method", "label": "Wifi.Disconnect",
       "attrs": { "in": "params:a{sv}",
-                 "purpose": "Tear down the current association on this Wi-Fi interface. Transitions the interface to State=disconnected and emits Interface.StateChanged.",
+                 "out": "job_id:s",
+                 "completion_signal": "sig:fi.nexus.Wifi.DisconnectComplete",
+                 "progress_signal": "sig:fi.nexus.Wifi.StateChanged",
+                 "purpose": "Tear down the current association on this Wi-Fi interface. Transitions the interface to State=disconnected and emits Interface.StateChanged / Wifi.StateChanged. Returns a job_id for the corresponding DisconnectComplete signal.",
                  "params_keys": {
                    "pause_auto_connect": "b — when true, also block the active profile from the daemon's auto-connect picker until daemon restart, an explicit Connect(profile), or a profile edit. Runtime-only; does NOT modify the on-disk Profile.Wifi.AutoConnect field. Default false."
                  },
                  "durability": "By default, transient — does not remove the stored profile and does not block auto-reconnect; the backend may auto-reconnect on the next scan tick if the profile has auto_connect=true and a matching BSS is in range. With params.pause_auto_connect=true, the disconnect also installs a session-only pause that survives across SetPowered toggles and adapter off/on cycles, but is cleared by daemon restart, by an explicit Connect(profile) on the same profile, by Profile.Update, or by Profile.Delete / Manager.RemoveProfile.",
                  "to_opt_out_persistently": "Either Profile.Update with auto_connect=false (persistent, on-disk), or Manager.RemoveProfile / Profile.Delete (forget the profile).",
+                 "completion_semantics": "DisconnectComplete fires once when the supplicant teardown returns: success (reason='') or failure (reason='other') if the backend errored mid-teardown. Issuing Disconnect while a Connect job is in flight cancels that Connect with reason='cancelled' before the disconnect itself proceeds.",
                  "see_also": ["method:fi.nexus.Manager.RemoveProfile", "flow:disconnect-and-forget-wifi", "flow:disconnect-and-pause-wifi"] } },
     { "id": "method:fi.nexus.Wifi.Roam", "type": "Method", "label": "Wifi.Roam",
       "attrs": { "in": "bssid:ay", "valid_when": "RoamingMode == nexus" } },
@@ -379,6 +387,21 @@
     { "id": "sig:fi.nexus.Wifi.NetworkRequest", "type": "Signal", "label": "Wifi.NetworkRequest",
       "attrs": { "args": "network:o, field:s, text:s",
                  "purpose": "Supplicant is requesting an out-of-band credential. Respond via Wifi.ProvideCredential." } },
+    { "id": "sig:fi.nexus.Wifi.StateChanged", "type": "Signal", "label": "Wifi.StateChanged",
+      "attrs": { "args": "new_state:s, details:a{sv}",
+                 "purpose": "Typed mirror of fi.nexus.Interface.StateChanged emitted on the same path with the same args and details schema. Provided so clients whose typed proxy stack reliably resolves per-technology signals but not the common fi.nexus.Interface signals can subscribe on the technology-specific channel.",
+                 "details_schema": "Same as Interface.StateChanged: reason (s), bssid (ay), ssid_bytes (ay), frequency (u), signal_dbm (i), security (s), profile (o) — keys present per the DD-006 §9 details table.",
+                 "see_also": ["sig:fi.nexus.Interface.StateChanged"] } },
+    { "id": "sig:fi.nexus.Wifi.ConnectComplete", "type": "Signal", "label": "Wifi.ConnectComplete",
+      "attrs": { "args": "job_id:s, success:b, reason:s",
+                 "purpose": "Terminal edge for an operator-initiated Wifi.Connect. job_id matches the value returned by Connect; success is true iff the interface reached Connected for the attempt. reason is '' on success and one of credentials_invalid | server_unreachable | handshake_timeout | rf_killed | supplicant_unavailable | cancelled | other on failure.",
+                 "correlation": "Match by job_id with the value returned by method:fi.nexus.Wifi.Connect.",
+                 "see_also": ["method:fi.nexus.Wifi.Connect"] } },
+    { "id": "sig:fi.nexus.Wifi.DisconnectComplete", "type": "Signal", "label": "Wifi.DisconnectComplete",
+      "attrs": { "args": "job_id:s, success:b, reason:s",
+                 "purpose": "Terminal edge for an operator-initiated Wifi.Disconnect. reason is '' on success (the operator asked) and 'other' when the backend failed mid-teardown.",
+                 "correlation": "Match by job_id with the value returned by method:fi.nexus.Wifi.Disconnect.",
+                 "see_also": ["method:fi.nexus.Wifi.Disconnect"] } },
 
     { "id": "prop:fi.nexus.ScanResult.Bssid", "type": "Property", "label": "ScanResult.Bssid",
       "attrs": { "sig": "ay", "access": "read", "length_bytes": 6 } },
@@ -819,6 +842,9 @@
     { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.RoamStarted" },
     { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.RoamCompleted" },
     { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.NetworkRequest" },
+    { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.StateChanged" },
+    { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.ConnectComplete" },
+    { "from": "iface:fi.nexus.Wifi", "rel": "defines_signal", "to": "sig:fi.nexus.Wifi.DisconnectComplete" },
 
     { "from": "iface:fi.nexus.ScanResult", "rel": "defines_property", "to": "prop:fi.nexus.ScanResult.Bssid" },
     { "from": "iface:fi.nexus.ScanResult", "rel": "defines_property", "to": "prop:fi.nexus.ScanResult.Ssid" },
@@ -962,10 +988,15 @@
     { "from": "method:fi.nexus.Wifi.Connect", "rel": "may_return_error", "to": "err:fi.nexus.Error.InvalidArgument" },
     { "from": "method:fi.nexus.Wifi.Connect", "rel": "may_return_error", "to": "err:fi.nexus.Error.AuthFailed" },
     { "from": "method:fi.nexus.Wifi.Connect", "rel": "may_emit_signal", "to": "sig:fi.nexus.Interface.StateChanged" },
+    { "from": "method:fi.nexus.Wifi.Connect", "rel": "may_emit_signal", "to": "sig:fi.nexus.Wifi.StateChanged" },
+    { "from": "method:fi.nexus.Wifi.Connect", "rel": "may_emit_signal", "to": "sig:fi.nexus.Wifi.ConnectComplete" },
     { "from": "method:fi.nexus.Wifi.Connect", "rel": "rate_limit_class", "to": "rate:connects" },
     { "from": "method:fi.nexus.Wifi.Disconnect", "rel": "requires_polkit", "to": "polkit:fi.nexus.connect" },
     { "from": "method:fi.nexus.Wifi.Disconnect", "rel": "may_return_error", "to": "err:fi.nexus.Error.AuthFailed" },
     { "from": "method:fi.nexus.Wifi.Disconnect", "rel": "may_emit_signal", "to": "sig:fi.nexus.Interface.StateChanged" },
+    { "from": "method:fi.nexus.Wifi.Disconnect", "rel": "may_emit_signal", "to": "sig:fi.nexus.Wifi.StateChanged" },
+    { "from": "method:fi.nexus.Wifi.Disconnect", "rel": "may_emit_signal", "to": "sig:fi.nexus.Wifi.DisconnectComplete" },
+    { "from": "method:fi.nexus.Wifi.Disconnect", "rel": "may_emit_signal", "to": "sig:fi.nexus.Wifi.ConnectComplete" },
     { "from": "method:fi.nexus.Wifi.Disconnect", "rel": "rate_limit_class", "to": "rate:connects" },
     { "from": "method:fi.nexus.Wifi.Roam", "rel": "requires_polkit", "to": "polkit:fi.nexus.connect" },
     { "from": "method:fi.nexus.Wifi.Roam", "rel": "may_return_error", "to": "err:fi.nexus.Error.InvalidState" },
@@ -1145,17 +1176,22 @@
         { "do": "Manager.GetInterface(ifname)",
           "node": "method:fi.nexus.Manager.GetInterface",
           "errors": ["err:fi.nexus.Error.NotFound"] },
-        { "do": "Wifi.Connect(profile_path) on the interface object",
+        { "do": "Wifi.Connect(profile_path) on the interface object — capture the returned job_id",
           "node": "method:fi.nexus.Wifi.Connect",
           "polkit": "polkit:fi.nexus.connect",
+          "yields": "job_id:s — correlates the subsequent Wifi.ConnectComplete",
           "errors": ["err:fi.nexus.Error.NotFound", "err:fi.nexus.Error.InvalidArgument", "err:fi.nexus.Error.AuthFailed"] },
-        { "do": "Watch fi.nexus.Interface.StateChanged on the interface path",
-          "node": "sig:fi.nexus.Interface.StateChanged",
-          "expected_states": ["connecting", "authenticating", "handshaking", "connected"],
-          "failure_states": ["disconnected with details.reason=credentials_invalid|server_unreachable|handshake_timeout"] }
+        { "do": "Wait for Wifi.ConnectComplete(job_id, success, reason) — this is the canonical 'did we get there' edge; replace any 30s connect-watchdog with this signal",
+          "node": "sig:fi.nexus.Wifi.ConnectComplete",
+          "expected_success": "success=true, reason=''",
+          "expected_failures": "success=false, reason in {credentials_invalid, server_unreachable, handshake_timeout, rf_killed, supplicant_unavailable, cancelled, other}" },
+        { "do": "Optionally, for progress-UI animation, watch Wifi.StateChanged or fi.nexus.Interface.StateChanged on the interface path — both carry the same args and details",
+          "node": "sig:fi.nexus.Wifi.StateChanged",
+          "alt_node": "sig:fi.nexus.Interface.StateChanged",
+          "expected_states": ["connecting", "authenticating", "handshaking", "connected"] }
       ],
       "branches": [
-        { "when": "details.reason == credentials_invalid",
+        { "when": "ConnectComplete reason == credentials_invalid",
           "go_to_flow": "flow:recover-credentials-invalid" },
         { "when": "Wifi.NetworkRequest fires during authenticating",
           "go_to_flow": "flow:supplicant-credential-prompt" }
@@ -1178,8 +1214,11 @@
           "settings_required": ["ssid:ay", "security:a{sv} ({type, passphrase|psk|password|...})"],
           "settings_optional": ["priority:i", "auto_connect:b", "hidden:b", "fast_transition:b", "bssid_preferred:ay", "scan_frequencies:au"],
           "errors": ["err:fi.nexus.Error.InvalidArgument", "err:fi.nexus.Error.AlreadyExists", "err:fi.nexus.Error.AuthFailed"] },
-        { "do": "Wifi.Connect(profile_path) — explicit Connect bypasses auto_connect and is sticky",
-          "node": "method:fi.nexus.Wifi.Connect" }
+        { "do": "Wifi.Connect(profile_path) — explicit Connect bypasses auto_connect and is sticky. Capture the returned job_id.",
+          "node": "method:fi.nexus.Wifi.Connect",
+          "yields": "job_id:s" },
+        { "do": "Wait for Wifi.ConnectComplete(job_id, success, reason) — canonical terminal edge; do not roll a separate watchdog timer",
+          "node": "sig:fi.nexus.Wifi.ConnectComplete" }
       ],
       "ui_notes": [
         "On AlreadyExists, fetch the existing profile via FindWifiProfile and offer Profile.Update instead.",
@@ -1205,7 +1244,9 @@
       ],
       "ui_notes": [
         "ResourceBusy on Scan means the driver is busy — wait >=2s and retry.",
-        "RateLimited carries retry_after_ms; back off accordingly. Don't eat the user's screen with retries."
+        "RateLimited carries retry_after_ms; back off accordingly. Don't eat the user's screen with retries.",
+        "Default presentation: group scan_result objects client-side by (ScanResult.Ssid, ScanResult.SecurityOffered) and show one row per group, picking max(ScanResult.SignalDbm) for the displayed strength. This mirrors the ConnMan Service model (one entry per SSID+security, BSSID hidden) which most operators expect from a Wi-Fi picker. Nexus deliberately exposes the un-aggregated per-BSSID surface on iface:fi.nexus.ScanResult — keep that detail accessible behind a 'show APs' affordance for diagnostics, BSSID pinning (Profile.Wifi.BssidPreferred), blacklisting (Profile.Wifi.BssidBlacklist), and roaming UIs.",
+        "For the per-tick state-machine view (animating connecting → authenticating → handshaking → connected as the operator picks a row), prefer sig:fi.nexus.Wifi.StateChanged — it is the typed-signal alternative to subscribing PropertiesChanged on prop:fi.nexus.Wifi.State, which some typed-proxy stacks (e.g., Qt 6 QtDBus) coalesce or fail to deliver reliably for high-frequency property updates."
       ]
     },
 
@@ -1275,13 +1316,14 @@
       "trigger": "Operator chose 'Disconnect (don't auto-rejoin)' or equivalent — a transient opt-out that should NOT touch the on-disk profile.",
       "preconditions": ["A wifi-Kind interface is registered. An active connection on that interface (or no connection — the pause is then a no-op since the active-profile lookup misses)."],
       "steps": [
-        { "do": "Call Wifi.Disconnect(params={'pause_auto_connect': true}) on the interface object. Tears down the current association and adds the active profile to the daemon's runtime paused-set.",
+        { "do": "Call Wifi.Disconnect(params={'pause_auto_connect': true}) on the interface object. Tears down the current association and adds the active profile to the daemon's runtime paused-set. Capture the returned job_id.",
           "node": "method:fi.nexus.Wifi.Disconnect",
-          "polkit": "polkit:fi.nexus.connect" },
-        { "do": "Watch Interface.StateChanged on the interface path for state=disconnected to confirm tear-down.",
-          "node": "sig:fi.nexus.Interface.StateChanged" }
+          "polkit": "polkit:fi.nexus.connect",
+          "yields": "job_id:s" },
+        { "do": "Wait for Wifi.DisconnectComplete(job_id, success, reason) — canonical terminal edge. reason='' on success; 'other' on backend failure mid-teardown.",
+          "node": "sig:fi.nexus.Wifi.DisconnectComplete" }
       ],
-      "note": "The pause is runtime-only: it survives Wifi.SetPowered toggles and adapter off/on cycles but is cleared on daemon restart, on an explicit Connect to the same profile, on Profile.Update, and on RemoveProfile/Profile.Delete. Inspectable side-effect: the profile's Profile.Wifi.AutoConnect property still reads true on disk, but auto-select skips the profile until one of the clearing events fires. Use this when the operator wants 'don't connect right now' without committing to a persistent change. For persistent opt-out, edit Profile.Wifi.AutoConnect to false; for full removal, use flow:disconnect-and-forget-wifi."
+      "note": "The pause is runtime-only: it survives Wifi.SetPowered toggles and adapter off/on cycles but is cleared on daemon restart, on an explicit Connect to the same profile, on Profile.Update, and on RemoveProfile/Profile.Delete. Inspectable side-effect: the profile's Profile.Wifi.AutoConnect property still reads true on disk, but auto-select skips the profile until one of the clearing events fires. Use this when the operator wants 'don't connect right now' without committing to a persistent change. For persistent opt-out, edit Profile.Wifi.AutoConnect to false; for full removal, use flow:disconnect-and-forget-wifi. Issuing Disconnect while a Wifi.Connect is in flight also fires Wifi.ConnectComplete with reason='cancelled' for that connect's job_id."
     },
 
     {
@@ -1291,12 +1333,13 @@
       "trigger": "Operator chose 'Forget this network' (or equivalent).",
       "preconditions": ["A wifi-Kind interface is registered. A stored Wi-Fi profile exists for the network the operator wants to forget."],
       "steps": [
-        { "do": "Call Wifi.Disconnect on the interface object to tear down the current association. Skip this step if the interface is already idle/disconnected; calling it on an idle interface is harmless but no-op.",
+        { "do": "Call Wifi.Disconnect on the interface object to tear down the current association. Skip this step if the interface is already idle/disconnected; calling it on an idle interface is harmless but no-op. Capture the returned job_id.",
           "node": "method:fi.nexus.Wifi.Disconnect",
           "polkit": "polkit:fi.nexus.connect",
+          "yields": "job_id:s",
           "note": "Transient by itself — the backend may auto-reconnect on the next scan tick if the profile remains and auto_connect=true." },
-        { "do": "Watch Interface.StateChanged on the interface path for state=disconnected to confirm tear-down.",
-          "node": "sig:fi.nexus.Interface.StateChanged" },
+        { "do": "Wait for Wifi.DisconnectComplete(job_id, success, reason) — canonical terminal edge for the disconnect call.",
+          "node": "sig:fi.nexus.Wifi.DisconnectComplete" },
         { "do": "Resolve the stored profile's object path (from Manager.WifiProfiles, or the path captured when the profile was added).",
           "node": "prop:fi.nexus.Manager.WifiProfiles" },
         { "do": "Call Manager.RemoveProfile(path) (or equivalently Profile.Delete on the profile object) to forget the profile durably. Removes it from the in-memory cache and the on-disk profile store.",
@@ -1603,7 +1646,14 @@
         "Always read details.reason on disconnected. Permanent reasons (CredentialsInvalid) need a recovery affordance NOW; transient reasons need only a brief 'reconnecting…' note while cool-down elapses.",
         "Wifi.NetworkRequest can fire mid-authenticating with no state change — subscribe BEFORE calling Connect, or you'll miss the prompt. Render a modal credential dialog and reply via Wifi.ProvideCredential.",
         "Treat SignalDbm < -75 dBm as 'weak' visualization; it updates at <=1 Hz so animations should not assume sub-second cadence.",
-        "Wifi.Powered=false produces RfKilled disconnects; surface a top-level 'Wi-Fi off' affordance distinct from per-network state."
+        "Wifi.Powered=false produces RfKilled disconnects; surface a top-level 'Wi-Fi off' affordance distinct from per-network state.",
+        "Picker aggregation: group scan_result objects by (Ssid, SecurityOffered), pick max(SignalDbm) per group, render one row per group. Mirrors the ConnMan Service model that operators expect. Keep per-BSSID detail (iface:fi.nexus.ScanResult) accessible behind a 'show APs' affordance for diagnostics, BssidPreferred pinning, and BssidBlacklist editing.",
+        "Signal bucketing for bars: SignalDbm >= -55 → 4 bars (excellent); -55 to -65 → 3 bars (good); -65 to -75 → 2 bars (fair); < -75 → 1 bar (weak). Apply the same buckets in the picker (per-row max(SignalDbm)) and on the connected pill (Wifi.SignalDbm).",
+        "Security badge from ScanResult.SecurityOffered: empty or ['open'] → no lock; ['owe'] → padlock + 'Enhanced Open'; ['wpa2-psk'|'wpa3-psk'|both] → padlock; ['wpa2-eap'|'wpa3-eap'|both] → padlock + 'Enterprise'. When both wpa2 and wpa3 are advertised, label by the strongest mode (wpa3) since that's what the supplicant will negotiate.",
+        "ScanResult.AgeMs > 30000 means the BSS hasn't been heard on the most recent scan tick — fade or move to a 'last seen' bucket rather than dropping it; the next scan can refresh it. AgeMs is hot-coalesced (~1Hz), so don't bind it to a high-rate animation.",
+        "Supplicant collapse (also see supplicant_collapse_warning): branch the connect-progress UI on Wifi.Supplicant. wpa_supplicant gives you connecting → authenticating → handshaking → connected (3 sub-stages worth showing on Enterprise). iwd reports the entire pre-connected window as connecting — show a single indeterminate 'Connecting…' indicator and don't promise sub-stages.",
+        "Roaming should be near-silent in the steady-state UI: don't dismiss the connected screen on Wifi.RoamStarted/State=roaming; the IP layer typically survives a sub-second reassociation. Surface roam events only in a diagnostics view, or as a brief inline 'Reassociating…' chip that doesn't displace content.",
+        "Hidden networks: visible scan_result objects only carry the broadcast set. To connect to a hidden SSID, the operator types the SSID into 'Add network' and the profile is created with hidden=true; do not require a scan_result match for that path."
       ]
     },
 
@@ -1853,6 +1903,143 @@
         "satellites_used is the most legible progress indicator while in acquiring. Most consumer modules need ~4 satellites for a Fix2D, ~5+ for Fix3D.",
         "track_deg is undefined at zero speed; many receivers report 0.0 in that case. Don't render a heading arrow when speed_mps < ~0.5."
       ]
+    }
+  },
+
+  "ui_design_patterns": {
+    "_about": "Cross-cutting UI design recipes that span Wi-Fi, Bluetooth, and GNSS. nexusd already encodes the domain knowledge — these recipes lift the implications into UI form so implementers can apply them directly without re-deriving from the DDs. Use alongside `state_machines.<tech>.ui_guidance` (per-state details) and `command_sequences.*` (turn-by-turn scripts).",
+
+    "notification_event_dispatch": {
+      "title": "How to render each Manager.NotificationEvent kind",
+      "purpose": "NotificationEvent is the operator-facing alert channel. The right UI surface depends on whether the event is recoverable, whether it's per-interface or system-wide, and whether the operator can act on it now.",
+      "rules": [
+        "Subscribe to fi.nexus.Manager.NotificationEvent at /fi/nexus1 once at app start; route by `kind`. Treat unknown kinds as a generic toast carrying `kind` + the formatted `data` dict — never drop them.",
+        "Group by recoverability: recoverable kinds (credentials_invalid, eth_credentials_invalid, profile_corrupt) belong in the fix-feed (see ui:fix_feed). Informational kinds (subsystem_unavailable, subsystem_recovered) belong in a transient banner. Admin-level kinds (master_key_degraded) belong in a settings/security pane and SHOULD persist until acknowledged.",
+        "Attach the recovery affordance from the kind's `remediation` attr — don't ask the operator to figure out what to do."
+      ],
+      "dispatch_table": {
+        "kind:credentials_invalid": {
+          "surface": "fix-feed item + optional toast on first arrival",
+          "title_copy": "'Wi-Fi password may have changed for <ssid>'",
+          "primary_action": "'Re-enter password' → opens credential prompt → Profile.Update",
+          "data_keys_used": ["profile", "ssid"],
+          "see_also": ["flow:recover-credentials-invalid"]
+        },
+        "kind:eth_credentials_invalid": {
+          "surface": "fix-feed item",
+          "title_copy": "'Network sign-in rejected on <ifname>' (subtitle: reason → 'wrong password' for bad_credentials, 'certificate rejected' for certificate_rejected)",
+          "primary_action": "'Update credentials' → opens EAP-method-appropriate form → Profile.Update on the Ethernet profile",
+          "data_keys_used": ["ifname", "reason"],
+          "see_also": ["flow:recover-eth-credentials-invalid"]
+        },
+        "kind:profile_corrupt": {
+          "surface": "fix-feed item with destructive affordance",
+          "title_copy": "'Saved network <key> is unreadable'",
+          "primary_action": "'Forget and re-add' → Manager.RemoveProfile",
+          "data_keys_used": ["kind", "key", "reason"]
+        },
+        "kind:subsystem_unavailable": {
+          "surface": "top-of-screen banner scoped to the affected technology",
+          "title_copy": "subsystem='gpsd' → 'GPS service offline'; subsystem='wpa_supplicant' → 'Wi-Fi service offline'; subsystem='bluez' → 'Bluetooth service offline'",
+          "primary_action": "(none — recovery is automatic) ; show a 'Diagnostics' link to a logs view",
+          "data_keys_used": ["subsystem", "duration_s"],
+          "auto_clear_on": "kind:subsystem_recovered with same subsystem"
+        },
+        "kind:subsystem_recovered": {
+          "surface": "clear the matching subsystem_unavailable banner; optional brief 'service restored' toast",
+          "data_keys_used": ["subsystem"]
+        },
+        "kind:master_key_degraded": {
+          "surface": "persistent admin-level alert in security/settings pane (NOT a transient toast)",
+          "title_copy": "'Profile encryption key degraded — saved credentials may be at risk'",
+          "primary_action": "'Open security settings' → admin remediation flow",
+          "data_keys_used": ["source", "reason"]
+        },
+        "kind:auth_backend_unavailable": {
+          "surface": "(reserved — not currently emitted; see node attrs) ; if observed, treat as subsystem_unavailable for the named backend",
+          "data_keys_used": ["backend", "affected_interfaces"]
+        }
+      }
+    },
+
+    "error_to_user_copy": {
+      "title": "Translating fi.nexus.Error.* into operator-facing copy and recovery affordances",
+      "purpose": "D-Bus errors on the public surface have well-defined semantics. The same error means the same thing across backends — operators benefit from consistent copy and a consistent recovery affordance.",
+      "rules": [
+        "Always render the operator-facing copy, never the raw error name. Log the error name + path + method to a diagnostics view.",
+        "Bucket by recoverability: 'retry now' (ResourceBusy, Timeout-with-care), 'wait then retry' (RateLimited), 'fix input' (InvalidArgument, AlreadyExists, NotPaired), 'fix permissions' (AuthFailed), 'unrecoverable in this UI' (FeatureDisabled, Unsupported, BluezUnavailable, SupplicantUnavailable).",
+        "Special case Timeout: the call may have actually succeeded server-side. Do NOT auto-retry blindly — reconcile via state (re-read Properties, re-walk ObjectManager) before deciding."
+      ],
+      "table": {
+        "err:fi.nexus.Error.NotFound": { "copy": "context-dependent: 'No such network', 'No such interface', 'Profile no longer exists'", "affordance": "refresh the list / back out" },
+        "err:fi.nexus.Error.AlreadyExists": { "copy": "'A profile for this network already exists'", "affordance": "'Use existing' (FindWifiProfile) or 'Update existing' (Profile.Update)" },
+        "err:fi.nexus.Error.InvalidArgument": { "copy": "'That doesn\\'t look right' + the field that failed validation if known", "affordance": "highlight the offending field; let the operator fix it" },
+        "err:fi.nexus.Error.InvalidState": { "copy": "'Can\\'t do that right now' + the state we\\'re in", "affordance": "wait for the state to advance, then retry; never auto-retry inside the same state" },
+        "err:fi.nexus.Error.AuthFailed": { "copy": "'Sign in as administrator to do this'", "affordance": "see ui:permissions_handling — trigger a polkit auth agent prompt where supported, else block with a hint" },
+        "err:fi.nexus.Error.ResourceBusy": { "copy": "'Driver is busy — retrying'", "affordance": "wait >=2 s and retry once; surface only if a second attempt also fails" },
+        "err:fi.nexus.Error.RateLimited": { "copy": "'Too many requests — try again in <retry_after_ms / 1000> s'", "affordance": "respect retry_after_ms; render a countdown if the UI is blocking on the call" },
+        "err:fi.nexus.Error.FeatureDisabled": { "copy": "'<technology> is disabled on this device'", "affordance": "disable the feature surface entirely; no retry path" },
+        "err:fi.nexus.Error.Timeout": { "copy": "'Took longer than expected'", "affordance": "DO NOT auto-retry; re-read state and decide based on observed reality" },
+        "err:fi.nexus.Error.SupplicantUnavailable": { "copy": "'Wi-Fi service is starting up — please wait'", "affordance": "auto-clear when subsystem_recovered fires; no manual retry needed" },
+        "err:fi.nexus.Error.IoError": { "copy": "'Network error — try again'", "affordance": "single retry; on second failure escalate to diagnostics" },
+        "err:fi.nexus.Error.CryptoError": { "copy": "'Couldn\\'t protect saved credentials'", "affordance": "tie to master_key_degraded if that notification has fired; otherwise treat as IoError" },
+        "err:fi.nexus.Error.Unsupported": { "copy": "'This device doesn\\'t support that'", "affordance": "disable the affordance permanently for this device" },
+        "err:fi.nexus.Error.UnknownDevice": { "copy": "'Device is no longer available'", "affordance": "remove from list, re-scan if appropriate" },
+        "err:fi.nexus.Error.UnknownPairingJob": { "copy": "'That pairing prompt expired'", "affordance": "drop any open prompt UI; pairing must be restarted" },
+        "err:fi.nexus.Error.NotPaired": { "copy": "'Pair before connecting'", "affordance": "redirect to the pair flow" },
+        "err:fi.nexus.Error.NotPowered": { "copy": "'<technology> is off'", "affordance": "show a 'Turn on' toggle that writes the relevant Powered property" },
+        "err:fi.nexus.Error.BluezUnavailable": { "copy": "'Bluetooth service offline'", "affordance": "auto-clear on subsystem_recovered (subsystem='bluez'); diagnostics link" },
+        "err:fi.nexus.Error.ConnectionFailed": { "copy": "'Couldn\\'t connect — peer may be out of range'", "affordance": "single retry; do NOT auto-retry repeatedly (peer-side issue)" }
+      }
+    },
+
+    "fix_feed": {
+      "title": "Build a 'fix-feed' that aggregates recoverable problems",
+      "purpose": "Operators benefit from a single list of 'things that need my attention' rather than scattered toasts. Several signals across backends collectively form this feed.",
+      "feed_sources": [
+        { "source": "Manager.NotificationEvent kind=credentials_invalid", "row_kind": "wifi-credentials" },
+        { "source": "Manager.NotificationEvent kind=eth_credentials_invalid", "row_kind": "ethernet-credentials" },
+        { "source": "Manager.NotificationEvent kind=profile_corrupt", "row_kind": "profile-corrupt" },
+        { "source": "Profile.CredentialsInvalidChanged(true) on a Wi-Fi profile (mirrors the notification — use whichever arrives first)", "row_kind": "wifi-credentials" },
+        { "source": "Interface.StateChanged with state=disconnected and details.reason in {credentials_invalid, server_unreachable, certificate_rejected} that has persisted past cool-down", "row_kind": "ethernet-credentials or wifi-credentials per Kind" },
+        { "source": "BluetoothDevice.State==failed (sticky failure that does not auto-retry — see state_machines.bluetooth_device.states.failed)", "row_kind": "bluetooth-failure" }
+      ],
+      "row_template": {
+        "id": "stable composite (row_kind + profile_path or ifname or device_path) so re-emissions deduplicate",
+        "title": "operator-facing summary (use error_to_user_copy / notification_event_dispatch.dispatch_table)",
+        "primary_action": "the recovery affordance from the dispatch_table entry",
+        "secondary_action": "'Dismiss' (transient — the row reappears if the underlying condition is re-asserted)",
+        "auto_clear_on": "the inverse signal (CredentialsInvalidChanged(false), state advances to authenticated/connected, BluetoothDevice.Forget called, etc.)"
+      },
+      "ordering": "Sort by first-seen-time desc with severity boost (master_key_degraded > credentials_invalid > profile_corrupt > bluetooth-failure). Don't reshuffle on every event; debounce."
+    },
+
+    "connection_status_reduce": {
+      "title": "Single 'are we online?' badge across Ethernet + Wi-Fi",
+      "purpose": "Operators want one yes/no answer for connectivity. Reducing across multiple interfaces consistently is the difference between a UI that feels coherent and one that contradicts itself.",
+      "recipe": [
+        "Walk all Interface objects via ObjectManager. For each Kind=ethernet, read Ethernet.State; for each Kind=wifi, read Wifi.State.",
+        "An interface is 'connected' when: Kind=ethernet AND State==link_ready (no 802.1X) OR State==authenticated (with 802.1X); or Kind=wifi AND State==connected.",
+        "If ANY interface is connected → badge='online', preferred_kind=ethernet over wifi if both. If NONE connected but ANY is in connecting/authenticating/handshaking → badge='connecting'. Otherwise badge='offline'.",
+        "Subscribe to fi.nexus.Interface.StateChanged with no path filter; recompute the reduce on every transition. Hot-property changes (SignalDbm, Frequency) MUST NOT trigger badge recomputation."
+      ],
+      "do_not": [
+        "Don't infer connectivity from carrier alone — 802.1X-required networks have carrier without connectivity.",
+        "Don't use OperState as the truth source — it reflects kernel link state, not application-layer readiness. State is the right property.",
+        "Don't poll. The signal-driven reduce is sub-millisecond on real hardware."
+      ]
+    },
+
+    "permissions_handling": {
+      "title": "Handling AuthFailed (polkit denial) without surprising the operator",
+      "purpose": "Almost every mutating method requires a polkit action. AuthFailed is policy denial, not an authentication failure of the operator's typed credentials. UIs must not conflate the two.",
+      "rules": [
+        "On AuthFailed: do not retry the same call automatically. The decision was made by polkit and won't change without operator action.",
+        "If a polkit auth agent is available in the session (most desktops, Cockpit, etc.), the call will have already prompted before returning AuthFailed. Treat the AuthFailed as 'operator declined or wasn't authorized'. Render 'Sign in as administrator to <verb>' with a Retry button that re-issues the call (this re-triggers the auth agent).",
+        "If no polkit agent is available (kiosk, headless console, embedded panel without agent), surface a clear hint: 'Administrator approval required — ask the system owner.' Don't pretend a Retry will help.",
+        "Different methods need different polkit actions (fi.nexus.scan, fi.nexus.connect, fi.nexus.profile.add, fi.nexus.profile.modify, fi.nexus.set_power, …). When you serialize the verb in the prompt, take it from the method's purpose, not from the polkit action ID — operators don't read action IDs."
+      ],
+      "see_also": ["edges with rel=requires_polkit", "consumer_recommendations.rate_limit_etiquette"]
     }
   },
 

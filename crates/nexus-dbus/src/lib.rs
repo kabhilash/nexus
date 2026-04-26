@@ -21,6 +21,7 @@ pub mod scan_results;
 pub mod service;
 pub mod services;
 pub mod state;
+pub mod wifi_jobs;
 
 pub use authz::{
     AlwaysAllowChecker, AlwaysDenyChecker, AuthChecker, AuthDecision, PolicyKitChecker,

@@ -8,11 +8,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nexus_core::{InterfaceInfo, InterfaceKind, NexusEvent, OperState};
+use futures_util::StreamExt;
+use nexus_core::{
+    DisconnectReason, InterfaceInfo, InterfaceKind, MacAddr, NexusEvent, OperState, SecurityMode,
+    Ssid, WifiState,
+};
 use nexus_dbus::backend_ops::BackendOps;
 use nexus_dbus::{
-    DbusConfig, NoopOps, PolicyMapChecker, RecordedCall, RecordingOps, RoamingMode, ScanParams,
-    actions, always_allow, always_deny, spawn_dbus_service,
+    DbusConfig, DbusError, NoopOps, PolicyMapChecker, RecordedCall, RecordingOps, RoamingMode,
+    ScanParams, actions, always_allow, always_deny, spawn_dbus_service,
 };
 use nexus_profile_store::{InMemoryKeySource, ProfileFileStore, ProfileStore};
 use tempfile::TempDir;
@@ -827,4 +831,428 @@ async fn roaming_mode_parses() {
     // alongside the mutating methods.
     assert_eq!(RoamingMode::parse("nexus"), Some(RoamingMode::Nexus));
     assert_eq!(RoamingMode::parse("none"), None);
+}
+
+// ---------------------------------------------------------------------------
+// DD-006 §6.3 / §9 — Wifi.Connect / Disconnect completion signals.
+//
+// Connect/Disconnect now return `(job_id: s)` and the terminal edge
+// fires via `Wifi.ConnectComplete` / `Wifi.DisconnectComplete`. These
+// tests exercise the per-branch reasons (success, credentials_invalid,
+// handshake_timeout, rf_killed, cancelled) and the `Wifi.StateChanged`
+// typed signal that mirrors `Interface.StateChanged`.
+// ---------------------------------------------------------------------------
+
+const WLAN_IFINDEX: u32 = 3;
+
+/// Add a Wi-Fi profile via D-Bus and return its object path. Used to
+/// give `Connect` something to point at.
+async fn add_wifi_profile_get_path(
+    bus: &Bus,
+    bus_name: &str,
+) -> OwnedObjectPath {
+    let client = bus.connection().await;
+    let reply = client
+        .call_method(
+            Some(bus_name),
+            "/fi/nexus1",
+            Some("fi.nexus.Manager"),
+            "AddWifiProfile",
+            &(build_wifi_settings_dict(),),
+        )
+        .await
+        .expect("AddWifiProfile");
+    reply.body().deserialize().unwrap()
+}
+
+/// Subscribe to `fi.nexus.Wifi.<member>` signals on the given path.
+async fn subscribe_wifi_signal(
+    client: &zbus::Connection,
+    member: &str,
+) -> zbus::MessageStream {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("fi.nexus.Wifi")
+        .unwrap()
+        .member(member)
+        .unwrap()
+        .path("/fi/nexus1/interface/wlan0")
+        .unwrap()
+        .build();
+    zbus::MessageStream::for_match_rule(rule, client, None)
+        .await
+        .expect("subscribe")
+}
+
+/// Wait for the next signal whose body deserializes as
+/// `(String, bool, String)` (the ConnectComplete / DisconnectComplete
+/// payload) and return it. Returns `None` on timeout.
+async fn next_complete(
+    stream: &mut zbus::MessageStream,
+    timeout: Duration,
+) -> Option<(String, bool, String)> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let remaining =
+            deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(1);
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Ok(payload) = msg.body().deserialize::<(String, bool, String)>() {
+                    return Some(payload);
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Issue Connect for a freshly-added profile and return the job_id.
+async fn issue_connect(bus: &Bus, bus_name: &str) -> String {
+    let path = add_wifi_profile_get_path(bus, bus_name).await;
+    let client = bus.connection().await;
+    let reply = client
+        .call_method(
+            Some(bus_name),
+            "/fi/nexus1/interface/wlan0",
+            Some("fi.nexus.Wifi"),
+            "Connect",
+            &(path,),
+        )
+        .await
+        .expect("Connect");
+    reply.body().deserialize::<String>().expect("job_id (s)")
+}
+
+#[tokio::test]
+async fn wifi_connect_returns_job_id_and_emits_complete_on_connected() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_cc_ok";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let mut stream = subscribe_wifi_signal(&client, "ConnectComplete").await;
+
+    let job_id = issue_connect(&bus, bus_name).await;
+    assert!(!job_id.is_empty(), "Connect returned empty job_id");
+
+    // Drive the backend to Connected. The service event loop sees
+    // WifiStateChanged, takes the pending connect job, and emits
+    // ConnectComplete(success=true, reason="").
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Connected {
+                bssid: MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]),
+                ssid: Ssid::new(b"corp".to_vec()).unwrap(),
+                frequency: 5180,
+                signal_dbm: -50,
+                security: SecurityMode::Wpa2Psk,
+            },
+        })
+        .unwrap();
+
+    let (jid, success, reason) = next_complete(&mut stream, Duration::from_millis(800))
+        .await
+        .expect("ConnectComplete");
+    assert_eq!(jid, job_id);
+    assert!(success);
+    assert_eq!(reason, "");
+    handle.stop().await;
+}
+
+async fn assert_connect_failure_reason(
+    bus_name: &str,
+    reason_variant: DisconnectReason,
+    expected_wire_reason: &str,
+) {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let mut stream = subscribe_wifi_signal(&client, "ConnectComplete").await;
+    let job_id = issue_connect(&bus, bus_name).await;
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Disconnected { reason: reason_variant },
+        })
+        .unwrap();
+    let (jid, success, wire) = next_complete(&mut stream, Duration::from_millis(800))
+        .await
+        .expect("ConnectComplete");
+    assert_eq!(jid, job_id);
+    assert!(!success);
+    assert_eq!(wire, expected_wire_reason);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn wifi_connect_complete_credentials_invalid() {
+    assert_connect_failure_reason(
+        "fi.nexus1.test_cc_creds",
+        DisconnectReason::CredentialsInvalid,
+        "credentials_invalid",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wifi_connect_complete_handshake_timeout() {
+    assert_connect_failure_reason(
+        "fi.nexus1.test_cc_hs",
+        DisconnectReason::HandshakeTimeout,
+        "handshake_timeout",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wifi_connect_complete_rf_killed() {
+    assert_connect_failure_reason(
+        "fi.nexus1.test_cc_rfk",
+        DisconnectReason::RfKilled,
+        "rf_killed",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wifi_connect_complete_supplicant_unavailable() {
+    assert_connect_failure_reason(
+        "fi.nexus1.test_cc_sup",
+        DisconnectReason::SupplicantUnavailable,
+        "supplicant_unavailable",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wifi_connect_complete_ap_initiated_maps_to_other() {
+    // Disconnect reasons not in the named set fall under "other"
+    // — ApInitiated is the canonical example.
+    assert_connect_failure_reason(
+        "fi.nexus1.test_cc_other",
+        DisconnectReason::ApInitiated,
+        "other",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wifi_disconnect_returns_job_id_and_emits_complete_on_success() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_dc_ok";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let mut stream = subscribe_wifi_signal(&client, "DisconnectComplete").await;
+
+    let empty: HashMap<String, OwnedValue> = HashMap::new();
+    let reply = client
+        .call_method(
+            Some(bus_name),
+            "/fi/nexus1/interface/wlan0",
+            Some("fi.nexus.Wifi"),
+            "Disconnect",
+            &(empty,),
+        )
+        .await
+        .expect("Disconnect");
+    let job_id: String = reply.body().deserialize().expect("job_id");
+    assert!(!job_id.is_empty());
+
+    let (jid, success, reason) = next_complete(&mut stream, Duration::from_millis(800))
+        .await
+        .expect("DisconnectComplete");
+    assert_eq!(jid, job_id);
+    assert!(success);
+    assert_eq!(reason, "");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn wifi_disconnect_emits_complete_other_when_backend_errors() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    // Inject an error so the backend's wifi_disconnect returns Err.
+    ops.inject_error(DbusError::Unsupported("supplicant gone".into()));
+    let bus_name = "fi.nexus1.test_dc_fail";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let mut stream = subscribe_wifi_signal(&client, "DisconnectComplete").await;
+    let empty: HashMap<String, OwnedValue> = HashMap::new();
+    let reply = client
+        .call_method(
+            Some(bus_name),
+            "/fi/nexus1/interface/wlan0",
+            Some("fi.nexus.Wifi"),
+            "Disconnect",
+            &(empty,),
+        )
+        .await
+        .expect("Disconnect");
+    let job_id: String = reply.body().deserialize().expect("job_id");
+
+    let (jid, success, reason) = next_complete(&mut stream, Duration::from_millis(800))
+        .await
+        .expect("DisconnectComplete");
+    assert_eq!(jid, job_id);
+    assert!(!success);
+    assert_eq!(reason, "other");
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn wifi_disconnect_cancels_in_flight_connect() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_cancel";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let mut connect_stream = subscribe_wifi_signal(&client, "ConnectComplete").await;
+    let mut disconnect_stream = subscribe_wifi_signal(&client, "DisconnectComplete").await;
+
+    // Issue Connect, then Disconnect before any state transition
+    // resolves the connect.
+    let connect_job = issue_connect(&bus, bus_name).await;
+    let empty: HashMap<String, OwnedValue> = HashMap::new();
+    let reply = client
+        .call_method(
+            Some(bus_name),
+            "/fi/nexus1/interface/wlan0",
+            Some("fi.nexus.Wifi"),
+            "Disconnect",
+            &(empty,),
+        )
+        .await
+        .expect("Disconnect");
+    let disconnect_job: String = reply.body().deserialize().expect("job_id");
+
+    let (cjid, csuccess, creason) =
+        next_complete(&mut connect_stream, Duration::from_millis(800))
+            .await
+            .expect("ConnectComplete");
+    assert_eq!(cjid, connect_job);
+    assert!(!csuccess);
+    assert_eq!(creason, "cancelled");
+
+    let (djid, dsuccess, _) =
+        next_complete(&mut disconnect_stream, Duration::from_millis(800))
+            .await
+            .expect("DisconnectComplete");
+    assert_eq!(djid, disconnect_job);
+    assert!(dsuccess);
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn wifi_state_changed_signal_emitted_on_each_transition() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_state";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("fi.nexus.Wifi")
+        .unwrap()
+        .member("StateChanged")
+        .unwrap()
+        .path("/fi/nexus1/interface/wlan0")
+        .unwrap()
+        .build();
+    let mut stream = zbus::MessageStream::for_match_rule(rule, &client, None)
+        .await
+        .expect("subscribe Wifi.StateChanged");
+
+    let bssid = MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    let ssid = Ssid::new(b"corp".to_vec()).unwrap();
+    for s in [
+        WifiState::Scanning,
+        WifiState::Connecting {
+            bssid,
+            ssid: ssid.clone(),
+        },
+        WifiState::Connected {
+            bssid,
+            ssid: ssid.clone(),
+            frequency: 2412,
+            signal_dbm: -55,
+            security: SecurityMode::Wpa2Psk,
+        },
+    ] {
+        event_tx
+            .send(NexusEvent::WifiStateChanged {
+                ifindex: WLAN_IFINDEX,
+                state: s,
+            })
+            .unwrap();
+    }
+
+    let mut got: Vec<String> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_millis(800);
+    while got.len() < 3 && std::time::Instant::now() < deadline {
+        let remaining =
+            deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(1);
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Ok((label, _details)) =
+                    msg.body().deserialize::<(String, HashMap<String, OwnedValue>)>()
+                {
+                    got.push(label);
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        got.iter().any(|s| s == "scanning"),
+        "expected `scanning` state, got {got:?}"
+    );
+    assert!(
+        got.iter().any(|s| s == "connecting"),
+        "expected `connecting` state, got {got:?}"
+    );
+    assert!(
+        got.iter().any(|s| s == "connected"),
+        "expected `connected` state, got {got:?}"
+    );
+    handle.stop().await;
 }

@@ -597,7 +597,13 @@ impl ManagerOps for ZbusManagerOps {
                 message: format!("bad profile path `{profile_path}`: {e}"),
             }
         })?;
-        wifi.connect(p).await.map_err(from_zbus_error)
+        // The new wire shape returns a `(job_id: s)` tuple per
+        // DD-006 §6.3; the CLI doesn't surface the id today (no
+        // wait-on-ConnectComplete loop yet), so discard it.
+        wifi.connect(p)
+            .await
+            .map(|_job_id| ())
+            .map_err(from_zbus_error)
     }
 
     async fn wifi_disconnect(
@@ -621,7 +627,12 @@ impl ManagerOps for ZbusManagerOps {
                 params.insert("pause_auto_connect".to_owned(), v);
             }
         }
-        wifi.disconnect(params).await.map_err(from_zbus_error)
+        // `Disconnect` likewise returns `(job_id: s)`. Same
+        // forward-compat treatment as `wifi_connect_profile` above.
+        wifi.disconnect(params)
+            .await
+            .map(|_job_id| ())
+            .map_err(from_zbus_error)
     }
 
     async fn find_wifi_profile(&self, ssid: &[u8]) -> Result<String, NexusctlError> {

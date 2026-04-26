@@ -433,12 +433,18 @@ Scan(params: a{sv}) -> ()
             fi.nexus.Error.ResourceBusy, fi.nexus.Error.RateLimited,
             fi.nexus.Error.FeatureDisabled
 
-Connect(profile: o) -> ()
+Connect(profile: o) -> (job_id: s)
     Connect to the given Wi-Fi profile. The profile path must be under
     /fi/nexus1/profile/wifi/; passing an Ethernet profile path returns
     InvalidArgument. Connecting bypasses the profile's auto_connect flag —
     an operator-requested connection is treated as an explicit override
     for the current session.
+
+    Returns a connect job id (ULID string) that correlates the
+    subsequent ConnectComplete signal. Progress is reported via
+    StateChanged (both fi.nexus.Interface.StateChanged and
+    fi.nexus.Wifi.StateChanged); the terminal edge for the operator's
+    "did we get there" question is ConnectComplete.
 
     Lifecycle after explicit Connect on a non-auto-connect profile: the
     backend treats the profile as "sticky" until explicit Disconnect or
@@ -451,10 +457,15 @@ Connect(profile: o) -> ()
     (still sticky). Only explicit Disconnect or daemon restart clears
     the stickiness.
 
-    Returns immediately; progress is reported via StateChanged.
+    ConnectComplete fires on the first terminal state for the attempt:
+    Connected (success) or Disconnected{reason} (failure). The
+    backend's internal retry loop continues independently, but each
+    operator-initiated Connect resolves to exactly one ConnectComplete.
+    If a Disconnect arrives before either edge, the in-flight
+    ConnectComplete fires with reason="cancelled".
     Errors: fi.nexus.Error.NotFound, fi.nexus.Error.InvalidArgument, fi.nexus.Error.AuthFailed
 
-Disconnect(params: a{sv}) -> ()
+Disconnect(params: a{sv}) -> (job_id: s)
     Disconnect from the current network. params may include:
       "pause_auto_connect" (b)  also block the active profile from
                                 the daemon's auto-connect picker
@@ -464,6 +475,11 @@ Disconnect(params: a{sv}) -> ()
                                 profile's `auto_connect` field is
                                 NOT modified. Default false.
     Pass an empty dict for the historical no-arg behaviour.
+
+    Returns a disconnect job id (ULID string) that correlates the
+    subsequent DisconnectComplete signal. The method returns as soon
+    as the auth/rate/feature gates pass; the supplicant teardown runs
+    asynchronously and resolves via DisconnectComplete.
     Errors: fi.nexus.Error.AuthFailed, fi.nexus.Error.InvalidArgument
 
 Roam(bssid: ay) -> ()
@@ -871,6 +887,47 @@ NetworkRequest(network: o, field: s, text: s)
     (`"password"`, `"passphrase"`, `"otp"`, `"pin"`, …); `text`
     is the human-readable prompt the supplicant suggests showing
     the operator. See DD-003 §9.2.
+
+StateChanged(new_state: s, details: a{sv})
+    Typed mirror of fi.nexus.Interface.StateChanged emitted on the
+    same path with the same args and the same details schema (see
+    the §9 details table above). Provided so clients whose typed
+    proxy stack reliably resolves per-interface signals but not the
+    common `fi.nexus.Interface` signals can subscribe on the
+    technology-specific channel. Both signals fire on every Wi-Fi
+    state transition; clients should pick one and ignore the other.
+
+ConnectComplete(job_id: s, success: b, reason: s)
+    Terminal signal for an operator-initiated Connect. `job_id`
+    matches the value returned by `Connect`. `success` is true when
+    the interface reached `Connected` for the attempt; false when it
+    reached `Disconnected{reason}` first or when the in-flight
+    Connect was cancelled by an explicit `Disconnect`.
+    `reason` on success is `""`. On failure it is one of:
+      "credentials_invalid"   — bad PSK / EAP credentials, or the
+                                 profile is now flagged
+                                 CredentialsInvalid.
+      "server_unreachable"    — the AAA / RADIUS server backing the
+                                 EAP exchange could not be reached.
+      "handshake_timeout"     — 4-way handshake did not complete in
+                                 time.
+      "rf_killed"             — interface entered Disconnected
+                                 because rfkill was asserted.
+      "supplicant_unavailable"— wpa_supplicant / iwd dropped off the
+                                 bus mid-attempt (NameOwnerChanged
+                                 to no owner).
+      "cancelled"             — operator issued `Disconnect` before
+                                 the attempt reached a terminal edge.
+      "other"                 — any reason not in the list above
+                                 (transient AP-initiated disconnect,
+                                 protocol error, driver wedge, etc.).
+
+DisconnectComplete(job_id: s, success: b, reason: s)
+    Terminal signal for an operator-initiated Disconnect. `job_id`
+    matches the value returned by `Disconnect`. `success` is true
+    when the supplicant teardown succeeded; false when it failed
+    mid-teardown. `reason` is `""` on success and `"other"` on
+    failure.
 ```
 
 **Ethernet (`fi.nexus.Ethernet`):**
@@ -1136,9 +1193,15 @@ busctl call fi.nexus1 /fi/nexus1 fi.nexus.Manager GetInterface s "wlp2s0"
 # Initiate connection
 busctl call fi.nexus1 /fi/nexus1/interface/wlp2s0 fi.nexus.Wifi Connect \
     o "/fi/nexus1/profile/wifi/01HPQY8S2N0Z8K9M7V3Y2F4T5W6"
-# -> (no return)
+# -> s "01J0PQR6V0Y8K9M7V3Y2F4T5W6"   (job_id ULID)
 
-# Watch state via signals:
+# Wait for the terminal edge — ConnectComplete fires once with the
+# job_id above and tells you whether the attempt reached Connected:
+busctl monitor --match "interface='fi.nexus.Wifi',member='ConnectComplete'"
+
+# For per-tick progress (UI), watch StateChanged on the typed Wi-Fi
+# channel or the common Interface channel — both carry the same args:
+busctl monitor --match "interface='fi.nexus.Wifi',member='StateChanged'"
 busctl monitor --match "interface='fi.nexus.Interface',member='StateChanged'"
 ```
 

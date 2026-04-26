@@ -16,6 +16,7 @@ use crate::errors::DbusError;
 use crate::properties::PropertyBatcher;
 use crate::rate_limit::RateLimiter;
 use crate::state::State;
+use crate::wifi_jobs::WifiJobs;
 
 /// Per-backend enable/disable flags plumbed in from `nexus.toml`.
 /// A mutating method on a disabled backend returns
@@ -102,6 +103,9 @@ pub struct Services {
     /// `"wpa_supplicant"` / `"ead"` / `"none"`. Stamped onto every
     /// Ethernet interface's cache on `InterfaceDiscovered`.
     pub ethernet_auth_backend: String,
+    /// Outstanding Wi-Fi `Connect` / `Disconnect` jobs (DD-006 §6.3
+    /// completion-signal correlation).
+    pub wifi_jobs: Arc<WifiJobs>,
 }
 
 impl Services {
@@ -123,6 +127,7 @@ impl Services {
             rate_limiter,
             enabled,
             ethernet_auth_backend,
+            wifi_jobs: Arc::new(WifiJobs::new()),
         }
     }
 }

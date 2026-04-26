@@ -46,17 +46,61 @@ pub trait Wifi {
         params: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
     ) -> zbus::Result<()>;
 
-    /// `Connect(profile: o) -> ()`.
+    /// `Connect(profile: o) -> (job_id: s)`. Returns a ULID job id
+    /// that correlates the subsequent
+    /// `fi.nexus.Wifi.ConnectComplete(job_id, success, reason)`
+    /// signal — DD-006 §6.3 / §9.
     #[zbus(name = "Connect")]
-    fn connect(&self, profile: zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
+    fn connect(&self, profile: zbus::zvariant::ObjectPath<'_>) -> zbus::Result<String>;
 
-    /// `Disconnect(params: a{sv}) -> ()`. Pass an empty dict for
-    /// the historical no-arg behaviour. Recognised params:
+    /// `Disconnect(params: a{sv}) -> (job_id: s)`. Pass an empty
+    /// dict for the historical no-arg behaviour. Recognised params:
     ///   - `pause_auto_connect` (b): also block the active profile
     ///     from auto-connect for the rest of this daemon session.
+    /// Returns a ULID job id that correlates the subsequent
+    /// `fi.nexus.Wifi.DisconnectComplete(job_id, success, reason)`
+    /// signal.
     #[zbus(name = "Disconnect")]
     fn disconnect(
         &self,
         params: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+    ) -> zbus::Result<String>;
+
+    /// `ConnectComplete(job_id: s, success: b, reason: s)` — DD-006
+    /// §9. Terminal signal for an operator-initiated `Connect`.
+    #[zbus(signal, name = "ConnectComplete")]
+    fn connect_complete(
+        &self,
+        job_id: String,
+        success: bool,
+        reason: String,
+    ) -> zbus::Result<()>;
+
+    /// `DisconnectComplete(job_id: s, success: b, reason: s)` —
+    /// DD-006 §9. Terminal signal for an operator-initiated
+    /// `Disconnect`.
+    #[zbus(signal, name = "DisconnectComplete")]
+    fn disconnect_complete(
+        &self,
+        job_id: String,
+        success: bool,
+        reason: String,
+    ) -> zbus::Result<()>;
+
+    /// `StateChanged(new_state: s, details: a{sv})` — DD-006 §9.
+    /// Typed mirror of `fi.nexus.Interface.StateChanged` emitted on
+    /// every Wi-Fi state transition.
+    ///
+    /// Named `wifi_state_changed` in Rust (rather than
+    /// `state_changed`) to avoid clashing with zbus's
+    /// auto-generated `receive_state_changed` for the `State`
+    /// property's `PropertiesChanged` stream — both helpers would
+    /// otherwise occupy the same `WifiProxy::receive_state_changed`
+    /// slot. The wire name is unchanged.
+    #[zbus(signal, name = "StateChanged")]
+    fn wifi_state_changed(
+        &self,
+        new_state: String,
+        details: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
     ) -> zbus::Result<()>;
 }

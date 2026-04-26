@@ -11,6 +11,7 @@ use nexus_core::{MacAddr, Ssid};
 use ulid::Ulid;
 use zbus::fdo;
 use zbus::message::Header;
+use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
 use crate::authz::{AuthDecision, actions};
@@ -188,12 +189,18 @@ impl WifiIface {
             .map_err(fdo::Error::from)
     }
 
-    /// `Connect(profile: o) -> ()` — `fi.nexus.connect`.
+    /// `Connect(profile: o) -> (job_id: s)` — `fi.nexus.connect`.
+    /// DD-006 §6.3. Returns a ULID `job_id` that correlates the
+    /// subsequent `ConnectComplete` signal. The terminal edge fires
+    /// from the service event loop on the next Wi-Fi state
+    /// transition (Connected → success; Disconnected{reason} →
+    /// failure with mapped `reason`); an explicit `Disconnect`
+    /// before that resolves the job with `reason="cancelled"`.
     async fn connect(
         &self,
         #[zbus(header)] hdr: Header<'_>,
         profile: OwnedObjectPath,
-    ) -> fdo::Result<()> {
+    ) -> fdo::Result<String> {
         self.check_feature()?;
         self.check_rate(&hdr, OpClass::ConnectDisconnect)?;
         self.require_auth(&hdr, actions::CONNECT).await?;
@@ -217,14 +224,20 @@ impl WifiIface {
                 ))));
             }
         }
-        self.services
-            .ops
-            .wifi_connect(&self.ifname, id)
-            .await
-            .map_err(fdo::Error::from)
+        let job_id = Ulid::new().to_string();
+        self.services.wifi_jobs.register_connect(&self.ifname, &job_id);
+        if let Err(e) = self.services.ops.wifi_connect(&self.ifname, id).await {
+            // Backend rejected the call before any state-machine
+            // work — clear the registration so a stale job_id
+            // doesn't sit waiting for a state transition that will
+            // never come.
+            self.services.wifi_jobs.take_connect(&self.ifname);
+            return Err(fdo::Error::from(e));
+        }
+        Ok(job_id)
     }
 
-    /// `Disconnect(params: a{sv}) -> ()` — `fi.nexus.connect`.
+    /// `Disconnect(params: a{sv}) -> (job_id: s)` — `fi.nexus.connect`.
     /// DD-006 §6.3. Recognised params:
     ///   - `pause_auto_connect` (b, default false): if true, the
     ///     active profile is added to the backend's runtime
@@ -234,22 +247,60 @@ impl WifiIface {
     ///     `auto_connect` field is *not* modified.
     /// Unknown keys are ignored — clients can probe for
     /// future-added knobs without server-side validation churn.
+    ///
+    /// Returns a ULID `job_id` for the corresponding
+    /// `DisconnectComplete` signal. Cancels any in-flight
+    /// `Connect` job by emitting `ConnectComplete(success=false,
+    /// reason="cancelled")` for it before driving the teardown.
     async fn disconnect(
         &self,
         #[zbus(header)] hdr: Header<'_>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
         params: HashMap<String, OwnedValue>,
-    ) -> fdo::Result<()> {
+    ) -> fdo::Result<String> {
         self.check_feature()?;
         self.check_rate(&hdr, OpClass::ConnectDisconnect)?;
         self.require_auth(&hdr, actions::CONNECT).await?;
         let pause_auto_connect = lookup_bool(&params, "pause_auto_connect")
             .map_err(|e| fdo::Error::from(DbusError::InvalidArgument(e)))?
             .unwrap_or(false);
+        let job_id = Ulid::new().to_string();
         self.services
-            .ops
-            .wifi_disconnect(&self.ifname, pause_auto_connect)
-            .await
-            .map_err(fdo::Error::from)
+            .wifi_jobs
+            .register_disconnect(&self.ifname, &job_id);
+        let services = Arc::clone(&self.services);
+        let ifname = self.ifname.clone();
+        let emitter_owned = emitter.to_owned();
+        let job_for_task = job_id.clone();
+        tokio::spawn(async move {
+            // Cancel any in-flight Connect: emit ConnectComplete
+            // with reason="cancelled" so the operator sees a
+            // terminal edge for the prior Connect attempt before
+            // the disconnect's terminal edge.
+            if let Some(connect_job) = services.wifi_jobs.take_connect(&ifname) {
+                let _ = WifiIface::connect_complete(
+                    &emitter_owned,
+                    &connect_job,
+                    false,
+                    "cancelled",
+                )
+                .await;
+            }
+            let result = services.ops.wifi_disconnect(&ifname, pause_auto_connect).await;
+            services.wifi_jobs.take_disconnect(&ifname);
+            let (success, reason) = match &result {
+                Ok(()) => (true, ""),
+                Err(_) => (false, "other"),
+            };
+            let _ = WifiIface::disconnect_complete(
+                &emitter_owned,
+                &job_for_task,
+                success,
+                reason,
+            )
+            .await;
+        });
+        Ok(job_id)
     }
 
     /// `Roam(bssid: ay) -> ()` — `fi.nexus.connect`. Only valid in
@@ -346,6 +397,43 @@ impl WifiIface {
             .await
             .map_err(|e| zbus::Error::from(zbus::fdo::Error::from(e)))
     }
+
+    // ---- Signals (DD-006 §9) ----
+
+    // `StateChanged(new_state: s, details: a{sv})` is declared on
+    // `fi.nexus.Wifi` for clients whose typed proxy stack
+    // resolves per-technology signals more reliably than the
+    // common `fi.nexus.Interface` channel. The signal is emitted
+    // raw from the service event loop alongside
+    // `Interface.StateChanged` (see `emit_wifi_state_changed`); a
+    // typed `#[zbus(signal)]` helper here would clash with the
+    // namesake on `InterfaceIface`, both of which are registered
+    // on the same object path.
+
+    /// `ConnectComplete(job_id: s, success: b, reason: s)`.
+    ///
+    /// Terminal signal for an operator-initiated `Connect`. See
+    /// DD-006 §9 for the documented `reason` value set.
+    #[zbus(signal)]
+    pub async fn connect_complete(
+        emitter: &SignalEmitter<'_>,
+        job_id: &str,
+        success: bool,
+        reason: &str,
+    ) -> zbus::Result<()>;
+
+    /// `DisconnectComplete(job_id: s, success: b, reason: s)`.
+    ///
+    /// Terminal signal for an operator-initiated `Disconnect`.
+    /// `reason` is `""` on success, `"other"` on backend failure
+    /// mid-teardown.
+    #[zbus(signal)]
+    pub async fn disconnect_complete(
+        emitter: &SignalEmitter<'_>,
+        job_id: &str,
+        success: bool,
+        reason: &str,
+    ) -> zbus::Result<()>;
 
     /// `RoamingMode` writeable property — `fi.nexus.connect`.
     #[zbus(property)]
