@@ -169,7 +169,10 @@
     { "id": "method:fi.nexus.Manager.AddEthernetProfile", "type": "Method", "label": "Manager.AddEthernetProfile",
       "attrs": { "in": "settings:a{sv}", "out": "path:o", "uniqueness": "At most one profile per ifname." } },
     { "id": "method:fi.nexus.Manager.RemoveProfile", "type": "Method", "label": "Manager.RemoveProfile",
-      "attrs": { "in": "path:o", "side_effect": "Disconnects any active connection using this profile." } },
+      "attrs": { "in": "path:o",
+                 "purpose": "Forget a stored profile. Removes it from the in-memory cache and the on-disk profile store; the backend will not auto-connect to it again. Path may point to either a wifi profile (/fi/nexus1/profile/wifi/<ulid>) or an ethernet profile (/fi/nexus1/profile/ethernet/<ulid>).",
+                 "side_effect": "Disconnects any active connection using this profile.",
+                 "equivalent_call": "Profile.Delete on the same path." } },
     { "id": "method:fi.nexus.Manager.SetPowerState", "type": "Method", "label": "Manager.SetPowerState",
       "attrs": { "in": "state:s" } },
     { "id": "method:fi.nexus.Manager.RotateMasterKey", "type": "Method", "label": "Manager.RotateMasterKey",
@@ -328,7 +331,10 @@
         "stickiness": "Explicit Connect on a non-auto-connect profile makes it sticky until explicit Disconnect or daemon restart, even across transient Disconnected states."
       } },
     { "id": "method:fi.nexus.Wifi.Disconnect", "type": "Method", "label": "Wifi.Disconnect",
-      "attrs": { "in": "()" } },
+      "attrs": { "in": "()",
+                 "purpose": "Tear down the current association on this Wi-Fi interface. Transitions the interface to State=disconnected and emits Interface.StateChanged.",
+                 "durability": "Transient — does not remove the stored profile. The backend may auto-reconnect on the next scan tick if the profile has auto_connect=true and a matching BSS is in range. To opt out durably, follow with Manager.RemoveProfile (or Profile.Delete) on the profile path.",
+                 "see_also": ["method:fi.nexus.Manager.RemoveProfile", "flow:disconnect-and-forget-wifi"] } },
     { "id": "method:fi.nexus.Wifi.Roam", "type": "Method", "label": "Wifi.Roam",
       "attrs": { "in": "bssid:ay", "valid_when": "RoamingMode == nexus" } },
     { "id": "method:fi.nexus.Wifi.ProvideCredential", "type": "Method", "label": "Wifi.ProvideCredential",
@@ -1229,6 +1235,30 @@
           "node": "sig:fi.nexus.Interface.StateChanged" }
       ],
       "note": "EthernetProfile does not yet carry a CredentialsInvalid flag (the on-disk schema lacks the field), so there is no Profile.CredentialsInvalidChanged signal to confirm the recovery. The Manager.NotificationEvent above is the only authoritative event for ethernet credentials-invalid; the recovery-confirmation signal is Interface.StateChanged transitioning to authenticated."
+    },
+
+    {
+      "id": "flow:disconnect-and-forget-wifi",
+      "name": "Disconnect from a Wi-Fi network and forget its profile",
+      "audience": ["app integrator", "ui builder"],
+      "trigger": "Operator chose 'Forget this network' (or equivalent).",
+      "preconditions": ["A wifi-Kind interface is registered. A stored Wi-Fi profile exists for the network the operator wants to forget."],
+      "steps": [
+        { "do": "Call Wifi.Disconnect on the interface object to tear down the current association. Skip this step if the interface is already idle/disconnected; calling it on an idle interface is harmless but no-op.",
+          "node": "method:fi.nexus.Wifi.Disconnect",
+          "polkit": "polkit:fi.nexus.connect",
+          "note": "Transient by itself — the backend may auto-reconnect on the next scan tick if the profile remains and auto_connect=true." },
+        { "do": "Watch Interface.StateChanged on the interface path for state=disconnected to confirm tear-down.",
+          "node": "sig:fi.nexus.Interface.StateChanged" },
+        { "do": "Resolve the stored profile's object path (from Manager.WifiProfiles, or the path captured when the profile was added).",
+          "node": "prop:fi.nexus.Manager.WifiProfiles" },
+        { "do": "Call Manager.RemoveProfile(path) (or equivalently Profile.Delete on the profile object) to forget the profile durably. Removes it from the in-memory cache and the on-disk profile store.",
+          "node": "method:fi.nexus.Manager.RemoveProfile",
+          "polkit": "polkit:fi.nexus.profile.modify" },
+        { "do": "Watch ObjectManager.InterfacesRemoved on the profile path to confirm the profile was unregistered.",
+          "node": "sig:org.freedesktop.DBus.ObjectManager.InterfacesRemoved" }
+      ],
+      "note": "Disconnect alone is reversible — the profile is still stored and the backend treats it as a candidate for the next scan/auto-connect cycle. RemoveProfile (or Profile.Delete on the profile object) is the durable opt-out. Order matters only for cleanliness: removing the profile while connected will also disconnect (per Manager.RemoveProfile.side_effect), but emitting Disconnect first gives the UI a clean state-change observation point. nexusctl wraps the two calls as 'wifi disconnect' and 'wifi forget <ssid|ulid>'."
     },
 
     {
