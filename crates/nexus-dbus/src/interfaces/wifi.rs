@@ -434,3 +434,160 @@ fn parse_scan_params(
 // option-typed parsing branches.
 #[allow(dead_code)]
 fn _touch(_s: Ssid) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zbus::zvariant::Value;
+
+    fn owned(v: Value<'_>) -> OwnedValue {
+        OwnedValue::try_from(v).unwrap()
+    }
+
+    // --- tuple_from_bss / empty_bss_tuple ----------------------------
+
+    #[test]
+    fn tuple_from_bss_packs_every_field_in_order() {
+        let bss = WifiConnectedBss {
+            ssid: b"nexus-net".to_vec(),
+            bssid: MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]),
+            frequency: 5180,
+            signal_dbm: -42,
+            security: "wpa2_personal".into(),
+        };
+        let (ssid_str, ssid_bytes, bssid_bytes, frequency, signal_dbm, security) =
+            tuple_from_bss(&bss);
+        assert_eq!(ssid_str, "nexus-net");
+        assert_eq!(ssid_bytes, b"nexus-net".to_vec());
+        assert_eq!(bssid_bytes, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert_eq!(frequency, 5180);
+        assert_eq!(signal_dbm, -42);
+        assert_eq!(security, "wpa2_personal");
+    }
+
+    #[test]
+    fn tuple_from_bss_preserves_non_utf8_ssid_bytes_alongside_lossy_string() {
+        // SSIDs aren't required to be UTF-8 — the lossy string must
+        // not corrupt the raw byte field, which is what consumers
+        // doing exact comparisons rely on.
+        let bss = WifiConnectedBss {
+            ssid: vec![0xFF, 0xFE, 0x00, 0x41],
+            bssid: MacAddr([0; 6]),
+            frequency: 0,
+            signal_dbm: 0,
+            security: String::new(),
+        };
+        let (s, bytes, ..) = tuple_from_bss(&bss);
+        assert_eq!(bytes, vec![0xFF, 0xFE, 0x00, 0x41]);
+        assert!(
+            s.contains('\u{FFFD}'),
+            "lossy decode should mark invalid bytes, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn empty_bss_tuple_has_zero_default_for_every_slot() {
+        let (s, ssid, bssid, freq, dbm, sec) = empty_bss_tuple();
+        assert!(s.is_empty());
+        assert!(ssid.is_empty());
+        assert!(bssid.is_empty());
+        assert_eq!(freq, 0);
+        assert_eq!(dbm, 0);
+        assert!(sec.is_empty());
+    }
+
+    // --- parse_scan_params -------------------------------------------
+
+    #[test]
+    fn parse_scan_params_empty_dict_uses_documented_defaults() {
+        let p = parse_scan_params(&HashMap::new()).unwrap();
+        // active defaults to true; allow_roam to false. Both are
+        // operator-visible defaults documented in DD-006 §6.3.
+        assert!(p.active);
+        assert!(!p.allow_roam);
+        assert!(p.ssids.is_empty());
+        assert!(p.frequencies.is_empty());
+    }
+
+    #[test]
+    fn parse_scan_params_honors_explicit_active_and_allow_roam() {
+        let mut d = HashMap::new();
+        d.insert("active".into(), owned(Value::new(false)));
+        d.insert("allow_roam".into(), owned(Value::new(true)));
+        let p = parse_scan_params(&d).unwrap();
+        assert!(!p.active);
+        assert!(p.allow_roam);
+    }
+
+    #[test]
+    fn parse_scan_params_extracts_single_ssid() {
+        let mut d = HashMap::new();
+        let ssids: Vec<Vec<u8>> = vec![b"nexus-net".to_vec()];
+        d.insert("ssids".into(), owned(Value::new(ssids)));
+        let p = parse_scan_params(&d).unwrap();
+        assert_eq!(p.ssids, vec![b"nexus-net".to_vec()]);
+    }
+
+    #[test]
+    fn parse_scan_params_extracts_multiple_ssids_in_order() {
+        let mut d = HashMap::new();
+        let ssids: Vec<Vec<u8>> =
+            vec![b"a".to_vec(), b"bb".to_vec(), vec![0xFF, 0xFE, 0x00, 0x41]];
+        d.insert("ssids".into(), owned(Value::new(ssids.clone())));
+        let p = parse_scan_params(&d).unwrap();
+        assert_eq!(p.ssids, ssids);
+    }
+
+    #[test]
+    fn parse_scan_params_silently_drops_non_array_ssids() {
+        // A misuse — caller passed a string under the "ssids" key.
+        // The parser silently treats it as no SSIDs (DD-006 §6.3
+        // "Unknown keys are ignored" tolerance extends to malformed
+        // values — clients can't trip a hard error this way).
+        let mut d = HashMap::new();
+        d.insert("ssids".into(), owned(Value::new("not-an-array".to_owned())));
+        let p = parse_scan_params(&d).unwrap();
+        assert!(p.ssids.is_empty());
+    }
+
+    #[test]
+    fn parse_scan_params_extracts_frequencies() {
+        let mut d = HashMap::new();
+        d.insert(
+            "frequencies".into(),
+            owned(Value::new(vec![2412u32, 5180u32, 5825u32])),
+        );
+        let p = parse_scan_params(&d).unwrap();
+        assert_eq!(p.frequencies, vec![2412, 5180, 5825]);
+    }
+
+    #[test]
+    fn parse_scan_params_silently_drops_non_array_frequencies() {
+        let mut d = HashMap::new();
+        d.insert("frequencies".into(), owned(Value::new(true)));
+        let p = parse_scan_params(&d).unwrap();
+        assert!(p.frequencies.is_empty());
+    }
+
+    #[test]
+    fn parse_scan_params_rejects_bad_active_type() {
+        // active=42 (i32) is not a bool — `lookup_bool` returns Err,
+        // which `parse_scan_params` propagates as a String. A
+        // mistyped argument should fail loudly.
+        let mut d = HashMap::new();
+        d.insert("active".into(), owned(Value::new(42i32)));
+        let err = parse_scan_params(&d).unwrap_err();
+        assert!(err.to_lowercase().contains("active"), "got {err}");
+    }
+
+    #[test]
+    fn parse_scan_params_ignores_unknown_keys() {
+        let mut d = HashMap::new();
+        d.insert("active".into(), owned(Value::new(true)));
+        d.insert("future_knob".into(), owned(Value::new("ignored".to_owned())));
+        // No error; the future_knob is silently skipped, matching
+        // the docstring's forward-compat guarantee.
+        let p = parse_scan_params(&d).unwrap();
+        assert!(p.active);
+    }
+}

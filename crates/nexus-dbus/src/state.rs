@@ -301,3 +301,305 @@ pub fn default_capabilities() -> Vec<String> {
         "bluetooth".to_owned(),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nexus_core::{
+        BtAddressType, BtDeviceInfo, BtTransport, DisconnectReason, InterfaceInfo, InterfaceKind,
+        MacAddr, Nl80211IfType, OperState, PhyCapabilities, SecurityMode, Ssid, WifiState,
+    };
+
+    use super::*;
+
+    fn ssid() -> Ssid {
+        Ssid::new(b"nexus-net".to_vec()).unwrap()
+    }
+
+    fn bssid() -> MacAddr {
+        MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])
+    }
+
+    fn info(kind: InterfaceKind, ifname: &str, ifindex: u32) -> InterfaceInfo {
+        InterfaceInfo {
+            ifindex,
+            ifname: ifname.into(),
+            mac: [0x02, 0, 0, 0, 0, ifindex as u8],
+            mtu: 1500,
+            operstate: OperState::Up,
+            carrier: true,
+            kind,
+            discovered_at: std::time::Instant::now(),
+        }
+    }
+
+    fn wireless_kind() -> InterfaceKind {
+        InterfaceKind::Wireless {
+            wiphy: 0,
+            wiphy_name: "phy0".into(),
+            wdev: 1,
+            iftype: Nl80211IfType(2),
+            capabilities: Arc::new(PhyCapabilities::default()),
+        }
+    }
+
+    fn bluetooth_kind() -> InterfaceKind {
+        InterfaceKind::Bluetooth {
+            hci_name: "hci0".into(),
+            hci_index: 0,
+            bt_address: MacAddr([0; 6]),
+            bluez_path: "/org/bluez/hci0".into(),
+        }
+    }
+
+    fn gnss_kind() -> InterfaceKind {
+        InterfaceKind::Gnss {
+            device_path: "/dev/ttyUSB0".into(),
+            gpsd_device: "/dev/ttyUSB0".into(),
+            vendor_model: Some("u-blox F9P".into()),
+        }
+    }
+
+    fn dummy_bt_info() -> BtDeviceInfo {
+        BtDeviceInfo {
+            adapter: "/org/bluez/hci0".into(),
+            device_path: "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF".into(),
+            address: bssid(),
+            address_type: BtAddressType::LePublic,
+            name: Some("Pixel 8".into()),
+            alias: None,
+            rssi: Some(-55),
+            tx_power: None,
+            uuids: vec![],
+            transport: BtTransport::Le,
+            manufacturer_data: Default::default(),
+            paired: false,
+            bonded: false,
+            trusted: false,
+            blocked: false,
+            connected: false,
+        }
+    }
+
+    // --- PowerState ----------------------------------------------------
+
+    #[test]
+    fn power_state_as_str_and_parse_round_trip() {
+        for v in [PowerState::Active, PowerState::Background, PowerState::Sleep] {
+            assert_eq!(PowerState::parse(v.as_str()), Some(v));
+        }
+    }
+
+    #[test]
+    fn power_state_parse_unknown_returns_none() {
+        assert!(PowerState::parse("unknown").is_none());
+        assert!(PowerState::parse("").is_none());
+        assert!(PowerState::parse("ACTIVE").is_none());
+    }
+
+    #[test]
+    fn power_state_default_is_active() {
+        assert_eq!(PowerState::default(), PowerState::Active);
+    }
+
+    // --- InterfaceState::new picks the right kind_data variant --------
+
+    #[test]
+    fn interface_state_new_ethernet_kind_data() {
+        let s = InterfaceState::new(info(InterfaceKind::Ethernet, "eth0", 1));
+        assert!(matches!(s.kind_data, InterfaceKindData::Ethernet(_)));
+        assert!(s.managed_profile.is_none());
+        assert_eq!(s.kind_label(), "ethernet");
+    }
+
+    #[test]
+    fn interface_state_new_wireless_kind_data() {
+        let s = InterfaceState::new(info(wireless_kind(), "wlan0", 2));
+        assert!(matches!(s.kind_data, InterfaceKindData::Wifi(_)));
+        assert_eq!(s.kind_label(), "wifi");
+    }
+
+    #[test]
+    fn interface_state_new_bluetooth_kind_data() {
+        let s = InterfaceState::new(info(bluetooth_kind(), "hci0", 3));
+        assert!(matches!(s.kind_data, InterfaceKindData::Bluetooth(_)));
+        assert_eq!(s.kind_label(), "bluetooth");
+    }
+
+    #[test]
+    fn interface_state_new_gnss_kind_data() {
+        let s = InterfaceState::new(info(gnss_kind(), "/dev/ttyUSB0", 4));
+        assert!(matches!(s.kind_data, InterfaceKindData::Gnss(_)));
+        assert_eq!(s.kind_label(), "gnss");
+    }
+
+    // --- WifiInterfaceState::apply_state ------------------------------
+
+    #[test]
+    fn apply_state_covers_every_non_connected_variant() {
+        // For everything that isn't `Connected`, the cache must reset
+        // its connected_bss / signal_dbm / frequency to defaults and
+        // the state string must mirror the variant's lowercase name.
+        let cases = [
+            (WifiState::Idle, "idle"),
+            (WifiState::Scanning, "scanning"),
+            (
+                WifiState::Connecting {
+                    bssid: bssid(),
+                    ssid: ssid(),
+                },
+                "connecting",
+            ),
+            (
+                WifiState::Authenticating {
+                    bssid: bssid(),
+                    ssid: ssid(),
+                },
+                "authenticating",
+            ),
+            (
+                WifiState::Handshaking {
+                    bssid: bssid(),
+                    ssid: ssid(),
+                },
+                "handshaking",
+            ),
+            (
+                WifiState::Roaming {
+                    from: bssid(),
+                    to: MacAddr([0x11; 6]),
+                    ssid: ssid(),
+                },
+                "roaming",
+            ),
+            (
+                WifiState::Disconnected {
+                    reason: DisconnectReason::CredentialsInvalid,
+                },
+                "disconnected",
+            ),
+            (WifiState::Gone, "gone"),
+        ];
+
+        for (variant, expected) in cases {
+            let mut w = WifiInterfaceState {
+                signal_dbm: -50,
+                frequency: 2412,
+                connected_bss: Some(WifiConnectedBss {
+                    ssid: vec![],
+                    bssid: bssid(),
+                    frequency: 2412,
+                    signal_dbm: -50,
+                    security: "open".into(),
+                }),
+                ..Default::default()
+            };
+            w.apply_state(&variant);
+            assert_eq!(w.state, expected, "variant {variant:?}");
+            assert!(
+                w.connected_bss.is_none(),
+                "{variant:?} must clear connected_bss"
+            );
+            assert_eq!(w.signal_dbm, 0, "{variant:?} must reset signal_dbm");
+            assert_eq!(w.frequency, 0, "{variant:?} must reset frequency");
+        }
+    }
+
+    #[test]
+    fn apply_state_connected_populates_bss_cache() {
+        let mut w = WifiInterfaceState::default();
+        w.apply_state(&WifiState::Connected {
+            bssid: bssid(),
+            ssid: ssid(),
+            frequency: 5180,
+            signal_dbm: -42,
+            security: SecurityMode::Wpa2Psk,
+        });
+        assert_eq!(w.state, "connected");
+        assert_eq!(w.signal_dbm, -42);
+        assert_eq!(w.frequency, 5180);
+        let bss = w.connected_bss.as_ref().expect("populated");
+        assert_eq!(bss.bssid, bssid());
+        assert_eq!(bss.ssid, b"nexus-net".to_vec());
+        assert_eq!(bss.frequency, 5180);
+        assert_eq!(bss.signal_dbm, -42);
+        assert_eq!(bss.security, "wpa2_personal");
+    }
+
+    // --- security_label ------------------------------------------------
+
+    #[test]
+    fn security_label_covers_every_mode() {
+        let cases = [
+            (SecurityMode::Open, "open"),
+            (SecurityMode::Owe, "owe"),
+            (SecurityMode::Wep, "wep"),
+            (SecurityMode::Wpa2Psk, "wpa2_personal"),
+            (SecurityMode::Wpa3Sae, "wpa3_personal"),
+            (SecurityMode::Wpa2Wpa3Transition, "wpa2_wpa3_personal"),
+            (SecurityMode::Wpa2Eap, "wpa2_enterprise"),
+            (SecurityMode::Wpa3Eap, "wpa3_enterprise"),
+            (SecurityMode::Wpa3EapSuiteB192, "wpa3_enterprise_192"),
+        ];
+        for (mode, expected) in cases {
+            assert_eq!(security_label(mode), expected, "mode {mode:?}");
+        }
+    }
+
+    // --- fix_mode_to_i32 ----------------------------------------------
+
+    #[test]
+    fn fix_mode_to_i32_uses_dbus_wire_values() {
+        // 0/2/3 mirrors the DD-006 Gnss.FixMode wire enum;
+        // explicitly pin the gap (no value 1) so a future "Fix1D"
+        // refactor doesn't silently flip semantics.
+        assert_eq!(fix_mode_to_i32(FixMode::NoFix), 0);
+        assert_eq!(fix_mode_to_i32(FixMode::Fix2D), 2);
+        assert_eq!(fix_mode_to_i32(FixMode::Fix3D), 3);
+    }
+
+    // --- BtDeviceState ------------------------------------------------
+
+    #[test]
+    fn bt_device_state_from_info_starts_in_discovered() {
+        let s = BtDeviceState::from_info(dummy_bt_info());
+        assert_eq!(s.state, "discovered");
+        assert!(s.profile_path.is_none());
+        assert_eq!(s.info.address, bssid());
+    }
+
+    // --- State / capabilities ----------------------------------------
+
+    #[test]
+    fn default_capabilities_includes_every_documented_axis() {
+        // The capability list is the API surface every UI consumes
+        // to decide which interfaces to render. A drift here breaks
+        // every operator app silently.
+        let caps = default_capabilities();
+        for required in [
+            "wifi.wpa2",
+            "wifi.wpa3",
+            "wifi.owe",
+            "eth.dot1x",
+            "gnss",
+            "bluetooth",
+        ] {
+            assert!(caps.iter().any(|c| c == required), "missing {required}");
+        }
+    }
+
+    #[test]
+    fn state_new_populates_version_and_defaults() {
+        let s = State::new("0.1.0-test");
+        assert_eq!(s.version, "0.1.0-test");
+        assert_eq!(s.master_key_source, "file");
+        assert_eq!(s.power_state, PowerState::Active);
+        assert!(!s.bluez_connected);
+        assert!(s.interfaces.is_empty());
+        assert!(s.wifi_profiles.is_empty());
+        assert!(s.ethernet_profiles.is_empty());
+        assert!(s.bluetooth_profiles.is_empty());
+        assert_eq!(s.api_capabilities, default_capabilities());
+    }
+}
