@@ -229,33 +229,41 @@ print_coverage_summary() {
 }
 
 # Run cargo test and print the test summary table.
+#
+# `--no-fail-fast` is on by default so a single failed binary doesn't
+# skip subsequent ones — without it cargo exits after the first
+# failed executable and hides downstream failures from the summary
+# table. Cargo's behaviour within a binary is unaffected (every test
+# in a binary runs regardless).
 run_tests() {
     local tmpfile exit_code=0
     tmpfile=$(mktemp)
-    echo "+ ${DOCKER_BASE[*]} cargo test $*"
-    "${DOCKER_BASE[@]}" cargo test "$@" 2>&1 | tee "$tmpfile" || exit_code=$?
+    echo "+ ${DOCKER_BASE[*]} cargo test --no-fail-fast $*"
+    "${DOCKER_BASE[@]}" cargo test --no-fail-fast "$@" 2>&1 | tee "$tmpfile" || exit_code=$?
     print_test_summary "$tmpfile"
     rm -f "$tmpfile"
     return "$exit_code"
 }
 
 # Run cargo llvm-cov --summary-only and print the test summary table.
+# `--no-fail-fast` is on by default for the same reason as run_tests.
 run_coverage_summary() {
     local tmpfile exit_code=0
     tmpfile=$(mktemp)
-    echo "+ ${DOCKER_BASE[*]} cargo llvm-cov --summary-only"
-    "${DOCKER_BASE[@]}" cargo llvm-cov --summary-only 2>&1 | tee "$tmpfile" || exit_code=$?
+    echo "+ ${DOCKER_BASE[*]} cargo llvm-cov --no-fail-fast --summary-only"
+    "${DOCKER_BASE[@]}" cargo llvm-cov --no-fail-fast --summary-only 2>&1 | tee "$tmpfile" || exit_code=$?
     print_test_summary "$tmpfile"
     rm -f "$tmpfile"
     return "$exit_code"
 }
 
 # Run cargo llvm-cov (full report) and print both the test and coverage tables.
+# `--no-fail-fast` is on by default for the same reason as run_tests.
 run_coverage() {
     local tmpfile exit_code=0
     tmpfile=$(mktemp)
-    echo "+ ${DOCKER_BASE[*]} cargo llvm-cov"
-    "${DOCKER_BASE[@]}" cargo llvm-cov 2>&1 | tee "$tmpfile" || exit_code=$?
+    echo "+ ${DOCKER_BASE[*]} cargo llvm-cov --no-fail-fast"
+    "${DOCKER_BASE[@]}" cargo llvm-cov --no-fail-fast 2>&1 | tee "$tmpfile" || exit_code=$?
     print_test_summary "$tmpfile"
     print_coverage_summary "$tmpfile"
     rm -f "$tmpfile"
