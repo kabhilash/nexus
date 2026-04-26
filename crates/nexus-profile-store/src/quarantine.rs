@@ -241,4 +241,100 @@ mod tests {
             "OperatorNotification{{kind:profile_corrupt}} must be emitted",
         );
     }
+
+    #[test]
+    fn quarantine_file_writes_correct_kind_label_for_each_profile_kind() {
+        // Ethernet/Gnss/Bluetooth tombstones must carry the right
+        // `kind = "..."` line; these are the strings every operator
+        // tool greps for, and they are the kind_label arms not
+        // exercised by the happy-path Wifi test.
+        for (kind, expected) in [
+            (ProfileKind::Ethernet, "ethernet"),
+            (ProfileKind::Gnss, "gnss"),
+            (ProfileKind::Bluetooth, "bluetooth"),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let sub = dir.path().join(expected);
+            fs::create_dir_all(&sub).unwrap();
+            let victim = sub.join("file.toml");
+            fs::write(&victim, b"x").unwrap();
+
+            let moved = quarantine_file(
+                dir.path(),
+                kind,
+                &victim,
+                "bad",
+                corrupt_reason::DECRYPT_FAIL,
+                None,
+            )
+            .unwrap();
+
+            let mut tombstone = moved.clone();
+            tombstone.set_extension(format!(
+                "{}.{}",
+                moved.extension().unwrap().to_string_lossy(),
+                TOMBSTONE_EXT,
+            ));
+            let body = fs::read_to_string(&tombstone).unwrap();
+            assert!(
+                body.contains(&format!("kind = \"{expected}\"")),
+                "{kind:?} tombstone missing kind label, got:\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_dir_creation_is_idempotent_across_calls() {
+        // Two consecutive quarantines: first creates the dir, the
+        // second hits the `if dir.exists() { return Ok }` early
+        // return in `create_quarantine_dir`.
+        let dir = TempDir::new().unwrap();
+        let wifi_dir = dir.path().join("wifi");
+        fs::create_dir_all(&wifi_dir).unwrap();
+
+        for n in 0..2 {
+            let victim = wifi_dir.join(format!("v{n}.toml"));
+            fs::write(&victim, b"x").unwrap();
+            quarantine_file(
+                dir.path(),
+                ProfileKind::Wifi,
+                &victim,
+                "bad",
+                corrupt_reason::DECRYPT_FAIL,
+                None,
+            )
+            .unwrap();
+        }
+
+        let entries: Vec<_> = fs::read_dir(dir.path().join(QUARANTINE_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        // Two payloads + two tombstones.
+        assert_eq!(entries.len(), 4, "got entries: {entries:?}");
+    }
+
+    #[test]
+    fn notify_master_key_degraded_emits_operator_notification_with_progress() {
+        let (tx, mut rx) = broadcast::channel(4);
+        notify_master_key_degraded(Some(&tx), "scrypt mismatch", 3, 7);
+
+        let event = rx.try_recv().expect("event");
+        match event {
+            NexusEvent::OperatorNotification { kind, data } => {
+                assert_eq!(kind, "master_key_degraded");
+                assert!(data.get("reason").is_some());
+                assert!(data.get("completed").is_some());
+                assert!(data.get("total").is_some());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_master_key_degraded_without_tx_is_silent() {
+        // Just exercises the `event_tx = None` branch; no panic
+        // means the early return path works.
+        notify_master_key_degraded(None, "no listener", 0, 0);
+    }
 }
