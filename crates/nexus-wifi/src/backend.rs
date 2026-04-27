@@ -119,6 +119,14 @@ pub struct WifiBackend {
     /// per `WifiConfig::signal_poll_interval`, not every tick.
     last_signal_poll: HashMap<u32, Instant>,
 
+    /// Last observed rfkill state per interface, fed by the
+    /// `/dev/rfkill` watcher via [`Self::on_rfkill`]. `false` means
+    /// rfkill is asserted (radio off). Absent means we have no
+    /// rfkill information for the interface yet — the heartbeat
+    /// signal-poll path treats absent as "assume powered" so the
+    /// pre-rfkill-watcher behaviour is unchanged.
+    interface_powered: HashMap<u32, bool>,
+
     /// Deadline at which each `Disconnected`-but-not-permanent
     /// interface transitions to `Idle` and re-scans (DD-003 §3.2
     /// / §6.4). Entries are inserted on the Disconnected transition
@@ -216,6 +224,7 @@ impl WifiBackend {
             config,
             supplicant_up: true,
             last_signal_poll: HashMap::new(),
+            interface_powered: HashMap::new(),
             disconnect_cooldowns: HashMap::new(),
             connect_started_at: HashMap::new(),
             last_power_state: PowerState::default(),
@@ -359,7 +368,7 @@ impl WifiBackend {
     /// the Interface Monitor hasn't enumerated yet) are dropped —
     /// the next event after the interface lands will reflect
     /// current state.
-    async fn on_rfkill(&self, state: RfkillState) {
+    async fn on_rfkill(&mut self, state: RfkillState) {
         let Some(ifindex) = self.ifindex_for_wiphy(&state.wiphy_name) else {
             tracing::debug!(
                 wiphy = %state.wiphy_name,
@@ -368,6 +377,15 @@ impl WifiBackend {
             );
             return;
         };
+        // Track per-interface powered state so the heartbeat
+        // signal-poll path can skip interfaces whose radio is off
+        // — wpa_supplicant's `SignalPoll` returns `Failed to read
+        // signal` while the radio is rfkilled, and there's a
+        // window between rfkill engaging and the supplicant
+        // emitting Disconnected during which the cached
+        // WifiState is still `Connected`. Without this, we hammer
+        // the supplicant at 1× signal_poll_interval.
+        self.interface_powered.insert(ifindex, state.powered);
         let _ = self.event_tx.send(NexusEvent::WifiRfkillChanged {
             ifindex,
             powered: state.powered,
@@ -403,6 +421,17 @@ impl WifiBackend {
             .iter()
             .filter_map(|(ifindex, entry)| {
                 if !matches!(entry.state, WifiState::Connected { .. }) {
+                    return None;
+                }
+                // Skip interfaces whose radio is rfkilled. The
+                // cached WifiState may still be `Connected`
+                // because wpa_supplicant hasn't emitted the
+                // matching Disconnected yet, but `SignalPoll`
+                // against a powered-off radio just returns
+                // `Failed to read signal` until association
+                // collapses. Absent rfkill info → assume powered
+                // (test harnesses, deployments without /dev/rfkill).
+                if matches!(self.interface_powered.get(ifindex), Some(false)) {
                     return None;
                 }
                 let last = self.last_signal_poll.get(ifindex).copied();
@@ -1011,6 +1040,7 @@ impl WifiBackend {
                 self.cache.clear(ifindex);
                 self.active_handle.remove(&ifindex);
                 self.last_signal_poll.remove(&ifindex);
+                self.interface_powered.remove(&ifindex);
                 self.disconnect_cooldowns.remove(&ifindex);
                 self.connect_started_at.remove(&ifindex);
                 self.dwell_since.remove(&ifindex);
@@ -1197,7 +1227,31 @@ impl WifiBackend {
 
             let after = match state {
                 SupplicantState::Scanning => {
-                    entry.state = WifiState::Scanning;
+                    // wpa_supplicant fires `State=scanning` for both
+                    // standalone pre-association scans AND background
+                    // scans done while still associated. DD-003 §3.1
+                    // has no `Connected → Scanning` edge — a
+                    // background scan keeps the link up at the kernel
+                    // level, so don't fold the cached state to
+                    // `Scanning` when we were already in a live
+                    // association. Same protection
+                    // `request_scan` already applies to backend-
+                    // initiated scans.
+                    //
+                    // Without this guard, the next `State=completed`
+                    // re-emit looks like a `not-Connected → Connected`
+                    // transition (`prev_connected` flipped to false
+                    // while we were folded to Scanning) and the
+                    // `After::LinkReady` path fans out — fresh
+                    // `WifiLinkReady` event, inflated connect-success
+                    // metrics, and a connectivity-probe re-run on
+                    // every roam-eval / signal-poll-driven scan.
+                    if !matches!(
+                        entry.state,
+                        WifiState::Connected { .. } | WifiState::Roaming { .. }
+                    ) {
+                        entry.state = WifiState::Scanning;
+                    }
                     After::None
                 }
                 SupplicantState::Associating | SupplicantState::Associated => {

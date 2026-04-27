@@ -321,6 +321,73 @@ async fn duplicate_supplicant_connected_does_not_re_emit_link_ready() {
     h.shutdown().await;
 }
 
+/// A wpa_supplicant background scan during an active association
+/// shows up as `State=scanning` followed by `State=completed` (with
+/// the same BSSID). The wifi backend must NOT fold the cached state
+/// to `WifiState::Scanning` — DD-003 §3.1 has no `Connected →
+/// Scanning` edge. Without the guard, the supplicant's
+/// post-scan `Connected` re-emit looks like a fresh
+/// `not-Connected → Connected` transition and fires a spurious
+/// `WifiLinkReady`, which fans out into the connectivity probe.
+#[tokio::test]
+async fn supplicant_scanning_during_association_does_not_re_emit_link_ready() {
+    use nexus_wifi::supplicant::SupplicantState;
+
+    let profile = wifi_profile(b"corp", "correcthorse", 10);
+    let mut h = Harness::start(vec![profile], WifiConfig::default()).await;
+    let bssid = MacAddr([0xAA; 6]);
+    let ssid = Ssid::new(b"corp".to_vec()).unwrap();
+
+    h.supplicant
+        .set_scan_results(2, vec![bss(bssid.0, b"corp", -45, SecurityMode::Wpa2Psk)]);
+    h.supplicant.set_connect_outcome(2, MockBehavior::Success);
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+
+    // Wait for the first LinkReady (the genuine connect).
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiLinkReady { ifindex: 2 }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Inject a background-scan transient: supplicant flips State to
+    // scanning briefly, then back to completed for the same BSSID.
+    let _ = h.sup_tx.send(SupplicantEvent::State {
+        ifindex: 2,
+        state: SupplicantState::Scanning,
+    });
+    let _ = h.sup_tx.send(SupplicantEvent::State {
+        ifindex: 2,
+        state: SupplicantState::Connected {
+            bssid,
+            ssid,
+            frequency: 5180,
+        },
+    });
+
+    // No second LinkReady should arrive within the window.
+    let deadline = Instant::now() + Duration::from_millis(300);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, h.event_rx.recv()).await {
+            Ok(Ok(NexusEvent::WifiLinkReady { ifindex: 2 })) => {
+                panic!(
+                    "background-scan transient (Scanning → Connected same BSSID) \
+                     re-emitted WifiLinkReady — Connected→Scanning fold is back"
+                );
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    h.shutdown().await;
+}
+
 /// DD-003 §6.3: a Fail(BadCredentials) outcome surfaces as a
 /// Disconnected { CredentialsInvalid } and does NOT transition to
 /// Connected.
