@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 
 use nexus_core::{
-    BssInfo, BtDeviceInfo, FixMode, GnssFix, InterfaceInfo, InterfaceKind, MacAddr, SatInfo,
-    WifiState,
+    BssInfo, BtDeviceInfo, ConnectivityState, FixMode, GnssFix, InterfaceInfo, InterfaceKind,
+    MacAddr, SatInfo, WifiState,
 };
 use nexus_profile_store::{BluetoothProfile, EthernetProfile, WifiProfile};
 
@@ -265,6 +265,11 @@ pub struct State {
     pub power_state: PowerState,
     pub master_key_source: String,
     pub bluez_connected: bool,
+    /// Last observed internet-reachability state, fed by the
+    /// daemon's connectivity probe via
+    /// `NexusEvent::InternetConnectivityChanged`. `Unknown` until the
+    /// first probe completes.
+    pub internet_connectivity: ConnectivityState,
 
     /// Keyed by interface ifname — the escaped form is derived via
     /// [`crate::paths::escape_component`].

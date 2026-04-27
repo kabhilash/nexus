@@ -16,6 +16,7 @@
 pub mod bt_ops;
 pub mod bus;
 pub mod config;
+pub mod connectivity;
 pub mod preflight;
 pub mod reload;
 pub mod supervision;
@@ -24,9 +25,11 @@ pub mod wifi_ops;
 pub use bt_ops::BtBackendOps;
 pub use bus::spawn_bus;
 pub use config::{
-    BluetoothSection, Config, ConfigError, DbusSection, EthernetSection, GnssDefaultsSection,
-    GnssSection, InterfaceMonitorSection, ProfileStoreSection, SupervisionSection, WifiSection,
+    BluetoothSection, Config, ConfigError, ConnectivitySection, DbusSection, EthernetSection,
+    GnssDefaultsSection, GnssSection, InterfaceMonitorSection, ProfileStoreSection,
+    SupervisionSection, WifiSection,
 };
+pub use connectivity::{ConnectivityConfig, run_connectivity};
 pub use reload::{LogLevelSetter, ReloadCoordinator, ReloadError, ReloadOps, diff_config};
 pub use supervision::{SubsystemName, SupervisionError, spawn_supervised};
 pub use wifi_ops::WifiBackendOps;

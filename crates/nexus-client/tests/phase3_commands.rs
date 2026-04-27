@@ -51,6 +51,7 @@ impl ManagerOps for Stub {
             master_key_source: "file".into(),
             bluez_available: false,
             gpsd_available: false,
+            internet_connectivity: String::new(),
         })
     }
     async fn list_interfaces(&self) -> Result<Vec<InterfaceSummary>, NexusctlError> {

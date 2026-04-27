@@ -120,6 +120,23 @@ impl Manager {
         self.services.state.read().await.master_key_source.clone()
     }
 
+    /// Last observed internet-reachability state. One of
+    /// `internetUnknown` (pre-probe), `internetOnline`,
+    /// `internetCaptivePortal`, `internetOffline`. Mirrors the most
+    /// recent `InternetConnectivityChanged` signal (which is emitted
+    /// directly from the service event loop — see the comment at the
+    /// bottom of this impl).
+    #[zbus(property, name = "InternetConnectivity")]
+    async fn internet_connectivity(&self) -> String {
+        self.services
+            .state
+            .read()
+            .await
+            .internet_connectivity
+            .as_str()
+            .to_owned()
+    }
+
     // -----------------------------------------------------------------
     // Read-only lookup methods — DD-006 §5.2
     // -----------------------------------------------------------------
@@ -198,6 +215,13 @@ impl Manager {
             "MasterKeySource".into(),
             OwnedValue::try_from(Value::new(guard.master_key_source.clone()))
                 .map_err(|e| DbusError::InvalidArgument(e.to_string()))?,
+        );
+        out.insert(
+            "InternetConnectivity".into(),
+            OwnedValue::try_from(Value::new(
+                guard.internet_connectivity.as_str().to_owned(),
+            ))
+            .map_err(|e| DbusError::InvalidArgument(e.to_string()))?,
         );
         Ok(out)
     }
@@ -554,6 +578,14 @@ impl Manager {
         job_id: &str,
         report: HashMap<String, OwnedValue>,
     ) -> zbus::Result<()>;
+
+    // `InternetConnectivityChanged(state: s)` is emitted via
+    // `connection.emit_signal` from the service event loop (see
+    // `service::emit_manager_internet_connectivity_changed`). It is
+    // NOT declared with `#[zbus(signal)]` here because zbus
+    // auto-generates an `internet_connectivity_changed`
+    // PropertiesChanged emitter from the `InternetConnectivity`
+    // property above, and the names collide.
 }
 
 impl Manager {

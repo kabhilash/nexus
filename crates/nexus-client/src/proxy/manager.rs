@@ -31,6 +31,12 @@ pub trait Manager {
     #[zbus(property, name = "MasterKeySource")]
     fn master_key_source(&self) -> zbus::Result<String>;
 
+    /// Last observed internet-reachability state from the daemon's
+    /// connectivity probe. One of `internetUnknown`, `internetOnline`,
+    /// `internetCaptivePortal`, `internetOffline`.
+    #[zbus(property, name = "InternetConnectivity")]
+    fn internet_connectivity(&self) -> zbus::Result<String>;
+
     /// `GetInterface(ifname: s) -> (path: o)`. Returns
     /// `fi.nexus.Error.NotFound` on an unknown name.
     #[zbus(name = "GetInterface")]

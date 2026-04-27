@@ -10,6 +10,7 @@ you need into your `nexus.toml`.
 | `wifi.conf`       | Enables the Wi-Fi subsystem with wpa_supplicant (the default backend).  |
 | `bluetooth.conf`  | Enables the Bluetooth subsystem (talks to BlueZ over the system bus).   |
 | `gnss.conf`       | Enables the GNSS subsystem (reads from a local gpsd on `127.0.0.1:2947`).|
+| `connectivity.conf` | Tunes the internet-connectivity probe (URL, interval, timeout).         |
 | `dev-session.conf`| Flips the daemon onto the session bus with PolicyKit disabled; for developer VMs. |
 
 Full field reference: [`docs/configuration.md`](../../docs/configuration.md).

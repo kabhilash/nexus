@@ -43,6 +43,7 @@ pub enum SubsystemName {
     Bluetooth,
     Gnss,
     Dbus,
+    Connectivity,
 }
 
 impl SubsystemName {
@@ -54,6 +55,7 @@ impl SubsystemName {
             SubsystemName::Bluetooth => "bluetooth",
             SubsystemName::Gnss => "gnss",
             SubsystemName::Dbus => "dbus",
+            SubsystemName::Connectivity => "connectivity",
         }
     }
 }
@@ -305,5 +307,6 @@ mod tests {
             "interface_monitor"
         );
         assert_eq!(SubsystemName::Dbus.as_str(), "dbus");
+        assert_eq!(SubsystemName::Connectivity.as_str(), "connectivity");
     }
 }

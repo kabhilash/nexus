@@ -21,9 +21,9 @@ use anyhow::{Context, Result, anyhow};
 use nexus_bluetooth::{BluetoothConfig, MockBluezClient, ZbusBluezClient};
 use nexus_core::NexusEvent;
 use nexus_daemon::{
-    BtBackendOps, Config, LogLevelSetter, ReloadCoordinator, ReloadOps, SubsystemName,
-    WifiBackendOps, preflight,
-    spawn_bus, spawn_supervised,
+    BtBackendOps, Config, ConnectivityConfig, LogLevelSetter, ReloadCoordinator, ReloadOps,
+    SubsystemName, WifiBackendOps, preflight,
+    run_connectivity, spawn_bus, spawn_supervised,
 };
 use nexus_dbus::{
     BackendOps, DbusConfig, EnabledFeatures, NoopOps, PolicyKitChecker, RateLimits, always_allow,
@@ -649,6 +649,31 @@ async fn spawn_all(
         ));
     } else {
         info!("gnss disabled — skipping");
+    }
+
+    if config.connectivity.enabled {
+        let cn_cfg = ConnectivityConfig {
+            url: config.connectivity.url.clone(),
+            interval: config.connectivity.interval,
+            timeout: config.connectivity.timeout,
+        };
+        let ev = event_tx.clone();
+        out.push((
+            SubsystemName::Connectivity,
+            spawn_supervised(
+                SubsystemName::Connectivity,
+                config.supervision.clone(),
+                event_tx.clone(),
+                shutdown.clone(),
+                move |cancel| {
+                    let cn_cfg = cn_cfg.clone();
+                    let ev = ev.clone();
+                    async move { run_connectivity(cn_cfg, ev, cancel).await }
+                },
+            ),
+        ));
+    } else {
+        info!("connectivity disabled — skipping");
     }
 
     if config.dbus.enabled {

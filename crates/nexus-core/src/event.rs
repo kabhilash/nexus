@@ -247,6 +247,18 @@ pub enum NexusEvent {
         total: u32,
     },
 
+    // --- Connectivity probe ---
+    /// Internet-reachability state changed. Emitted by the
+    /// connectivity probe (an HTTP/1.1 GET against a generate-204
+    /// style endpoint; default `http://connectivity-check.ubuntu.com/`).
+    /// The D-Bus layer mirrors this on
+    /// `fi.nexus.Manager.InternetConnectivity` (read-only property)
+    /// and `fi.nexus.Manager.InternetConnectivityChanged` (signal).
+    /// Only fires on transitions, not on every successful probe.
+    InternetConnectivityChanged {
+        state: ConnectivityState,
+    },
+
     // --- Any backend to the D-Bus layer ---
     /// Operator-facing notification. Translates to
     /// `fi.nexus.Manager.NotificationEvent` (DD-006 §5.3).
@@ -254,6 +266,44 @@ pub enum NexusEvent {
         kind: String,
         data: NotificationData,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Connectivity payload type
+// ---------------------------------------------------------------------------
+
+/// Outcome of an internet-reachability probe. Maps 1:1 onto the
+/// `fi.nexus.Manager.Connectivity` D-Bus state strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ConnectivityState {
+    /// Pre-probe initial state. Surfaced once at startup before the
+    /// first probe completes; never re-entered after the first
+    /// transition.
+    #[default]
+    Unknown,
+    /// The probe URL returned the expected `204 No Content`.
+    Online,
+    /// The probe URL responded but with a different status (typically
+    /// `200` with an HTML login page, or a `3xx` redirect to one) —
+    /// strong evidence of a captive portal in the path.
+    CaptivePortal,
+    /// DNS failure, connection refused, timeout, or any other
+    /// transport-level failure.
+    Offline,
+}
+
+impl ConnectivityState {
+    /// Wire string consumed by `fi.nexus.Manager.Connectivity` and
+    /// `fi.nexus.Manager.ConnectivityChanged`. Matches the values
+    /// documented in the integration knowledge graph.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnectivityState::Online => "internetOnline",
+            ConnectivityState::CaptivePortal => "internetCaptivePortal",
+            ConnectivityState::Offline => "internetOffline",
+            ConnectivityState::Unknown => "internetUnknown",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

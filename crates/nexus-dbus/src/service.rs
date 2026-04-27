@@ -687,6 +687,24 @@ async fn handle_event(
             debug!(kind, data_len = data.len(), "operator notification");
             emit_manager_notification_event(connection, &kind, &data).await;
         }
+        NexusEvent::InternetConnectivityChanged { state: next } => {
+            let prev = {
+                let mut guard = state.write().await;
+                let prev = guard.internet_connectivity;
+                guard.internet_connectivity = next;
+                prev
+            };
+            // Defensive: the probe already de-dupes, but a probe
+            // restart or a stray event shouldn't double-emit.
+            if prev != next {
+                debug!(
+                    from = prev.as_str(),
+                    to = next.as_str(),
+                    "internet connectivity transition"
+                );
+                emit_manager_internet_connectivity_changed(connection, next.as_str()).await;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -1102,6 +1120,26 @@ async fn emit_manager_notification_event(
         .await
     {
         tracing::debug!(error = ?e, kind, "Manager.NotificationEvent emit failed");
+    }
+}
+
+/// Emit `fi.nexus.Manager.InternetConnectivityChanged(state: s)`.
+/// Best-effort — a failure to emit is logged at debug.
+async fn emit_manager_internet_connectivity_changed(connection: &zbus::Connection, state: &str) {
+    let Ok(manager_path) = ObjectPath::try_from(MANAGER_PATH) else {
+        return;
+    };
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            manager_path,
+            "fi.nexus.Manager",
+            "InternetConnectivityChanged",
+            &(state,),
+        )
+        .await
+    {
+        tracing::debug!(error = ?e, state, "Manager.InternetConnectivityChanged emit failed");
     }
 }
 

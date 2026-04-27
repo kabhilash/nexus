@@ -1011,6 +1011,7 @@ pub(crate) fn decode_manager_status(
         master_key_source: s("MasterKeySource"),
         bluez_available: false,
         gpsd_available: false,
+        internet_connectivity: s("InternetConnectivity"),
     }
 }
 

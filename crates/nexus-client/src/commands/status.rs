@@ -56,6 +56,7 @@ mod tests {
                 master_key_source: "file".into(),
                 bluez_available: true,
                 gpsd_available: false,
+                internet_connectivity: "internetOnline".into(),
             })
         }
         async fn list_interfaces(&self) -> Result<Vec<InterfaceSummary>, NexusctlError> {
@@ -94,5 +95,7 @@ mod tests {
         assert!(s.contains("Version:"));
         assert!(s.contains("Power state:"));
         assert!(s.contains("Master key:"));
+        assert!(s.contains("Internet:"));
+        assert!(s.contains("online"));
     }
 }

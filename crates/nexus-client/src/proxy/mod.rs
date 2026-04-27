@@ -60,6 +60,12 @@ pub struct ManagerStatus {
     /// `true` when at least one GNSS interface's `GpsdConnected`
     /// property is true.
     pub gpsd_available: bool,
+    /// `fi.nexus.Manager.InternetConnectivity` — last observed
+    /// internet-reachability probe outcome. One of `internetUnknown`
+    /// (pre-probe), `internetOnline`, `internetCaptivePortal`,
+    /// `internetOffline`. Empty string when the daemon predates the
+    /// connectivity probe (older nexusd).
+    pub internet_connectivity: String,
 }
 
 /// One row in `nexusctl iface list` (and the technology-scoped

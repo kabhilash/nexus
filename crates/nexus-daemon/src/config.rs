@@ -64,6 +64,8 @@ pub struct Config {
     pub bluetooth: BluetoothSection,
     #[serde(rename = "gnss")]
     pub gnss: GnssSection,
+    #[serde(rename = "connectivity")]
+    pub connectivity: ConnectivitySection,
 }
 
 impl Default for Config {
@@ -79,6 +81,7 @@ impl Default for Config {
             wifi: WifiSection::default(),
             bluetooth: BluetoothSection::default(),
             gnss: GnssSection::default(),
+            connectivity: ConnectivitySection::default(),
         }
     }
 }
@@ -132,6 +135,9 @@ impl Config {
         }
         if self.gnss.enabled {
             out.push(S::Gnss);
+        }
+        if self.connectivity.enabled {
+            out.push(S::Connectivity);
         }
         if self.dbus.enabled {
             out.push(S::Dbus);
@@ -465,6 +471,37 @@ impl Default for GnssDefaultsSection {
 }
 
 // ---------------------------------------------------------------------------
+// Section: connectivity
+// ---------------------------------------------------------------------------
+
+/// Internet-connectivity probe — periodic HTTP GET against a
+/// `generate_204` style endpoint. See `crates/nexus-daemon/src/connectivity.rs`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConnectivitySection {
+    pub enabled: bool,
+    /// Probe URL. Plain `http://` only — see the module docs for why.
+    pub url: String,
+    /// How often the timer-driven probe fires.
+    #[serde(with = "duration_secs_f")]
+    pub interval: Duration,
+    /// Total budget for one probe (DNS + connect + write + read).
+    #[serde(with = "duration_secs_f")]
+    pub timeout: Duration,
+}
+
+impl Default for ConnectivitySection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: "http://connectivity-check.ubuntu.com/".to_owned(),
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Serde helpers
 // ---------------------------------------------------------------------------
 
@@ -504,6 +541,26 @@ mod tests {
         assert!(cfg.wifi.enabled);
         assert!(cfg.bluetooth.enabled);
         assert!(!cfg.gnss.enabled);
+        assert!(cfg.connectivity.enabled);
+        assert_eq!(cfg.connectivity.url, "http://connectivity-check.ubuntu.com/");
+        assert_eq!(cfg.connectivity.interval, Duration::from_secs(30));
+        assert_eq!(cfg.connectivity.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn connectivity_section_overrides_apply() {
+        let text = r#"
+            [connectivity]
+            enabled = false
+            url = "http://www.gstatic.com/generate_204"
+            interval = 90.0
+            timeout = 2.5
+        "#;
+        let cfg = Config::parse_str(text).unwrap();
+        assert!(!cfg.connectivity.enabled);
+        assert_eq!(cfg.connectivity.url, "http://www.gstatic.com/generate_204");
+        assert_eq!(cfg.connectivity.interval, Duration::from_secs(90));
+        assert_eq!(cfg.connectivity.timeout, Duration::from_millis(2500));
     }
 
     #[test]

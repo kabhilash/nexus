@@ -37,6 +37,20 @@ impl Render for ManagerStatus {
     }
 }
 
+/// Translate the camelCase wire-state strings into a short
+/// human-friendly label. Keep the wire string visible when we don't
+/// recognise it (forward-compat with daemons newer than this client).
+fn format_connectivity(state: &str) -> String {
+    match state {
+        "" => "unavailable (older daemon)".to_owned(),
+        "internetUnknown" => "unknown (probe not yet run)".to_owned(),
+        "internetOnline" => "online".to_owned(),
+        "internetCaptivePortal" => "captive portal".to_owned(),
+        "internetOffline" => "offline".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 fn render_status_block(status: &ManagerStatus, w: &mut dyn Write) -> io::Result<()> {
     let key_w = "Capabilities:".len();
     writeln!(w, "{:<key_w$} {}", "Version:", status.version)?;
@@ -80,6 +94,12 @@ fn render_status_block(status: &ManagerStatus, w: &mut dyn Write) -> io::Result<
         }
     )?;
     writeln!(w, "{:<key_w$} {}", "Master key:", status.master_key_source)?;
+    writeln!(
+        w,
+        "{:<key_w$} {}",
+        "Internet:",
+        format_connectivity(&status.internet_connectivity)
+    )?;
     if !status.api_capabilities.is_empty() {
         writeln!(
             w,

@@ -47,6 +47,7 @@ fn fixture() -> Arc<Fixture> {
             master_key_source: "file".into(),
             bluez_available: true,
             gpsd_available: true,
+            internet_connectivity: "internetOnline".into(),
         },
         rows: vec![
             InterfaceSummary {
@@ -220,6 +221,7 @@ async fn snapshot_status_human() {
     BlueZ:        reachable
     gpsd:         reachable
     Master key:   file
+    Internet:     online
     Capabilities: events, properties
     ");
 }
@@ -251,7 +253,8 @@ async fn snapshot_status_json() {
       "bluetooth_profile_count": 0,
       "master_key_source": "file",
       "bluez_available": true,
-      "gpsd_available": true
+      "gpsd_available": true,
+      "internet_connectivity": "internetOnline"
     }
     "#);
 }
