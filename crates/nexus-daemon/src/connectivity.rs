@@ -198,18 +198,24 @@ impl LinkKind {
 /// Run the connectivity probe loop. Returns `Ok(())` only on
 /// `cancel.cancelled()`. Returns `Err` if the URL is malformed
 /// (caught at startup) — the supervised wrapper logs and stops.
+///
+/// `event_rx` must be subscribed *before* the Wi-Fi / Ethernet
+/// backends spawn so the initial `LinkReady` events the backends emit
+/// during their startup evaluation are not missed (`broadcast::Sender::subscribe`
+/// after the fact returns a receiver that only sees messages from
+/// then on). The daemon's `main.rs` follows the same pattern as the
+/// D-Bus arm and pre-subscribes at daemon scope.
 pub async fn run_connectivity(
     cfg: ConnectivityConfig,
     event_tx: broadcast::Sender<NexusEvent>,
+    mut event_rx: broadcast::Receiver<NexusEvent>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let url = parse_http_url(&cfg.url)?;
-    let mut event_rx = event_tx.subscribe();
-    let mut last = ConnectivityState::Unknown;
     let mut tick = tokio::time::interval(cfg.interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // The first `tick.tick()` resolves immediately; we don't want to
-    // probe at t=0 (no link is ready yet), so consume that one.
+    // The first `tick.tick()` resolves immediately; the initial probe
+    // below covers the t=0 reading, so consume that tick.
     tick.tick().await;
 
     // Set of (ifindex → kind) for currently link-ready interfaces.
@@ -225,6 +231,17 @@ pub async fn run_connectivity(
         timeout_s = cfg.timeout.as_secs(),
         "connectivity probe starting"
     );
+
+    // Initial probe so the state reflects actual reachability from
+    // t=0 rather than sitting at `Unknown`. This matters when nexusd
+    // restarts on a host where Wi-Fi / Ethernet were already
+    // connected — backends will still emit `LinkReady` as they
+    // evaluate, but the probe gives an authoritative answer
+    // immediately rather than waiting for the next backend tick.
+    let initial = probe_once(&url, cfg.timeout).await;
+    info!(state = initial.as_str(), "connectivity: initial state");
+    let _ = event_tx.send(NexusEvent::InternetConnectivityChanged { state: initial });
+    let mut last = initial;
 
     loop {
         // Drive the periodic timer only while we have a link to probe

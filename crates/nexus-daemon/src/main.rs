@@ -394,6 +394,16 @@ async fn spawn_all(
     let (monitor_cmd_tx, monitor_cmd_rx) = nexus_interface_monitor::command_channel();
     let monitor_cmd_rx_slot = Arc::new(tokio::sync::Mutex::new(Some(monitor_cmd_rx)));
 
+    // Pre-subscribe the connectivity arm to the bus *before* any
+    // event-producing subsystem starts. `broadcast::Sender::subscribe`
+    // only sees messages emitted after the call, so subscribing
+    // inside the supervised closure (which runs after wifi / ethernet
+    // backends have already started) would lose every initial
+    // `LinkReady` the backends emit while evaluating their startup
+    // state. Same `Arc<Mutex<Option<_>>>` trick the dbus arm uses.
+    let connectivity_event_rx = event_tx.subscribe();
+    let connectivity_event_rx = Arc::new(tokio::sync::Mutex::new(Some(connectivity_event_rx)));
+
     if config.interface_monitor.enabled {
         let ev = event_tx.clone();
         let monitor_cmd_rx_slot = Arc::clone(&monitor_cmd_rx_slot);
@@ -658,6 +668,7 @@ async fn spawn_all(
             timeout: config.connectivity.timeout,
         };
         let ev = event_tx.clone();
+        let rx_slot = Arc::clone(&connectivity_event_rx);
         out.push((
             SubsystemName::Connectivity,
             spawn_supervised(
@@ -668,7 +679,26 @@ async fn spawn_all(
                 move |cancel| {
                     let cn_cfg = cn_cfg.clone();
                     let ev = ev.clone();
-                    async move { run_connectivity(cn_cfg, ev, cancel).await }
+                    let rx_slot = Arc::clone(&rx_slot);
+                    async move {
+                        // The receiver is !Clone. On the first (and
+                        // typically only) attempt we take it; if the
+                        // supervisor restarts the connectivity task
+                        // after a crash, it falls back to subscribing
+                        // late and may miss initial-state events —
+                        // matches the wifi / monitor pattern.
+                        let rx = match rx_slot.lock().await.take() {
+                            Some(rx) => rx,
+                            None => {
+                                tracing::warn!(
+                                    "connectivity: pre-subscribed receiver already consumed; \
+                                     subscribing late (initial-state events may be missed)"
+                                );
+                                ev.subscribe()
+                            }
+                        };
+                        run_connectivity(cn_cfg, ev, rx, cancel).await
+                    }
                 },
             ),
         ));
