@@ -1,6 +1,15 @@
 # Wi-Fi Backend Audit — Remaining Findings
 
-Scope: code under `crates/nexus-wifi/` audited against `dd-003-wifi-backend.md` on 2026-04-24, refreshed after the C/K/S/§14.1 passes.
+Scope: code under `crates/nexus-wifi/` audited against `dd-003-wifi-backend.md` on 2026-04-24, refreshed after the C/K/S/§14.1 passes and again on 2026-04-27 after the rfkill-state-machine deep review.
+
+**Closed in 2026-04-27 deep review** (delivered across `nexus-core` 0.7.0→0.8.0 / `nexus-wifi` 0.16.2→0.17.0):
+
+- Rfkill is now a first-class state-machine input. `on_rfkill(false)` and `operator_set_powered(false)` drive the interface to `WifiState::Disconnected{RfKilled}`, clear `dwell_since` / `connect_started_at` / `active_handle` / cooldowns / `scan_in_flight`, and emit `WifiLinkLost` if the prior state was associated. Idempotent: the kernel `RFKILL_OP_CHANGE` event that follows a successful operator write hits the same helper as a no-op.
+- `DisconnectReason::RfKilled` is now `is_permanent()` so the cooldown sweep cannot promote it back to Idle. The radio-on edge (`apply_radio_on`) does that explicitly: folds `RfKilled` to `Idle` and calls `sched.fire_now(...)` so the auto-select path resumes immediately.
+- Every entry point that needs a live radio is gated by a `radio_off` check: `request_scan`, `operator_connect`, `try_connect`, `operator_roam`, `dispatch_roam`. `operator_connect` returns `WifiError::Rfkill` rather than transitioning to `Connecting{...}` (which the driver-wedge detector would later misclassify).
+- `fire_scheduled_scans` and `earliest_scan_deadline` skip rfkilled radios so the run-loop's `select!` arm doesn't tight-loop on a stale scheduler deadline that `request_scan` would only refuse.
+- A late-arriving wpa_supplicant `Disconnected{LocalRequest|other}` while the radio is rfkilled is now consumed without touching state — the rfkill path is the source of truth for that window, so the authoritative `reason='rf_killed'` survives on the wire instead of being overwritten by a generic `cancelled`/`other`.
+- New backend tests in `tests/backend_tests.rs`: `rfkill_off_transitions_connected_to_disconnected_rfkilled`, `rfkill_off_preserves_reason_against_late_supplicant_disconnect`, `rfkill_on_resumes_idle_and_kicks_scan_scheduler`, `operator_connect_during_rfkill_returns_rfkill_error_without_state_change`. Backend now exposes a test-only `spawn_wifi_backend_with_test_rfkill_rx` (and `WifiBackend::with_rfkill_rx`) so integration tests can drive the rfkill watcher without a real `/dev/rfkill`.
 
 **Closed since the last refresh** (delivered across `nexus-wifi` 0.13.0 / `nexus-interface-monitor` 0.2.0 / `nexus-core` 0.3.0 / `nexus-dbus` 0.5.0 / `nexus-daemon` 0.10.1):
 

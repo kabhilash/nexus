@@ -453,8 +453,15 @@ pub enum DisconnectReason {
 impl DisconnectReason {
     /// True when the reason keeps the interface in `Disconnected`
     /// until operator intervention rather than cooling down to `Idle`.
+    /// `RfKilled` belongs here because the only way out is an
+    /// explicit `Powered=true` (soft-rfkill release) or a hardware
+    /// switch flip — there's no transient retry that could recover
+    /// from a powered-off radio.
     pub fn is_permanent(&self) -> bool {
-        matches!(self, DisconnectReason::CredentialsInvalid)
+        matches!(
+            self,
+            DisconnectReason::CredentialsInvalid | DisconnectReason::RfKilled
+        )
     }
 }
 

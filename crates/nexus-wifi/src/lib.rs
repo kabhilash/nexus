@@ -247,3 +247,46 @@ pub fn spawn_wifi_backend(
 pub(crate) fn secretstring(value: &str) -> nexus_profile_store::SecretString {
     nexus_profile_store::SecretString::from(value)
 }
+
+/// Variant of [`spawn_wifi_backend`] for integration tests that need
+/// to drive `/dev/rfkill` edges without opening the real device.
+/// Skips the rfkill watcher; the caller-supplied receiver feeds
+/// straight into [`WifiBackend::with_rfkill_rx`]. The writer side is
+/// left unset, so `operator_set_powered` returns
+/// [`WifiError::Rfkill`](error::WifiError::Rfkill) — tests for that
+/// path go through deployments with a real `/dev/rfkill`.
+#[doc(hidden)]
+pub fn spawn_wifi_backend_with_test_rfkill_rx(
+    event_tx: broadcast::Sender<NexusEvent>,
+    supplicant_tx: broadcast::Sender<SupplicantEvent>,
+    supplicant: Box<dyn WifiSupplicantBackend>,
+    profile_store: Arc<dyn ProfileStore>,
+    config: WifiConfig,
+    commands: mpsc::Receiver<WifiCommand>,
+    monitor_commands: Option<mpsc::Sender<nexus_interface_monitor::MonitorCommand>>,
+    rfkill_rx: mpsc::Receiver<rfkill::RfkillState>,
+) -> WifiBackendHandle {
+    metrics::register();
+    let shutdown = CancellationToken::new();
+
+    let mut backend = WifiBackend::new(
+        event_tx,
+        supplicant_tx,
+        supplicant,
+        profile_store,
+        config,
+        commands,
+    )
+    .with_rfkill_rx(rfkill_rx);
+    if let Some(tx) = monitor_commands {
+        backend = backend.with_monitor_commands(tx);
+    }
+    let power = backend.power_handle();
+    let shutdown_child = shutdown.clone();
+    let join = tokio::spawn(async move { backend.run(shutdown_child).await });
+    WifiBackendHandle {
+        join,
+        shutdown,
+        power,
+    }
+}

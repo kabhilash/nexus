@@ -262,6 +262,17 @@ impl WifiBackend {
         self
     }
 
+    /// Wire only the read-side of `/dev/rfkill`. Used by integration
+    /// tests that want to drive `on_rfkill` (and the backend's
+    /// state-machine response) without opening the real device or
+    /// providing a write-capable [`RfkillWriter`]. The write path is
+    /// tested separately via `operator_set_powered` in deployments
+    /// where the watcher actually opens `/dev/rfkill`.
+    pub fn with_rfkill_rx(mut self, rx: tokio::sync::mpsc::Receiver<RfkillState>) -> Self {
+        self.rfkill_rx = Some(rx);
+        self
+    }
+
     /// Handle the caller's `Arc<RwLock<PowerState>>` so external
     /// power-management code (e.g., D-Bus SetPowerState) can
     /// mutate it without a dedicated channel.
@@ -363,11 +374,11 @@ impl WifiBackend {
     }
 
     /// Map an rfkill edge from the watcher to a
-    /// `NexusEvent::WifiRfkillChanged`. Events for wiphys that
-    /// aren't in the interface registry (e.g. a USB dongle that
-    /// the Interface Monitor hasn't enumerated yet) are dropped —
-    /// the next event after the interface lands will reflect
-    /// current state.
+    /// `NexusEvent::WifiRfkillChanged` and drive the corresponding
+    /// state-machine transition. Events for wiphys that aren't in
+    /// the interface registry (e.g. a USB dongle that the Interface
+    /// Monitor hasn't enumerated yet) are dropped — the next event
+    /// after the interface lands will reflect current state.
     async fn on_rfkill(&mut self, state: RfkillState) {
         let Some(ifindex) = self.ifindex_for_wiphy(&state.wiphy_name) else {
             tracing::debug!(
@@ -377,19 +388,97 @@ impl WifiBackend {
             );
             return;
         };
-        // Track per-interface powered state so the heartbeat
-        // signal-poll path can skip interfaces whose radio is off
-        // — wpa_supplicant's `SignalPoll` returns `Failed to read
-        // signal` while the radio is rfkilled, and there's a
-        // window between rfkill engaging and the supplicant
-        // emitting Disconnected during which the cached
-        // WifiState is still `Connected`. Without this, we hammer
-        // the supplicant at 1× signal_poll_interval.
-        self.interface_powered.insert(ifindex, state.powered);
         let _ = self.event_tx.send(NexusEvent::WifiRfkillChanged {
             ifindex,
             powered: state.powered,
         });
+        if state.powered {
+            self.apply_radio_on(ifindex);
+        } else {
+            self.apply_radio_off(ifindex);
+        }
+    }
+
+    /// Drive the state machine to `Disconnected{RfKilled}` and
+    /// release every per-interface bookkeeping slot that only makes
+    /// sense while the radio is active. Idempotent — a re-entry
+    /// while already `Disconnected{RfKilled}` is a no-op.
+    ///
+    /// Called from both `on_rfkill(false)` (kernel CHANGE event from
+    /// `/dev/rfkill`) and `operator_set_powered(false)` (D-Bus
+    /// SetPowered after a successful rfkill write). The kernel
+    /// CHANGE event that follows a successful operator write hits
+    /// here too; the second call is the no-op.
+    fn apply_radio_off(&mut self, ifindex: u32) {
+        self.interface_powered.insert(ifindex, false);
+        let already_rf_killed = matches!(
+            self.interfaces.get(&ifindex).map(|e| &e.state),
+            Some(WifiState::Disconnected {
+                reason: DisconnectReason::RfKilled
+            })
+        );
+        if already_rf_killed {
+            return;
+        }
+        let was_associated = matches!(
+            self.interfaces.get(&ifindex).map(|e| &e.state),
+            Some(WifiState::Connected { .. } | WifiState::Roaming { .. })
+        );
+        if let Some(entry) = self.interfaces.get_mut(&ifindex) {
+            entry.state = WifiState::Disconnected {
+                reason: DisconnectReason::RfKilled,
+            };
+        } else {
+            return;
+        }
+        // Release every slot whose semantics depend on a live radio.
+        // RfKilled is permanent (DD-003 §3.2 / `is_permanent()`), so
+        // we deliberately do NOT arm a disconnect cooldown — the
+        // only way out is a `Powered=true` edge, handled by
+        // `apply_radio_on`.
+        self.dwell_since.remove(&ifindex);
+        self.connect_started_at.remove(&ifindex);
+        self.active_handle.remove(&ifindex);
+        self.disconnect_cooldowns.remove(&ifindex);
+        self.roam_in_flight.remove(&ifindex);
+        self.scan_in_flight.remove(&ifindex);
+        self.last_signal_poll.remove(&ifindex);
+        if was_associated {
+            self.emit_link_lost(ifindex, m::link_lost_reason::RFKILL);
+        }
+        self.emit_state(ifindex);
+    }
+
+    /// Promote `Disconnected{RfKilled}` back to `Idle` and kick the
+    /// scheduler so the normal scan + auto-select path runs. Other
+    /// states are left alone — a `Powered=true` while we were
+    /// `Disconnected{Other}` doesn't change anything (we'll cool
+    /// down to Idle on the normal cooldown sweep).
+    fn apply_radio_on(&mut self, ifindex: u32) {
+        self.interface_powered.insert(ifindex, true);
+        let was_rf_killed = matches!(
+            self.interfaces.get(&ifindex).map(|e| &e.state),
+            Some(WifiState::Disconnected {
+                reason: DisconnectReason::RfKilled
+            })
+        );
+        if !was_rf_killed {
+            return;
+        }
+        if let Some(entry) = self.interfaces.get_mut(&ifindex) {
+            entry.state = WifiState::Idle;
+        }
+        self.emit_state(ifindex);
+        if let Some(sched) = self.schedulers.get_mut(&ifindex) {
+            sched.fire_now(Instant::now());
+        }
+    }
+
+    /// True when we have positive evidence the interface's radio is
+    /// off (rfkill asserted). Absent rfkill info → assume powered.
+    /// Used to gate every operation that requires a live radio.
+    fn radio_off(&self, ifindex: u32) -> bool {
+        matches!(self.interface_powered.get(&ifindex), Some(false))
     }
 
     fn ifindex_for_wiphy(&self, wiphy_name: &str) -> Option<u32> {
@@ -802,6 +891,14 @@ impl WifiBackend {
     /// to [`RfkillWriter::set_blocked`]. Returns `NotAttached` if
     /// the interface isn't registered and `Supplicant` (as a
     /// catch-all for rfkill plumbing errors) on write failure.
+    ///
+    /// On a successful rfkill write the local state machine is
+    /// driven optimistically — the kernel `RFKILL_OP_CHANGE` event
+    /// the watcher delivers a moment later runs through `on_rfkill`
+    /// and lands in the same idempotent helper, so the second
+    /// arrival is a no-op. The optimism keeps the bus surface and
+    /// the backend's internal state in lockstep from the moment
+    /// `SetPowered` returns.
     async fn operator_set_powered(&mut self, ifname: &str, on: bool) -> Result<()> {
         let ifindex = self.require_ifindex(ifname)?;
         let wiphy_name = self
@@ -818,7 +915,8 @@ impl WifiBackend {
             .ok_or_else(|| WifiError::Rfkill {
                 ifindex,
                 detail: "rfkill writer not available".to_owned(),
-            })?;
+            })?
+            .clone();
         writer
             .set_blocked(&wiphy_name, !on)
             .await
@@ -826,6 +924,15 @@ impl WifiBackend {
                 ifindex,
                 detail: format!("rfkill write: {e}"),
             })?;
+        let _ = self.event_tx.send(NexusEvent::WifiRfkillChanged {
+            ifindex,
+            powered: on,
+        });
+        if on {
+            self.apply_radio_on(ifindex);
+        } else {
+            self.apply_radio_off(ifindex);
+        }
         Ok(())
     }
 
@@ -836,6 +943,12 @@ impl WifiBackend {
     /// action isn't subject to the automatic-selection rate limit.
     async fn operator_connect(&mut self, ifname: &str, profile_id: ulid::Ulid) -> Result<()> {
         let ifindex = self.require_ifindex(ifname)?;
+        if self.radio_off(ifindex) {
+            return Err(WifiError::Rfkill {
+                ifindex,
+                detail: "radio is rfkilled".to_owned(),
+            });
+        }
         let profile = self
             .profiles
             .iter()
@@ -926,6 +1039,12 @@ impl WifiBackend {
     /// useful than us silently no-op'ing here.
     async fn operator_roam(&mut self, ifname: &str, bssid: nexus_core::MacAddr) -> Result<()> {
         let ifindex = self.require_ifindex(ifname)?;
+        if self.radio_off(ifindex) {
+            return Err(WifiError::Rfkill {
+                ifindex,
+                detail: "radio is rfkilled".to_owned(),
+            });
+        }
         self.supplicant
             .roam(ifindex, crate::types::RoamTarget::Bss(bssid))
             .await
@@ -1190,6 +1309,18 @@ impl WifiBackend {
                 was_connected: bool,
                 bssid: nexus_core::MacAddr,
             },
+        }
+
+        // While the radio is off, the supplicant's state machine is
+        // unreliable — a stale `Connected` event can arrive after
+        // rfkill engaged, or wpa_supplicant may emit a generic
+        // `Disconnected{LocalRequest}` whose mapped reason would
+        // overwrite our authoritative `Disconnected{RfKilled}`.
+        // The rfkill path (`apply_radio_off`) is the source of
+        // truth for this window; just consume the supplicant event
+        // without touching state.
+        if self.radio_off(ifindex) {
+            return Ok(());
         }
 
         // Pre-compute the security-mode lookup that `Connected` needs
@@ -1548,6 +1679,16 @@ impl WifiBackend {
         if !self.supplicant_up {
             return Ok(());
         }
+        // Skip the scan when the radio is off. Without this the
+        // post-cooldown sweep (firing on every Disconnected → Idle
+        // transition) would drive scans against a powered-off radio
+        // until the supplicant tore the association down, after
+        // which the cooldown gate would re-fire on every tick. The
+        // radio-on edge (`apply_radio_on`) explicitly fires the
+        // scheduler once Powered=true comes back.
+        if self.radio_off(ifindex) {
+            return Ok(());
+        }
         // Only let wpa_supplicant act on scan results autonomously
         // when the operator has explicitly delegated roaming to it.
         // Callers that already set `allow_roam = true` (roam-
@@ -1656,6 +1797,9 @@ impl WifiBackend {
     /// `roams_total{outcome=success|fail}` counter and folds the
     /// state back to `Connected`. DD-003 §7 / §12.5.
     async fn dispatch_roam(&mut self, ifindex: u32, target: nexus_core::MacAddr) {
+        if self.radio_off(ifindex) {
+            return;
+        }
         let ifname = self.ifname_of(ifindex);
         let (from, ssid) = match self.interfaces.get(&ifindex).map(|e| &e.state) {
             Some(WifiState::Connected { bssid, ssid, .. }) => (*bssid, ssid.clone()),
@@ -1702,6 +1846,11 @@ impl WifiBackend {
             .iter()
             .filter(|(i, e)| {
                 !scans_suspended(&e.state, e.roam_mode)
+                    // Skip rfkilled radios so a stuck deadline
+                    // doesn't tight-loop the select! arm.
+                    // `apply_radio_on` re-fires the scheduler when
+                    // the radio comes back.
+                    && !matches!(self.interface_powered.get(i), Some(false))
                     && self
                         .schedulers
                         .get(i)
@@ -1724,6 +1873,12 @@ impl WifiBackend {
         bss: BssInfo,
     ) -> Result<()> {
         let now = Instant::now();
+        if self.radio_off(ifindex) {
+            // Auto-select path: silently swallow. The radio is off,
+            // so the operator just paused everything; resuming on
+            // the radio-on edge fires a fresh scan that will retry.
+            return Ok(());
+        }
         if !self.retry.rate_limit_allows(ifindex, now) {
             return Ok(());
         }
@@ -1916,8 +2071,14 @@ impl WifiBackend {
 
     fn earliest_scan_deadline(&self, power: PowerState) -> Option<Instant> {
         self.schedulers
-            .values()
-            .filter_map(|s| s.next_scan_at(power))
+            .iter()
+            // Skip rfkilled radios so the select! arm doesn't
+            // tight-loop on a stale deadline that `request_scan`
+            // will only refuse. `apply_radio_on` re-fires the
+            // scheduler when the radio comes back, so we don't
+            // miss the wake-up.
+            .filter(|(i, _)| !matches!(self.interface_powered.get(i), Some(false)))
+            .filter_map(|(_, s)| s.next_scan_at(power))
             .min()
     }
 

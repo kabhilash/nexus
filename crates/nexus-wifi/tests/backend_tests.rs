@@ -42,12 +42,28 @@ struct Harness {
     supplicant: MockSupplicantHandle,
     sup_tx: broadcast::Sender<SupplicantEvent>,
     cmd_tx: tokio::sync::mpsc::Sender<nexus_wifi::WifiCommand>,
+    /// Test-only rfkill injection channel. `None` for tests that
+    /// don't exercise rfkill — the backend then runs without
+    /// `/dev/rfkill` plumbing, just like a production deployment
+    /// where the device is missing.
+    rfkill_tx: Option<tokio::sync::mpsc::Sender<nexus_wifi::rfkill::RfkillState>>,
     // Keep the tempdir alive for the lifetime of the harness.
     _tmp: TempDir,
 }
 
 impl Harness {
     async fn start(profiles: Vec<WifiProfile>, config: WifiConfig) -> Self {
+        Self::start_inner(profiles, config, false).await
+    }
+
+    /// Same as [`start`] but wires a test-only rfkill receiver into
+    /// the backend. The returned harness exposes
+    /// [`Harness::inject_rfkill`] for driving the radio bit.
+    async fn start_with_rfkill(profiles: Vec<WifiProfile>, config: WifiConfig) -> Self {
+        Self::start_inner(profiles, config, true).await
+    }
+
+    async fn start_inner(profiles: Vec<WifiProfile>, config: WifiConfig, with_rfkill: bool) -> Self {
         let (event_tx, event_rx) = broadcast::channel(64);
         let (sup_tx, _sup_rx) = broadcast::channel(64);
 
@@ -62,15 +78,31 @@ impl Harness {
         let mock = MockSupplicant::new(sup_tx.clone());
         let supplicant_handle = mock.handle();
         let (cmd_tx, cmd_rx) = nexus_wifi::command_channel();
-        let backend = spawn_wifi_backend(
-            event_tx.clone(),
-            sup_tx.clone(),
-            Box::new(mock),
-            store,
-            config,
-            cmd_rx,
-            None, // tests don't exercise the MonitorCommand path
-        );
+        let (backend, rfkill_tx) = if with_rfkill {
+            let (rk_tx, rk_rx) = tokio::sync::mpsc::channel(16);
+            let h = nexus_wifi::spawn_wifi_backend_with_test_rfkill_rx(
+                event_tx.clone(),
+                sup_tx.clone(),
+                Box::new(mock),
+                store,
+                config,
+                cmd_rx,
+                None,
+                rk_rx,
+            );
+            (h, Some(rk_tx))
+        } else {
+            let h = spawn_wifi_backend(
+                event_tx.clone(),
+                sup_tx.clone(),
+                Box::new(mock),
+                store,
+                config,
+                cmd_rx,
+                None,
+            );
+            (h, None)
+        };
 
         Self {
             backend,
@@ -79,8 +111,24 @@ impl Harness {
             supplicant: supplicant_handle,
             sup_tx,
             cmd_tx,
+            rfkill_tx,
             _tmp: tmp,
         }
+    }
+
+    /// Push an rfkill edge into the backend. Panics if the harness
+    /// was built without `start_with_rfkill`.
+    async fn inject_rfkill(&self, wiphy_name: &str, powered: bool) {
+        let tx = self
+            .rfkill_tx
+            .as_ref()
+            .expect("harness built without rfkill plumbing; use start_with_rfkill");
+        tx.send(nexus_wifi::rfkill::RfkillState {
+            wiphy_name: wiphy_name.to_owned(),
+            powered,
+        })
+        .await
+        .expect("rfkill channel closed");
     }
 
     async fn shutdown(self) {
@@ -1156,6 +1204,286 @@ async fn bss_cache_stale_does_not_emit_scan_complete() {
     h.expect_no_event(
         |e| matches!(e, NexusEvent::WifiScanComplete { ifindex: 2, .. }),
         Duration::from_millis(300),
+    )
+    .await;
+    h.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Rfkill / Wifi.Powered turn-off paths
+// ---------------------------------------------------------------------------
+
+/// Powered=false while the interface is `Connected` must drive the
+/// state machine to `Disconnected{RfKilled}` and emit a matching
+/// `WifiLinkLost`. Without this the bus surface and the backend's
+/// internal state diverge — the dbus layer reads `disconnected`
+/// while the backend keeps polling SignalInfo, scheduling scans,
+/// and arming driver-wedge timers against a powered-off radio.
+#[tokio::test]
+async fn rfkill_off_transitions_connected_to_disconnected_rfkilled() {
+    let profile = wifi_profile(b"corp", "correcthorse", 10);
+    let mut h = Harness::start_with_rfkill(vec![profile], WifiConfig::default()).await;
+
+    h.supplicant
+        .set_scan_results(2, vec![bss([0xAA; 6], b"corp", -45, SecurityMode::Wpa2Psk)]);
+    h.supplicant.set_connect_outcome(2, MockBehavior::Success);
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiLinkReady { ifindex: 2 }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    h.inject_rfkill("phy0", false).await;
+
+    // The backend must publish (in some order) a
+    // `WifiRfkillChanged{powered=false}`, a
+    // `WifiStateChanged{Disconnected{RfKilled}}`, and a
+    // `WifiLinkLost`. We assert each independently.
+    let mut saw_state = false;
+    let mut saw_link_lost = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !(saw_state && saw_link_lost) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, h.event_rx.recv()).await {
+            Ok(Ok(NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Disconnected {
+                    reason: nexus_core::DisconnectReason::RfKilled,
+                },
+            })) => saw_state = true,
+            Ok(Ok(NexusEvent::WifiLinkLost { ifindex: 2 })) => saw_link_lost = true,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(saw_state, "Disconnected{{RfKilled}} state never emitted");
+    assert!(saw_link_lost, "WifiLinkLost never emitted");
+    h.shutdown().await;
+}
+
+/// While `Disconnected{RfKilled}` is in effect, a late-arriving
+/// supplicant `Disconnected{LocalRequest}` (wpa_supplicant catching
+/// up to the rfkill) must NOT overwrite the authoritative reason.
+/// Without this gate the consumer sees a fresh `disconnected{cancelled}`
+/// edge a few seconds after the radio went off, which contradicts
+/// the rfkill-driven `disconnected{rf_killed}` already in place.
+#[tokio::test]
+async fn rfkill_off_preserves_reason_against_late_supplicant_disconnect() {
+    use nexus_wifi::supplicant::SupplicantState;
+    let profile = wifi_profile(b"corp", "correcthorse", 10);
+    let mut h = Harness::start_with_rfkill(vec![profile], WifiConfig::default()).await;
+
+    h.supplicant
+        .set_scan_results(2, vec![bss([0xAA; 6], b"corp", -45, SecurityMode::Wpa2Psk)]);
+    h.supplicant.set_connect_outcome(2, MockBehavior::Success);
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiLinkReady { ifindex: 2 }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    h.inject_rfkill("phy0", false).await;
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Disconnected {
+                    reason: nexus_core::DisconnectReason::RfKilled,
+                },
+            },
+        ),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Now feed the late supplicant Disconnected.
+    let _ = h.sup_tx.send(SupplicantEvent::State {
+        ifindex: 2,
+        state: SupplicantState::Disconnected {
+            reason: DisconnectHint::LocalRequest,
+        },
+    });
+
+    // Drain for 200 ms; assert no Disconnected{*} with a non-RfKilled
+    // reason ever fires. The wifi backend must consume the
+    // late event and discard it, leaving the state at RfKilled.
+    let deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if let Ok(Ok(NexusEvent::WifiStateChanged {
+            ifindex: 2,
+            state: WifiState::Disconnected { reason },
+        })) = tokio::time::timeout(remaining, h.event_rx.recv()).await
+        {
+            assert!(
+                matches!(reason, nexus_core::DisconnectReason::RfKilled),
+                "late supplicant Disconnected overwrote RfKilled reason: {reason:?}"
+            );
+        }
+    }
+    h.shutdown().await;
+}
+
+/// Powered=true after a Powered=false must promote
+/// `Disconnected{RfKilled}` back to `Idle` and re-arm the scan
+/// scheduler so auto-select can resume. RfKilled is permanent
+/// (`is_permanent()` returns true), so the cooldown sweep won't
+/// auto-promote — the radio-on edge does it explicitly.
+#[tokio::test]
+async fn rfkill_on_resumes_idle_and_kicks_scan_scheduler() {
+    let profile = wifi_profile(b"corp", "correcthorse", 10);
+    let mut h = Harness::start_with_rfkill(vec![profile], WifiConfig::default()).await;
+
+    h.supplicant
+        .set_scan_results(2, vec![bss([0xAA; 6], b"corp", -45, SecurityMode::Wpa2Psk)]);
+    h.supplicant.set_connect_outcome(2, MockBehavior::Success);
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiLinkReady { ifindex: 2 }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let scans_before_off = h.supplicant.scan_calls().len();
+
+    h.inject_rfkill("phy0", false).await;
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Disconnected {
+                    reason: nexus_core::DisconnectReason::RfKilled,
+                },
+            },
+        ),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Confirm: while rfkilled, scheduled scans don't fire even if
+    // the heartbeat ticks. We sleep past one heartbeat (1 s) plus a
+    // bit, then count.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let scans_during_off = h.supplicant.scan_calls().len();
+    assert_eq!(
+        scans_during_off, scans_before_off,
+        "scheduler must not dispatch scans while rfkilled"
+    );
+
+    h.inject_rfkill("phy0", true).await;
+    // First, the backend should fold to Idle.
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Idle,
+            },
+        ),
+        Duration::from_secs(2),
+    )
+    .await;
+    // Then the scheduler kicks a fresh scan via the auto-select
+    // path. We see Scanning, then a new scan call.
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Scanning,
+            },
+        ),
+        Duration::from_secs(2),
+    )
+    .await;
+    let scans_after_on = h.supplicant.scan_calls().len();
+    assert!(
+        scans_after_on > scans_during_off,
+        "scan_calls did not advance after Powered=true: before={scans_during_off} after={scans_after_on}"
+    );
+    h.shutdown().await;
+}
+
+/// Operator `Connect` while the radio is rfkilled must error fast
+/// rather than transitioning the cached state to `Connecting{...}`
+/// (which the driver-wedge detector would later mis-identify as
+/// stuck firmware).
+#[tokio::test]
+async fn operator_connect_during_rfkill_returns_rfkill_error_without_state_change() {
+    let profile = wifi_profile(b"corp", "correcthorse", 10);
+    let profile_id = profile.id;
+    let mut h = Harness::start_with_rfkill(vec![profile], WifiConfig::default()).await;
+
+    h.supplicant.set_connect_outcome(2, MockBehavior::Success);
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+    // Wait for Idle.
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Scanning,
+            },
+        ),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    h.inject_rfkill("phy0", false).await;
+    h.expect_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Disconnected {
+                    reason: nexus_core::DisconnectReason::RfKilled,
+                },
+            },
+        ),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    h.cmd_tx
+        .send(nexus_wifi::WifiCommand::Connect {
+            ifname: "wlan0".into(),
+            profile_id,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+    let result = reply_rx.await.unwrap();
+    assert!(
+        matches!(result, Err(nexus_wifi::WifiError::Rfkill { .. })),
+        "operator_connect should return Rfkill while rfkilled, got {result:?}"
+    );
+
+    // No state transition out of Disconnected{RfKilled} should
+    // have leaked through. (If the early-return gate hadn't
+    // fired, the backend would have transitioned to Connecting{...}
+    // before calling the supplicant.)
+    h.expect_no_event(
+        |e| matches!(
+            e,
+            NexusEvent::WifiStateChanged {
+                ifindex: 2,
+                state: WifiState::Connecting { .. } | WifiState::Idle,
+            },
+        ),
+        Duration::from_millis(200),
     )
     .await;
     h.shutdown().await;
