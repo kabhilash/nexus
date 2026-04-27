@@ -664,7 +664,6 @@ async fn spawn_all(
     if config.connectivity.enabled {
         let cn_cfg = ConnectivityConfig {
             url: config.connectivity.url.clone(),
-            interval: config.connectivity.interval,
             timeout: config.connectivity.timeout,
         };
         let ev = event_tx.clone();

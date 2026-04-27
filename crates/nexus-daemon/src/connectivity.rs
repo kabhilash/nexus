@@ -1,27 +1,28 @@
 //! Internet-connectivity probe.
 //!
-//! Runs as a supervised daemon-scope task. The state machine is
-//! event-driven on top of a periodic backstop:
+//! Runs as a supervised daemon-scope task. Purely event-driven on
+//! Wi-Fi / Ethernet link state — there is no periodic backstop:
 //!
-//! 1. Track the set of currently link-ready interfaces (Wi-Fi and
-//!    Ethernet). Membership flips on
-//!    `WifiLinkReady`/`EthLinkReady` (insert) and
+//! 1. Track the set of currently link-ready interfaces. Membership
+//!    flips on `WifiLinkReady`/`EthLinkReady` (insert) and
 //!    `WifiLinkLost`/`EthLinkLost` (remove).
-//! 2. Whenever an interface becomes link-ready, immediately probe.
-//! 3. Whenever the last link-ready interface drops, immediately
-//!    publish `Offline` — no point waiting for the next probe to time
-//!    out.
-//! 4. While at least one link is ready, run the periodic backstop
-//!    probe every `interval`. The backstop is what catches the
-//!    online → captive-portal transition that happens *after* the
-//!    link came up (portal session expiry, ISP blip, …).
+//! 2. On `LinkReady`: probe the URL to classify
+//!    online vs captive-portal vs offline.
+//! 3. On `LinkLost` for the last remaining ready interface:
+//!    publish `Offline` immediately — no probe, no timeout wait.
+//! 4. At task entry: probe once so the published state reflects
+//!    actual reachability from t=0 rather than `Unknown`.
 //!
-//! When the set is empty, the periodic timer is skipped — there's
-//! nothing to probe and the state is already pinned at `Offline`.
+//! Tradeoff: the published state is sticky between link transitions.
+//! A captive portal that intercepts traffic mid-session, an ISP
+//! outage that doesn't drop carrier, or a DNS regression while the
+//! link stays up will all be missed until the next `LinkReady` fires.
+//! The design call here is that the link-state events are a strong
+//! enough proxy for connectivity and the steady-state polling cost
+//! isn't worth the marginal coverage.
 //!
 //! Only transitions are emitted on the bus; same-state probes are
-//! silenced to avoid pinging the D-Bus signal bus 1:1 with the probe
-//! cadence.
+//! silenced.
 //!
 //! ## HTTP probe
 //!
@@ -54,9 +55,6 @@ pub struct ConnectivityConfig {
     /// connection (which fails TLS in a way that's already
     /// indistinguishable from "offline").
     pub url: String,
-    /// How often the timer-driven probe fires. Event-driven probes
-    /// (link-ready) fire on top of this without resetting the timer.
-    pub interval: Duration,
     /// Total time budget for one probe — covers DNS, connect, write,
     /// and reading back the status line.
     pub timeout: Duration,
@@ -66,7 +64,6 @@ impl Default for ConnectivityConfig {
     fn default() -> Self {
         Self {
             url: "http://connectivity-check.ubuntu.com/".to_owned(),
-            interval: Duration::from_secs(30),
             timeout: Duration::from_secs(5),
         }
     }
@@ -195,6 +192,14 @@ impl LinkKind {
     }
 }
 
+/// Outcome of one event-loop iteration. `Probe` triggers an HTTP
+/// probe on the (presumed) up link; `ForceOffline` skips the probe
+/// and pins the published state at offline.
+enum Action {
+    Probe(LinkKind),
+    ForceOffline,
+}
+
 /// Run the connectivity probe loop. Returns `Ok(())` only on
 /// `cancel.cancelled()`. Returns `Err` if the URL is malformed
 /// (caught at startup) — the supervised wrapper logs and stops.
@@ -212,11 +217,6 @@ pub async fn run_connectivity(
     cancel: CancellationToken,
 ) -> Result<()> {
     let url = parse_http_url(&cfg.url)?;
-    let mut tick = tokio::time::interval(cfg.interval);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // The first `tick.tick()` resolves immediately; the initial probe
-    // below covers the t=0 reading, so consume that tick.
-    tick.tick().await;
 
     // Set of (ifindex → kind) for currently link-ready interfaces.
     // Wi-Fi and Ethernet ifindexes share the same global namespace, so
@@ -227,9 +227,8 @@ pub async fn run_connectivity(
 
     info!(
         url = %cfg.url,
-        interval_s = cfg.interval.as_secs(),
         timeout_s = cfg.timeout.as_secs(),
-        "connectivity probe starting"
+        "connectivity probe starting (event-driven, no periodic backstop)"
     );
 
     // Initial probe so the state reflects actual reachability from
@@ -244,23 +243,11 @@ pub async fn run_connectivity(
     let mut last = initial;
 
     loop {
-        // Drive the periodic timer only while we have a link to probe
-        // through. With no link, every probe would just time out and
-        // emit a same-state same-result event.
-        let timer = async {
-            if link_ready.is_empty() {
-                std::future::pending::<()>().await;
-            } else {
-                tick.tick().await;
-            }
-        };
-
         let action = tokio::select! {
             _ = cancel.cancelled() => {
                 info!("connectivity probe shutting down");
                 return Ok(());
             }
-            _ = timer => Action::Probe(ProbeReason::Timer),
             ev = event_rx.recv() => {
                 match ev {
                     Ok(NexusEvent::WifiLinkReady { ifindex }) => {
@@ -269,7 +256,7 @@ pub async fn run_connectivity(
                         if inserted {
                             debug!(ifindex, "connectivity: wifi link ready");
                         }
-                        Action::Probe(ProbeReason::Link(LinkKind::Wifi))
+                        Action::Probe(LinkKind::Wifi)
                     }
                     Ok(NexusEvent::EthLinkReady { ifindex }) => {
                         let inserted = link_ready.insert(ifindex);
@@ -277,7 +264,7 @@ pub async fn run_connectivity(
                         if inserted {
                             debug!(ifindex, "connectivity: ethernet link ready");
                         }
-                        Action::Probe(ProbeReason::Link(LinkKind::Ethernet))
+                        Action::Probe(LinkKind::Ethernet)
                     }
                     Ok(NexusEvent::WifiLinkLost { ifindex })
                     | Ok(NexusEvent::EthLinkLost { ifindex }) => {
@@ -292,9 +279,9 @@ pub async fn run_connectivity(
                             Action::ForceOffline
                         } else {
                             // Either we never tracked this ifindex
-                            // (e.g., quick LinkLost without a prior
+                            // (e.g., a quick LinkLost without a prior
                             // LinkReady), or another link is still up.
-                            // Trust the periodic probe to confirm.
+                            // Either way nothing to publish.
                             continue;
                         }
                     }
@@ -313,10 +300,8 @@ pub async fn run_connectivity(
 
         let next = match action {
             Action::ForceOffline => ConnectivityState::Offline,
-            Action::Probe(reason) => {
-                if let ProbeReason::Link(kind) = reason {
-                    debug!(link = kind.as_str(), "connectivity: probing on link-ready");
-                }
+            Action::Probe(kind) => {
+                debug!(link = kind.as_str(), "connectivity: probing on link-ready");
                 probe_once(&url, cfg.timeout).await
             }
         };
@@ -335,16 +320,6 @@ pub async fn run_connectivity(
             debug!(state = next.as_str(), "connectivity: same-state, no signal");
         }
     }
-}
-
-enum Action {
-    Probe(ProbeReason),
-    ForceOffline,
-}
-
-enum ProbeReason {
-    Timer,
-    Link(LinkKind),
 }
 
 #[cfg(test)]

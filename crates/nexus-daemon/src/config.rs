@@ -474,17 +474,15 @@ impl Default for GnssDefaultsSection {
 // Section: connectivity
 // ---------------------------------------------------------------------------
 
-/// Internet-connectivity probe — periodic HTTP GET against a
-/// `generate_204` style endpoint. See `crates/nexus-daemon/src/connectivity.rs`.
+/// Internet-connectivity probe — event-driven HTTP GET against a
+/// `generate_204` style endpoint. Fires on Wi-Fi / Ethernet link-ready
+/// only. See `crates/nexus-daemon/src/connectivity.rs`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConnectivitySection {
     pub enabled: bool,
     /// Probe URL. Plain `http://` only — see the module docs for why.
     pub url: String,
-    /// How often the timer-driven probe fires.
-    #[serde(with = "duration_secs_f")]
-    pub interval: Duration,
     /// Total budget for one probe (DNS + connect + write + read).
     #[serde(with = "duration_secs_f")]
     pub timeout: Duration,
@@ -495,7 +493,6 @@ impl Default for ConnectivitySection {
         Self {
             enabled: true,
             url: "http://connectivity-check.ubuntu.com/".to_owned(),
-            interval: Duration::from_secs(30),
             timeout: Duration::from_secs(5),
         }
     }
@@ -543,7 +540,6 @@ mod tests {
         assert!(!cfg.gnss.enabled);
         assert!(cfg.connectivity.enabled);
         assert_eq!(cfg.connectivity.url, "http://connectivity-check.ubuntu.com/");
-        assert_eq!(cfg.connectivity.interval, Duration::from_secs(30));
         assert_eq!(cfg.connectivity.timeout, Duration::from_secs(5));
     }
 
@@ -553,13 +549,11 @@ mod tests {
             [connectivity]
             enabled = false
             url = "http://www.gstatic.com/generate_204"
-            interval = 90.0
             timeout = 2.5
         "#;
         let cfg = Config::parse_str(text).unwrap();
         assert!(!cfg.connectivity.enabled);
         assert_eq!(cfg.connectivity.url, "http://www.gstatic.com/generate_204");
-        assert_eq!(cfg.connectivity.interval, Duration::from_secs(90));
         assert_eq!(cfg.connectivity.timeout, Duration::from_millis(2500));
     }
 
