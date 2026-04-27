@@ -273,18 +273,36 @@ fn read_event(fd: libc::c_int) -> io::Result<Option<RfkillEvent>> {
 }
 
 fn write_event(fd: libc::c_int, ev: &RfkillEvent) -> io::Result<()> {
-    let buf = [0u8; RFKILL_EVENT_SIZE];
-    // SAFETY: layout matches; writing a value-type through an
-    // unaligned pointer is defined via `write_unaligned`.
-    unsafe {
-        std::ptr::write_unaligned(buf.as_ptr() as *mut RfkillEvent, *ev);
-    }
-    // SAFETY: `write(2)` reads `buf.len()` bytes at `buf.as_ptr()`.
+    // Materialize the on-wire bytes from `ev`. The previous form was
+    // `let buf = [0u8; …]; ptr::write_unaligned(buf.as_ptr() as *mut RfkillEvent, *ev)`
+    // — that's UB: `buf` is immutable, and casting `*const u8` to
+    // `*mut RfkillEvent` then writing through it lets the compiler
+    // assume `buf` never changes and propagate the zero-init through
+    // to the `libc::write` arg. In release builds that means the
+    // kernel sees 8 zero bytes (op = `RFKILL_OP_ADD`, which writes
+    // reject with -EINVAL), regardless of what we tried to encode —
+    // *both* the block and unblock soft-rfkill writes silently
+    // become no-ops.
+    //
+    // SAFETY: `RfkillEvent` is `#[repr(C, packed)]` over integer
+    // fields, so its in-memory layout is exactly
+    // `[u8; RFKILL_EVENT_SIZE]`. Reading those bytes through a
+    // `*const u8` is well-defined.
+    let bytes: [u8; RFKILL_EVENT_SIZE] = unsafe {
+        let mut buf = [0u8; RFKILL_EVENT_SIZE];
+        std::ptr::copy_nonoverlapping(
+            (ev as *const RfkillEvent).cast::<u8>(),
+            buf.as_mut_ptr(),
+            RFKILL_EVENT_SIZE,
+        );
+        buf
+    };
+    // SAFETY: `write(2)` reads `bytes.len()` bytes at `bytes.as_ptr()`.
     let n = unsafe {
         libc::write(
             fd,
-            buf.as_ptr().cast::<libc::c_void>(),
-            buf.len(),
+            bytes.as_ptr().cast::<libc::c_void>(),
+            bytes.len(),
         )
     };
     if n < 0 {
@@ -398,5 +416,57 @@ mod tests {
             hard: 0,
         };
         assert!(translate(&ev).is_none());
+    }
+
+    /// Regression: `write_event` must put the actual `RfkillEvent`
+    /// bytes on the wire, not eight zero bytes. The previous
+    /// `let buf = [0u8; …]; ptr::write_unaligned(buf.as_ptr() as *mut)`
+    /// form was UB — release builds silently dropped the encoded
+    /// payload, which made every soft-rfkill write a no-op against
+    /// `/dev/rfkill` (the kernel rejects `op=0` = `RFKILL_OP_ADD` on
+    /// writes with `-EINVAL`).
+    ///
+    /// We can't write to `/dev/rfkill` from a CI container, so the
+    /// test round-trips through a tempfile and compares the bytes
+    /// against the canonical packed layout: `idx`(4 LE) + `ty`(1) +
+    /// `op`(1) + `soft`(1) + `hard`(1).
+    #[test]
+    fn write_event_emits_canonical_packed_bytes() {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::fd::AsRawFd;
+
+        let mut f = tempfile::tempfile().expect("tempfile");
+        let ev = RfkillEvent {
+            idx: 0x12345678,
+            ty: RFKILL_TYPE_WLAN,
+            op: RFKILL_OP_CHANGE,
+            soft: 0, // unblock
+            hard: 0,
+        };
+        write_event(f.as_raw_fd(), &ev).expect("write_event");
+        f.seek(SeekFrom::Start(0)).expect("seek");
+        let mut got = [0u8; RFKILL_EVENT_SIZE];
+        f.read_exact(&mut got).expect("read");
+        assert_eq!(
+            got,
+            [0x78, 0x56, 0x34, 0x12, RFKILL_TYPE_WLAN, RFKILL_OP_CHANGE, 0, 0],
+            "write_event must encode RfkillEvent fields in packed LE layout, not zero them out"
+        );
+
+        // Now block direction: soft=1 must actually land in byte 6.
+        f.seek(SeekFrom::Start(0)).expect("rewind");
+        f.set_len(0).expect("truncate");
+        let block = RfkillEvent {
+            idx: 1,
+            ty: RFKILL_TYPE_WLAN,
+            op: RFKILL_OP_CHANGE,
+            soft: 1,
+            hard: 0,
+        };
+        write_event(f.as_raw_fd(), &block).expect("write_event block");
+        f.seek(SeekFrom::Start(0)).expect("seek");
+        let mut got = [0u8; RFKILL_EVENT_SIZE];
+        f.read_exact(&mut got).expect("read");
+        assert_eq!(got[6], 1, "soft byte must be 1 for block direction");
     }
 }
