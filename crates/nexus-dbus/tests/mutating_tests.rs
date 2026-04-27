@@ -1796,6 +1796,322 @@ async fn wifi_state_changed_deduped_across_identical_emissions() {
     handle.stop().await;
 }
 
+/// `Wifi.Powered=false` (rfkill engaged or operator write) must
+/// land the cached `Wifi.State`, `ConnectedBss`, `SignalDbm`,
+/// `Frequency`, and `ScanResults` properties to a powered-off
+/// snapshot before the typed `Wifi.StateChanged` edge fires. Without
+/// this, `Wifi.State` reads `connected` while `Wifi.Powered=false`
+/// — a contract violation flagged by astraX_BT.
+#[tokio::test]
+async fn wifi_state_clears_on_powered_false() {
+    use zbus::zvariant::OwnedObjectPath;
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_pwr_off_clears";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Drive to Connected.
+    let bssid = MacAddr([0xAA; 6]);
+    let ssid = Ssid::new(b"corp".to_vec()).unwrap();
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Connected {
+                bssid,
+                ssid: ssid.clone(),
+                frequency: 5180,
+                signal_dbm: -50,
+                security: SecurityMode::Wpa2Psk,
+            },
+        })
+        .unwrap();
+    // Need a power-on first so we have something to flip to false.
+    event_tx
+        .send(NexusEvent::WifiRfkillChanged {
+            ifindex: WLAN_IFINDEX,
+            powered: true,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let client = bus.connection().await;
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("fi.nexus.Wifi")
+        .unwrap()
+        .member("StateChanged")
+        .unwrap()
+        .path("/fi/nexus1/interface/wlan0")
+        .unwrap()
+        .build();
+    let mut stream = zbus::MessageStream::for_match_rule(rule, &client, None)
+        .await
+        .expect("subscribe Wifi.StateChanged");
+
+    // Now flip Powered=false via the rfkill event.
+    event_tx
+        .send(NexusEvent::WifiRfkillChanged {
+            ifindex: WLAN_IFINDEX,
+            powered: false,
+        })
+        .unwrap();
+
+    // The synthesized `disconnected` edge with reason='rf_killed'
+    // must fire on Wifi.StateChanged.
+    let mut saw_edge = false;
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            + Duration::from_millis(1);
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Ok((label, details)) =
+                    msg.body().deserialize::<(String, HashMap<String, OwnedValue>)>()
+                {
+                    if label == "disconnected" {
+                        let reason = details
+                            .get("reason")
+                            .and_then(|v| <&str>::try_from(v).ok().map(str::to_owned))
+                            .unwrap_or_default();
+                        assert_eq!(
+                            reason, "rf_killed",
+                            "disconnect synthesized for Powered=false must carry reason=rf_killed"
+                        );
+                        saw_edge = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        saw_edge,
+        "Wifi.StateChanged 'disconnected' did not fire on Powered=false"
+    );
+
+    // Properties.Get on Wifi.State must read 'disconnected', and
+    // ConnectedBss must read its all-zero sentinel.
+    let state_val: String = client
+        .call_method(
+            Some(bus_name),
+            "/fi/nexus1/interface/wlan0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("fi.nexus.Wifi", "State"),
+        )
+        .await
+        .unwrap()
+        .body()
+        .deserialize::<zbus::zvariant::Value<'_>>()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        state_val, "disconnected",
+        "Wifi.State must clear on Powered=false; got {state_val:?}"
+    );
+
+    let scan_paths: Vec<OwnedObjectPath> = client
+        .call_method(
+            Some(bus_name),
+            "/fi/nexus1/interface/wlan0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("fi.nexus.Wifi", "ScanResults"),
+        )
+        .await
+        .unwrap()
+        .body()
+        .deserialize::<zbus::zvariant::Value<'_>>()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(
+        scan_paths.is_empty(),
+        "Wifi.ScanResults must drop on Powered=false; got {scan_paths:?}"
+    );
+
+    handle.stop().await;
+}
+
+/// Cached scan results must drop on `Wifi.Powered=false`. We
+/// pre-populate the cache via a `WifiScanComplete` event, flip
+/// power off, and assert `Wifi.ScanResults` is empty (option (a)
+/// of the contract — the daemon does NOT keep stale entries
+/// across power cycles).
+#[tokio::test]
+async fn wifi_scan_results_drop_on_powered_false() {
+    use nexus_core::{BssCapabilities, BssInfo};
+    use zbus::zvariant::OwnedObjectPath;
+
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_pwr_off_scans";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    event_tx
+        .send(NexusEvent::WifiRfkillChanged {
+            ifindex: WLAN_IFINDEX,
+            powered: true,
+        })
+        .unwrap();
+
+    let bssid = MacAddr([0xCC; 6]);
+    event_tx
+        .send(NexusEvent::WifiScanComplete {
+            ifindex: WLAN_IFINDEX,
+            success: true,
+            results: vec![BssInfo {
+                bssid,
+                ssid: Ssid::new(b"corp".to_vec()).unwrap(),
+                frequency: 5180,
+                signal_dbm: -55,
+                capabilities: BssCapabilities::default(),
+                security: vec![SecurityMode::Wpa2Psk],
+                age_ms: 0,
+            }],
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = bus.connection().await;
+    let pre: Vec<OwnedObjectPath> = client
+        .call_method(
+            Some(bus_name),
+            "/fi/nexus1/interface/wlan0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("fi.nexus.Wifi", "ScanResults"),
+        )
+        .await
+        .unwrap()
+        .body()
+        .deserialize::<zbus::zvariant::Value<'_>>()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        pre.len(),
+        1,
+        "scan-result registration prerequisite missed; got {pre:?}"
+    );
+
+    event_tx
+        .send(NexusEvent::WifiRfkillChanged {
+            ifindex: WLAN_IFINDEX,
+            powered: false,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let post: Vec<OwnedObjectPath> = client
+        .call_method(
+            Some(bus_name),
+            "/fi/nexus1/interface/wlan0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("fi.nexus.Wifi", "ScanResults"),
+        )
+        .await
+        .unwrap()
+        .body()
+        .deserialize::<zbus::zvariant::Value<'_>>()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(
+        post.is_empty(),
+        "Wifi.ScanResults must drop on Powered=false; got {post:?}"
+    );
+
+    handle.stop().await;
+}
+
+/// Powered=false → Powered=true must NOT carry forward the
+/// pre-power-off state. After flipping power back on, `Wifi.State`
+/// must remain at the cleared `disconnected` value until something
+/// drives a real association — a bare power-on doesn't promote the
+/// interface back to `connected`.
+#[tokio::test]
+async fn wifi_powered_true_after_off_does_not_carry_forward_state() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_pwr_cycle_no_carryforward";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    event_tx
+        .send(NexusEvent::WifiRfkillChanged {
+            ifindex: WLAN_IFINDEX,
+            powered: true,
+        })
+        .unwrap();
+    let bssid = MacAddr([0xDD; 6]);
+    let ssid = Ssid::new(b"corp".to_vec()).unwrap();
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Connected {
+                bssid,
+                ssid,
+                frequency: 5180,
+                signal_dbm: -50,
+                security: SecurityMode::Wpa2Psk,
+            },
+        })
+        .unwrap();
+    // Flip off and back on.
+    event_tx
+        .send(NexusEvent::WifiRfkillChanged {
+            ifindex: WLAN_IFINDEX,
+            powered: false,
+        })
+        .unwrap();
+    event_tx
+        .send(NexusEvent::WifiRfkillChanged {
+            ifindex: WLAN_IFINDEX,
+            powered: true,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = bus.connection().await;
+    let state_val: String = client
+        .call_method(
+            Some(bus_name),
+            "/fi/nexus1/interface/wlan0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("fi.nexus.Wifi", "State"),
+        )
+        .await
+        .unwrap()
+        .body()
+        .deserialize::<zbus::zvariant::Value<'_>>()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        state_val, "disconnected",
+        "Wifi.State carried forward across a power cycle (got {state_val:?}); \
+         a bare Powered=true must not promote the interface back to `connected`"
+    );
+
+    handle.stop().await;
+}
+
 // ---------------------------------------------------------------------------
 // DD-006 §6.4 — fi.nexus.Bluetooth.Powered (writable property).
 //

@@ -481,14 +481,114 @@ async fn handle_event(
         NexusEvent::WifiRfkillChanged { ifindex, powered } => {
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
                 let path = interface_path(&ifname);
-                let mut guard = state.write().await;
-                if let Some(e) = guard.interfaces.get_mut(&ifname) {
-                    if let InterfaceKindData::Wifi(c) = &mut e.kind_data {
-                        if c.powered != powered {
-                            c.powered = powered;
-                            services.batcher.mark(&path, "fi.nexus.Wifi", "Powered");
+                // When rfkill engages (or the operator writes
+                // Powered=false), the supplicant cannot remain
+                // associated. Mirror the consistency-at-the-edge
+                // pattern used for the connected direction in
+                // ad57020: force the cached state machine to
+                // `disconnected{rf_killed}`, zero the connection
+                // identity, and drop scan results — every Wi-Fi-off
+                // related property must agree at the moment we
+                // publish the StateChanged edge. Without this,
+                // `Wifi.State` retains the pre-power-off value
+                // (`connected` etc.) while `Powered` reads false.
+                let mut to_unregister: Vec<nexus_core::MacAddr> = Vec::new();
+                let mut emit_disconnect_edge = false;
+                let mut powered_marked = false;
+                let mut state_changed = false;
+                {
+                    let mut guard = state.write().await;
+                    if let Some(e) = guard.interfaces.get_mut(&ifname) {
+                        if let InterfaceKindData::Wifi(c) = &mut e.kind_data {
+                            if c.powered != powered {
+                                c.powered = powered;
+                                services.batcher.mark(&path, "fi.nexus.Wifi", "Powered");
+                                powered_marked = true;
+                            }
+                            if !powered {
+                                // We're turning the radio off. Force every
+                                // state-bearing field that implied
+                                // association to its "no association" value,
+                                // and queue scan-result objects for unregistration.
+                                let prev_state = c.state.clone();
+                                let was_associated = !matches!(
+                                    prev_state.as_str(),
+                                    "" | "idle" | "disconnected" | "gone"
+                                );
+                                if c.state != "disconnected" {
+                                    c.state = "disconnected".to_owned();
+                                    state_changed = true;
+                                    services.batcher.mark(&path, "fi.nexus.Wifi", "State");
+                                }
+                                if c.connected_bss.is_some() {
+                                    c.connected_bss = None;
+                                    services
+                                        .batcher
+                                        .mark(&path, "fi.nexus.Wifi", "ConnectedBss");
+                                }
+                                if c.signal_dbm != 0 {
+                                    c.signal_dbm = 0;
+                                    services
+                                        .batcher
+                                        .mark(&path, "fi.nexus.Wifi", "SignalDbm");
+                                }
+                                if c.frequency != 0 {
+                                    c.frequency = 0;
+                                    services
+                                        .batcher
+                                        .mark(&path, "fi.nexus.Wifi", "Frequency");
+                                }
+                                if !c.scan_cache.is_empty() {
+                                    to_unregister.extend(c.scan_cache.keys().copied());
+                                    c.scan_cache.clear();
+                                }
+                                if !c.scan_results.is_empty() {
+                                    c.scan_results.clear();
+                                    services
+                                        .batcher
+                                        .mark(&path, "fi.nexus.Wifi", "ScanResults");
+                                }
+                                emit_disconnect_edge = state_changed || was_associated;
+                            }
                         }
                     }
+                }
+                let _ = powered_marked;
+                // Unregister stale scan-result objects from the bus.
+                // The InterfacesRemoved signal that flows out of
+                // `unregister_scan_result` lets ObjectManager
+                // subscribers drop them in lockstep with the
+                // ScanResults property emptying.
+                for bssid in to_unregister {
+                    let _ = registry_tx
+                        .send(ServiceCommand::UnregisterScanResult {
+                            ifname: ifname.clone(),
+                            bssid,
+                        })
+                        .await;
+                }
+                if emit_disconnect_edge {
+                    use std::collections::HashMap;
+                    use zbus::zvariant::{OwnedValue, Value};
+                    // Flush every pending PropertiesChanged before
+                    // the typed StateChanged so a consumer reading
+                    // properties on the disconnected edge sees the
+                    // post-rfkill snapshot.
+                    flush_due_properties(connection, services, true).await;
+                    let mut details: HashMap<String, OwnedValue> = HashMap::new();
+                    if let Ok(v) =
+                        OwnedValue::try_from(Value::new("rf_killed".to_owned()))
+                    {
+                        details.insert("reason".into(), v);
+                    }
+                    emit_wifi_state_changed(
+                        connection,
+                        services,
+                        &ifname,
+                        "disconnected",
+                        &details,
+                    )
+                    .await;
                 }
             }
         }
