@@ -1074,16 +1074,6 @@ async fn wifi_connect_complete_credentials_invalid() {
 }
 
 #[tokio::test]
-async fn wifi_connect_complete_handshake_timeout() {
-    assert_connect_failure_reason(
-        "fi.nexus1.test_cc_hs",
-        DisconnectReason::HandshakeTimeout,
-        "handshake_timeout",
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn wifi_connect_complete_rf_killed() {
     assert_connect_failure_reason(
         "fi.nexus1.test_cc_rfk",
@@ -1103,16 +1093,175 @@ async fn wifi_connect_complete_supplicant_unavailable() {
     .await;
 }
 
+/// Transient `Disconnected{HandshakeTimeout}` events must NOT
+/// resolve a pending Connect job — the wifi backend's sticky-retry
+/// path handles the recovery and the eventual converged transition
+/// (here: a successful Connected) is what fires ConnectComplete.
+/// Without this, every flaky 4-way handshake fires a spurious
+/// `success=false` ahead of the eventual successful connect, forcing
+/// every consumer to invent its own debounce.
 #[tokio::test]
-async fn wifi_connect_complete_ap_initiated_maps_to_other() {
-    // Disconnect reasons not in the named set fall under "other"
-    // — ApInitiated is the canonical example.
-    assert_connect_failure_reason(
-        "fi.nexus1.test_cc_other",
-        DisconnectReason::ApInitiated,
-        "other",
-    )
-    .await;
+async fn wifi_connect_holds_through_transient_handshake_timeout() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_cc_hs_hold";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let mut stream = subscribe_wifi_signal(&client, "ConnectComplete").await;
+    let job_id = issue_connect(&bus, bus_name).await;
+
+    // First handshake fails — transient. ConnectComplete must NOT
+    // fire; the job stays pending so sticky-retry gets a shot.
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Disconnected {
+                reason: DisconnectReason::HandshakeTimeout,
+            },
+        })
+        .unwrap();
+    assert!(
+        next_complete(&mut stream, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "ConnectComplete must NOT fire on a transient handshake_timeout"
+    );
+
+    // Sticky-retry's converged outcome fires the terminal edge.
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Connected {
+                bssid: MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]),
+                ssid: Ssid::new(b"corp".to_vec()).unwrap(),
+                frequency: 5180,
+                signal_dbm: -50,
+                security: SecurityMode::Wpa2Psk,
+            },
+        })
+        .unwrap();
+    let (jid, success, reason) = next_complete(&mut stream, Duration::from_millis(800))
+        .await
+        .expect("ConnectComplete after converged Connected");
+    assert_eq!(jid, job_id);
+    assert!(success);
+    assert_eq!(reason, "");
+    handle.stop().await;
+}
+
+/// Same hold-off, but the converged outcome is a permanent failure
+/// (the BSSID failure threshold tripped → CredentialsInvalid). The
+/// terminal edge fires once with the credentials_invalid wire reason.
+#[tokio::test]
+async fn wifi_connect_held_until_credentials_invalid_promotion() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_cc_hs_then_creds";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let mut stream = subscribe_wifi_signal(&client, "ConnectComplete").await;
+    let job_id = issue_connect(&bus, bus_name).await;
+
+    // Three transient handshake timeouts in a row — none should
+    // emit ConnectComplete.
+    for _ in 0..3 {
+        event_tx
+            .send(NexusEvent::WifiStateChanged {
+                ifindex: WLAN_IFINDEX,
+                state: WifiState::Disconnected {
+                    reason: DisconnectReason::HandshakeTimeout,
+                },
+            })
+            .unwrap();
+        assert!(
+            next_complete(&mut stream, Duration::from_millis(150))
+                .await
+                .is_none(),
+            "ConnectComplete must NOT fire on a transient handshake_timeout"
+        );
+    }
+
+    // Backend promotes the profile to credentials_invalid → terminal.
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Disconnected {
+                reason: DisconnectReason::CredentialsInvalid,
+            },
+        })
+        .unwrap();
+    let (jid, success, wire) = next_complete(&mut stream, Duration::from_millis(800))
+        .await
+        .expect("ConnectComplete on credentials_invalid promotion");
+    assert_eq!(jid, job_id);
+    assert!(!success);
+    assert_eq!(wire, "credentials_invalid");
+    handle.stop().await;
+}
+
+/// `Disconnected{ApInitiated}` (and other non-terminal reasons) are
+/// transient. The job stays held; an eventual Connected resolves it.
+#[tokio::test]
+async fn wifi_connect_holds_through_transient_ap_initiated() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_cc_ap_initiated";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let mut stream = subscribe_wifi_signal(&client, "ConnectComplete").await;
+    let job_id = issue_connect(&bus, bus_name).await;
+
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Disconnected {
+                reason: DisconnectReason::ApInitiated,
+            },
+        })
+        .unwrap();
+    assert!(
+        next_complete(&mut stream, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "ConnectComplete must NOT fire on a transient ap_initiated disconnect"
+    );
+
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Connected {
+                bssid: MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]),
+                ssid: Ssid::new(b"corp".to_vec()).unwrap(),
+                frequency: 5180,
+                signal_dbm: -50,
+                security: SecurityMode::Wpa2Psk,
+            },
+        })
+        .unwrap();
+    let (jid, success, _) = next_complete(&mut stream, Duration::from_millis(800))
+        .await
+        .expect("ConnectComplete after converged Connected");
+    assert_eq!(jid, job_id);
+    assert!(success);
+    handle.stop().await;
 }
 
 #[tokio::test]

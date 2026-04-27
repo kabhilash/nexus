@@ -1302,6 +1302,21 @@ fn wifi_state_label_and_details(
     (label, details)
 }
 
+/// Reasons on which `Wifi.ConnectComplete` resolves a pending
+/// Connect job. Anything outside this set is treated as transient —
+/// the wifi backend's cooldown + sticky-retry path will produce a
+/// converged outcome eventually (either a successful `Connected` or
+/// a promoted `CredentialsInvalid` after the BSSID failure threshold
+/// trips) and *that* fires `ConnectComplete`. Keeps the contract
+/// promised by the integration knowledge graph: one Connect call →
+/// exactly one ConnectComplete.
+fn is_terminal_connect_reason(wire: &str) -> bool {
+    matches!(
+        wire,
+        "credentials_invalid" | "rf_killed" | "supplicant_unavailable"
+    )
+}
+
 /// Map a [`nexus_core::DisconnectReason`] to the wire string
 /// documented in DD-006 §9 (also used by `Wifi.ConnectComplete`).
 fn disconnect_reason_wire(r: &nexus_core::DisconnectReason) -> &'static str {
@@ -1369,8 +1384,28 @@ async fn emit_wifi_state_changed(
 
 /// If a `Wifi.Connect` job is pending for `ifname`, resolve it
 /// against this state transition and emit `Wifi.ConnectComplete`.
-/// `Connected` resolves with success; `Disconnected{reason}` with
-/// the mapped `reason`. Other states leave the job pending.
+///
+/// Resolution rules (DD-006 §6.3 — `ConnectComplete` is the
+/// **terminal** edge for an operator-initiated `Connect`):
+///
+/// - `Connected` → success, `reason=""`.
+/// - `Disconnected { reason }` → emit only when the wire reason is
+///   one of the terminal set: `credentials_invalid`, `rf_killed`,
+///   `supplicant_unavailable`. These are the reasons sticky-retry
+///   either won't recover from on its own (`credentials_invalid`)
+///   or that require operator intervention before any further
+///   attempt could succeed (`rf_killed`, `supplicant_unavailable`).
+/// - Every other `Disconnected { reason }` (handshake_timeout,
+///   ap_initiated, post_sleep_recovery, …) is **swallowed** — the
+///   wifi backend's cooldown + sticky-retry path will keep trying,
+///   and the eventual converged transition (a successful `Connected`
+///   or a promoted `CredentialsInvalid` after the BSSID failure
+///   threshold trips) is what fires `ConnectComplete`. This means
+///   exactly one `ConnectComplete` per Connect job, matching the
+///   integration knowledge graph's stated contract.
+/// - All other `WifiState::*` variants (Connecting, Authenticating,
+///   Handshaking, Roaming, Idle, Scanning, Gone) leave the job
+///   pending — none of them are terminal for a Connect attempt.
 async fn resolve_connect_job(
     connection: &zbus::Connection,
     services: &Arc<Services>,
@@ -1380,7 +1415,18 @@ async fn resolve_connect_job(
     use nexus_core::WifiState;
     let (success, reason): (bool, &str) = match s {
         WifiState::Connected { .. } => (true, ""),
-        WifiState::Disconnected { reason } => (false, disconnect_reason_wire(reason)),
+        WifiState::Disconnected { reason } => {
+            let wire = disconnect_reason_wire(reason);
+            if !is_terminal_connect_reason(wire) {
+                tracing::debug!(
+                    ifname,
+                    reason = wire,
+                    "wifi connect: transient disconnect — holding job for sticky-retry verdict"
+                );
+                return;
+            }
+            (false, wire)
+        }
         _ => return,
     };
     let Some(job_id) = services.wifi_jobs.take_connect(ifname) else {
