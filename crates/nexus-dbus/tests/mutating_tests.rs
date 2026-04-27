@@ -1659,6 +1659,143 @@ async fn wifi_state_changed_signal_emitted_on_each_transition() {
     handle.stop().await;
 }
 
+/// `Wifi.StateChanged` must be a transition edge: re-emitting an
+/// identical `(state_label, details)` tuple is a contract violation
+/// because clients use it to know when something *changed*. Verify
+/// by sending two identical `WifiStateChanged{Connected{…}}` events
+/// back-to-back and asserting only one Wifi.StateChanged signal lands
+/// on the bus.
+#[tokio::test]
+async fn wifi_state_changed_deduped_across_identical_emissions() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let bus_name = "fi.nexus1.test_state_dedup";
+    let (handle, event_tx) = spawn(&bus, bus_name, always_allow(), ops.clone()).await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(wlan_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("fi.nexus.Wifi")
+        .unwrap()
+        .member("StateChanged")
+        .unwrap()
+        .path("/fi/nexus1/interface/wlan0")
+        .unwrap()
+        .build();
+    let mut stream = zbus::MessageStream::for_match_rule(rule, &client, None)
+        .await
+        .expect("subscribe Wifi.StateChanged");
+
+    let bssid = MacAddr([0xAA; 6]);
+    let ssid = Ssid::new(b"corp".to_vec()).unwrap();
+    let connected = WifiState::Connected {
+        bssid,
+        ssid: ssid.clone(),
+        frequency: 5180,
+        signal_dbm: -50,
+        security: SecurityMode::Wpa2Psk,
+    };
+    // First emission — the genuine transition; should land.
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: connected.clone(),
+        })
+        .unwrap();
+    // Identical re-emission — same label, same details. Must be
+    // suppressed.
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: connected,
+        })
+        .unwrap();
+
+    let mut connected_count = 0;
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            + Duration::from_millis(1);
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Ok((label, _)) =
+                    msg.body().deserialize::<(String, HashMap<String, OwnedValue>)>()
+                {
+                    if label == "connected" {
+                        connected_count += 1;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        connected_count, 1,
+        "Wifi.StateChanged 'connected' fired {connected_count} times for a single \
+         logical transition; expected exactly 1 (state-changed signals must dedup \
+         identical re-emissions)"
+    );
+
+    // After a different transition arrives, the dedup gate must
+    // re-arm — a follow-up identical 'connected' would be a real
+    // edge again. Drive disconnect → connected (different BSSID) and
+    // assert another 'connected' signal lands.
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Disconnected {
+                reason: nexus_core::DisconnectReason::ApInitiated,
+            },
+        })
+        .unwrap();
+    let other_bssid = MacAddr([0xBB; 6]);
+    event_tx
+        .send(NexusEvent::WifiStateChanged {
+            ifindex: WLAN_IFINDEX,
+            state: WifiState::Connected {
+                bssid: other_bssid,
+                ssid,
+                frequency: 5180,
+                signal_dbm: -50,
+                security: SecurityMode::Wpa2Psk,
+            },
+        })
+        .unwrap();
+
+    let mut saw_followup = false;
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            + Duration::from_millis(1);
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Ok((label, _)) =
+                    msg.body().deserialize::<(String, HashMap<String, OwnedValue>)>()
+                {
+                    if label == "connected" {
+                        saw_followup = true;
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        saw_followup,
+        "second `connected` (different BSSID) must fire — dedup gate did not re-arm"
+    );
+
+    handle.stop().await;
+}
+
 // ---------------------------------------------------------------------------
 // DD-006 §6.4 — fi.nexus.Bluetooth.Powered (writable property).
 //

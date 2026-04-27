@@ -449,27 +449,45 @@ async fn handle_event(
             if let Some(ifname) = to_remove {
                 unregister_interface(connection, state, &ifname).await?;
                 state.write().await.interfaces.remove(&ifname);
+                clear_state_emit_dedup_for(services, &ifname);
             }
         }
         NexusEvent::CarrierChanged { ifindex, up } => {
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
-                if let Some(e) = state.write().await.interfaces.get_mut(&ifname) {
-                    e.info.carrier = up;
+                let path = interface_path(&ifname);
+                let mut guard = state.write().await;
+                if let Some(e) = guard.interfaces.get_mut(&ifname) {
+                    if e.info.carrier != up {
+                        e.info.carrier = up;
+                        services.batcher.mark(&path, "fi.nexus.Interface", "Carrier");
+                    }
                 }
             }
         }
         NexusEvent::OperstateChanged { ifindex, state: op } => {
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
-                if let Some(e) = state.write().await.interfaces.get_mut(&ifname) {
-                    e.info.operstate = op;
+                let path = interface_path(&ifname);
+                let mut guard = state.write().await;
+                if let Some(e) = guard.interfaces.get_mut(&ifname) {
+                    if e.info.operstate != op {
+                        e.info.operstate = op;
+                        services
+                            .batcher
+                            .mark(&path, "fi.nexus.Interface", "OperState");
+                    }
                 }
             }
         }
         NexusEvent::WifiRfkillChanged { ifindex, powered } => {
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
-                if let Some(e) = state.write().await.interfaces.get_mut(&ifname) {
+                let path = interface_path(&ifname);
+                let mut guard = state.write().await;
+                if let Some(e) = guard.interfaces.get_mut(&ifname) {
                     if let InterfaceKindData::Wifi(c) = &mut e.kind_data {
-                        c.powered = powered;
+                        if c.powered != powered {
+                            c.powered = powered;
+                            services.batcher.mark(&path, "fi.nexus.Wifi", "Powered");
+                        }
                     }
                 }
             }
@@ -479,6 +497,20 @@ async fn handle_event(
             state: wifi_state,
         } => {
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
+                let path = interface_path(&ifname);
+                // Update the cache, then — when the new state is
+                // `Connected` — force the Powered/OperState/Carrier
+                // properties consistent BEFORE we emit the typed
+                // StateChanged signal. The wifi backend can't reach
+                // `Connected` unless rfkill is off and the kernel
+                // link is up, so the cached values must agree even
+                // if the upstream `WifiRfkillChanged` /
+                // `OperstateChanged` / `CarrierChanged` events
+                // happen to arrive on the bus *after* this one.
+                // Without this, a consumer woken by the `connected`
+                // edge can read stale `Powered=false` /
+                // `OperState=down` / `Carrier=false` values from the
+                // properties.
                 let managed_profile = {
                     let mut guard = state.write().await;
                     let mp = guard
@@ -489,14 +521,46 @@ async fn handle_event(
                         if let InterfaceKindData::Wifi(c) = &mut e.kind_data {
                             c.apply_state(&wifi_state);
                         }
+                        if matches!(wifi_state, nexus_core::WifiState::Connected { .. }) {
+                            if e.info.operstate != nexus_core::OperState::Up {
+                                e.info.operstate = nexus_core::OperState::Up;
+                                services.batcher.mark(
+                                    &path,
+                                    "fi.nexus.Interface",
+                                    "OperState",
+                                );
+                            }
+                            if !e.info.carrier {
+                                e.info.carrier = true;
+                                services.batcher.mark(
+                                    &path,
+                                    "fi.nexus.Interface",
+                                    "Carrier",
+                                );
+                            }
+                            if let InterfaceKindData::Wifi(c) = &mut e.kind_data {
+                                if !c.powered {
+                                    c.powered = true;
+                                    services
+                                        .batcher
+                                        .mark(&path, "fi.nexus.Wifi", "Powered");
+                                }
+                            }
+                        }
                     }
                     mp
                 };
+                // Flush every pending PropertiesChanged batch so the
+                // property snapshot a client reads after seeing the
+                // typed StateChanged signal is consistent with the
+                // signal's `state_label`. Same ordering applies to
+                // disconnect transitions; cheap to do unconditionally.
+                flush_due_properties(connection, services, true).await;
                 let (label, details) = wifi_state_label_and_details(
                     &wifi_state,
                     managed_profile.as_deref(),
                 );
-                emit_wifi_state_changed(connection, &ifname, &label, &details).await;
+                emit_wifi_state_changed(connection, services, &ifname, &label, &details).await;
                 resolve_connect_job(connection, services, &ifname, &wifi_state).await;
             }
         }
@@ -643,8 +707,13 @@ async fn handle_event(
                 // technology-specific signals; lifecycle transitions
                 // surface through `fi.nexus.Interface.StateChanged`
                 // with `reason` / `eap_method` / `profile` in details.
+                // Flush pending PropertiesChanged so consumers reading
+                // properties after the StateChanged edge see a
+                // consistent snapshot.
+                flush_due_properties(connection, services, true).await;
                 emit_eth_state_changed(
                     connection,
+                    services,
                     &ifname,
                     &state_label,
                     eap_method.as_deref(),
@@ -1145,9 +1214,11 @@ async fn emit_manager_internet_connectivity_changed(connection: &zbus::Connectio
 
 /// Emit `fi.nexus.Interface.StateChanged(new_state: s, details: a{sv})`
 /// for an Ethernet interface (DD-006 §6.2 / §9). Best-effort — a
-/// failure to emit is logged at debug.
+/// failure to emit is logged at debug. Idempotent: a re-emission
+/// with the same `(state_label, details)` is suppressed.
 async fn emit_eth_state_changed(
     connection: &zbus::Connection,
+    services: &Arc<Services>,
     ifname: &str,
     state_label: &str,
     eap_method: Option<&str>,
@@ -1190,6 +1261,20 @@ async fn emit_eth_state_changed(
                 }
             }
         }
+    }
+    if should_skip_state_emit(
+        services,
+        ifname,
+        "Ethernet.Interface.StateChanged",
+        state_label,
+        &details,
+    ) {
+        tracing::debug!(
+            ifname,
+            state = state_label,
+            "ethernet state-changed suppressed (same as last emission)"
+        );
+        return;
     }
     if let Err(e) = connection
         .emit_signal(
@@ -1302,6 +1387,50 @@ fn wifi_state_label_and_details(
     (label, details)
 }
 
+/// Build a stable fingerprint of a `*.StateChanged` payload, used by
+/// [`should_skip_state_emit`] to dedupe re-emissions. HashMap's
+/// `Debug` is order-independent in *content* but not in iteration
+/// order, so we sort keys before formatting to keep the fingerprint
+/// stable across calls.
+fn state_payload_fingerprint(
+    label: &str,
+    details: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+) -> String {
+    use std::collections::BTreeMap;
+    let sorted: BTreeMap<&String, &zbus::zvariant::OwnedValue> = details.iter().collect();
+    format!("{label}|{sorted:?}")
+}
+
+/// Returns `true` if the (`ifname`, `signal_member`) pair has already
+/// emitted this `(label, details)` and the daemon should suppress a
+/// redundant signal. On a non-duplicate call, the dedup map is
+/// updated so the next identical call would suppress.
+fn should_skip_state_emit(
+    services: &Services,
+    ifname: &str,
+    signal_member: &'static str,
+    label: &str,
+    details: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+) -> bool {
+    let fp = state_payload_fingerprint(label, details);
+    let mut map = services.state_emit_dedup.lock().unwrap();
+    let key = (ifname.to_owned(), signal_member);
+    match map.get(&key) {
+        Some(prev) if prev == &fp => true,
+        _ => {
+            map.insert(key, fp);
+            false
+        }
+    }
+}
+
+/// Drop any cached state-emit fingerprint for `ifname`. Called on
+/// `InterfaceRemoved` so a re-discovered interface starts fresh.
+fn clear_state_emit_dedup_for(services: &Services, ifname: &str) {
+    let mut map = services.state_emit_dedup.lock().unwrap();
+    map.retain(|(name, _), _| name != ifname);
+}
+
 /// Reasons on which `Wifi.ConnectComplete` resolves a pending
 /// Connect job. Anything outside this set is treated as transient —
 /// the wifi backend's cooldown + sticky-retry path will produce a
@@ -1336,8 +1465,14 @@ fn disconnect_reason_wire(r: &nexus_core::DisconnectReason) -> &'static str {
 /// AND `fi.nexus.Interface.StateChanged(new_state: s, details: a{sv})`
 /// on the interface's object path. Both signals carry identical
 /// payloads — clients pick one and ignore the other (DD-006 §9).
+///
+/// Idempotent: a re-emission with the same `(state_label, details)`
+/// is suppressed via [`should_skip_state_emit`]. State-changed
+/// signals are transition edges; emitting an unchanged value
+/// confuses consumers and inflates bus traffic.
 async fn emit_wifi_state_changed(
     connection: &zbus::Connection,
+    services: &Arc<Services>,
     ifname: &str,
     state_label: &str,
     details: &std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
@@ -1346,6 +1481,18 @@ async fn emit_wifi_state_changed(
     let Ok(obj_path) = ObjectPath::try_from(path.clone()) else {
         return;
     };
+    // The Wifi.StateChanged and Interface.StateChanged signals carry
+    // identical payloads, so a single dedup gate covers both. We key
+    // off the Wifi.StateChanged member so the same fingerprint
+    // suppresses both arms.
+    if should_skip_state_emit(services, ifname, "Wifi.StateChanged", state_label, details) {
+        tracing::debug!(
+            ifname,
+            state = state_label,
+            "wifi state-changed suppressed (same as last emission)"
+        );
+        return;
+    }
     if let Err(e) = connection
         .emit_signal(
             None::<&str>,

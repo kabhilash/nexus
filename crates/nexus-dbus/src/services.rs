@@ -115,6 +115,15 @@ pub struct Services {
     /// Outstanding Wi-Fi `Connect` / `Disconnect` / `Scan` jobs
     /// (DD-006 §6.3 completion-signal correlation).
     pub wifi_jobs: Arc<WifiJobs>,
+    /// Per-(ifname, signal-member) fingerprint of the last
+    /// `*.StateChanged` payload we emitted, used to suppress
+    /// re-emissions of an unchanged value. The contract is that
+    /// `Wifi.StateChanged` / `Ethernet.StateChanged` /
+    /// `Interface.StateChanged` are *transition* edges — a duplicate
+    /// (same label, same details) is a daemon-side bug.
+    pub state_emit_dedup: std::sync::Mutex<
+        std::collections::HashMap<(String, &'static str), String>,
+    >,
 }
 
 impl Services {
@@ -142,6 +151,7 @@ impl Services {
             wifi_supplicant,
             wifi_roaming_mode,
             wifi_jobs: Arc::new(WifiJobs::new()),
+            state_emit_dedup: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
