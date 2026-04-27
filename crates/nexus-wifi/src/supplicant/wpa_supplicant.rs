@@ -90,7 +90,18 @@ trait WpaInterface {
     /// `rssi` (i32), `linkspeed` (i32, Mbps), `noise` (i32, dBm),
     /// `frequency` (u32, MHz). Not every driver populates every
     /// field.
-    fn signal_poll(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
+    ///
+    /// WORKAROUND: declared return type is `OwnedValue` rather than
+    /// `HashMap<String, OwnedValue>` because some wpa_supplicant
+    /// builds (observed on Raspberry Pi OS / wpa_supplicant 2.10
+    /// and the Yocto kirkstone packaging) marshal the dict wrapped
+    /// in a variant — body signature `v(a{sv})` instead of the
+    /// documented `a{sv}`. zbus rejects the mismatch with
+    /// `Signature mismatch: got 'v', expected 'a{sv}'`. By accepting
+    /// the most permissive type here, the call site in
+    /// [`signal_info`] handles either layout (direct dict, or
+    /// variant-wrapped dict) at runtime.
+    fn signal_poll(&self) -> zbus::Result<OwnedValue>;
 
     /// Reply to a `NetworkRequest` signal. `path` is the network
     /// object path from the request; `field` is echoed so the
@@ -805,7 +816,11 @@ impl WifiSupplicantBackend for WpaSupplicantBackend {
 
     async fn signal_info(&self, ifindex: u32) -> Result<SignalInfo> {
         let iface = self.iface_proxy(ifindex).await?;
-        let dict = iface.signal_poll().await.map_err(zbus_err)?;
+        let raw = iface.signal_poll().await.map_err(zbus_err)?;
+        let dict = unwrap_signal_poll_dict(raw).map_err(|e| WifiError::Supplicant {
+            backend: "wpa_supplicant",
+            source: format!("decoding SignalPoll reply: {e}").into(),
+        })?;
         // Fields are all nominally optional — different drivers
         // populate different subsets. Missing → 0 / None so the
         // caller at least gets the rssi snapshot.
@@ -1397,6 +1412,39 @@ fn zbus_err(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> WifiError
     }
 }
 
+/// Convert the `OwnedValue` returned by `SignalPoll` into the
+/// `a{sv}` dict the rest of `signal_info` expects. Handles both
+/// shapes seen in the wild: the documented `a{sv}` (the proxy
+/// reads it as an `OwnedValue` whose inner Value is a dict) and
+/// the variant-wrapped `v(a{sv})` some wpa_supplicant builds emit
+/// instead. See the `signal_poll` proxy comment for the upstream
+/// quirk this works around.
+fn unwrap_signal_poll_dict(raw: OwnedValue) -> std::result::Result<HashMap<String, OwnedValue>, String> {
+    use zbus::zvariant::Value;
+    // Direct `a{sv}`: try the cheap conversion first.
+    if let Ok(d) = HashMap::<String, OwnedValue>::try_from(raw.clone()) {
+        return Ok(d);
+    }
+    // `v(a{sv})`: peel one layer of variant wrapping. `OwnedValue`
+    // derefs to `Value`; for a body of signature `v` the inner
+    // value is itself a `Value::Value(Box<Value>)`.
+    let inner: &Value<'_> = &raw;
+    if let Value::Value(boxed) = inner {
+        let inner_owned = OwnedValue::try_from(
+            boxed
+                .try_clone()
+                .map_err(|e| format!("variant clone failed: {e}"))?,
+        )
+        .map_err(|e| format!("inner variant convert: {e}"))?;
+        return HashMap::<String, OwnedValue>::try_from(inner_owned)
+            .map_err(|e| format!("inner dict convert: {e}"));
+    }
+    Err(format!(
+        "unexpected SignalPoll body shape: {:?}",
+        inner.value_signature()
+    ))
+}
+
 /// Decode an i32 out of wpa_supplicant's `SignalPoll` a{sv}. The
 /// supplicant picks the smallest integer type that fits, so we
 /// accept i16/i32/u16/u32 and widen.
@@ -1605,6 +1653,51 @@ pub fn translate_disconnect_reason(code: i32) -> super::DisconnectHint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- unwrap_signal_poll_dict ----------------------------------------
+
+    fn dict_with_rssi(rssi: i32) -> HashMap<String, OwnedValue> {
+        use zbus::zvariant::Value;
+        let mut d = HashMap::new();
+        d.insert(
+            "rssi".to_owned(),
+            OwnedValue::try_from(Value::new(rssi)).unwrap(),
+        );
+        d
+    }
+
+    #[test]
+    fn unwrap_signal_poll_handles_direct_dict() {
+        // Documented `a{sv}` shape: the proxy reads the body as
+        // `OwnedValue` whose inner Value is a Dict.
+        use zbus::zvariant::Value;
+        let dict = dict_with_rssi(-42);
+        let raw = OwnedValue::try_from(Value::new(dict.clone())).unwrap();
+        let out = unwrap_signal_poll_dict(raw).expect("direct dict decodes");
+        assert_eq!(signal_i32(&out, "rssi"), Some(-42));
+    }
+
+    #[test]
+    fn unwrap_signal_poll_peels_variant_wrapper() {
+        // Quirk shape `v(a{sv})`: the Value is a variant whose inner
+        // Value is the dict.
+        use zbus::zvariant::Value;
+        let dict = dict_with_rssi(-55);
+        let inner = Value::new(dict);
+        let wrapped = Value::Value(Box::new(inner));
+        let raw = OwnedValue::try_from(wrapped).unwrap();
+        let out = unwrap_signal_poll_dict(raw).expect("variant-wrapped dict decodes");
+        assert_eq!(signal_i32(&out, "rssi"), Some(-55));
+    }
+
+    #[test]
+    fn unwrap_signal_poll_rejects_unexpected_shape() {
+        // Anything that's neither a dict nor a variant-wrapped dict
+        // should error rather than silently return an empty map.
+        use zbus::zvariant::Value;
+        let raw = OwnedValue::try_from(Value::new(42i32)).unwrap();
+        assert!(unwrap_signal_poll_dict(raw).is_err());
+    }
 
     // ---- build_wpa_network_args (DD-003 §9.4) ---------------------------
 

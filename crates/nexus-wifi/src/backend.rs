@@ -414,9 +414,15 @@ impl WifiBackend {
             })
             .collect();
         for ifindex in due {
+            // Record the attempt up front so a failed `signal_info`
+            // doesn't trigger a retry on every 1 Hz heartbeat tick —
+            // we wait for the next configured interval just like a
+            // successful poll. Without this, a transient supplicant
+            // error (or a known-quirky `SignalPoll` return signature)
+            // pegs the supplicant proxy at 1 Hz indefinitely.
+            self.last_signal_poll.insert(ifindex, now);
             match self.supplicant.signal_info(ifindex).await {
                 Ok(info) => {
-                    self.last_signal_poll.insert(ifindex, now);
                     let ifname = self.ifname_of(ifindex);
                     if let Some(entry) = self.interfaces.get_mut(&ifindex) {
                         if let WifiState::Connected {
@@ -1179,6 +1185,14 @@ impl WifiBackend {
                 return Ok(());
             };
             let prev_connected = matches!(entry.state, WifiState::Connected { .. });
+            let prev_bssid: Option<nexus_core::MacAddr> = match &entry.state {
+                WifiState::Connected { bssid, .. } => Some(*bssid),
+                _ => None,
+            };
+            let prev_signal_dbm: Option<i32> = match &entry.state {
+                WifiState::Connected { signal_dbm, .. } => Some(*signal_dbm),
+                _ => None,
+            };
             let ifname = entry.info.ifname.clone();
 
             let after = match state {
@@ -1217,15 +1231,36 @@ impl WifiBackend {
                     ssid,
                     frequency,
                 } => {
+                    // Same-BSSID Connected re-emit (typically from the
+                    // wpa_supplicant adapter's reconciliation tick at
+                    // RECONCILE_INTERVAL = 2 s — see
+                    // crates/nexus-wifi/src/supplicant/wpa_supplicant.rs)
+                    // is a state refresh, not a fresh link edge.
+                    // Keeping the cached signal_dbm avoids clobbering
+                    // it with the -50 dBm sentinel until the next
+                    // genuine signal poll, and skipping `After::LinkReady`
+                    // stops the downstream WifiLinkReady fan-out (the
+                    // connectivity probe re-runs every refresh, the
+                    // connect-success metrics get inflated, etc.).
+                    let same_bss_refresh = prev_connected && prev_bssid == Some(bssid);
+                    let signal_dbm = if same_bss_refresh {
+                        prev_signal_dbm.unwrap_or(-50)
+                    } else {
+                        -50 // sentinel; filled by next signal poll
+                    };
                     entry.state = WifiState::Connected {
                         bssid,
                         ssid,
                         frequency,
-                        signal_dbm: -50, // filled in by next signal poll
+                        signal_dbm,
                         security: precomputed_security
                             .expect("precomputed for Connected arm above"),
                     };
-                    After::LinkReady { bssid }
+                    if same_bss_refresh {
+                        After::None
+                    } else {
+                        After::LinkReady { bssid }
+                    }
                 }
                 SupplicantState::Disconnected { reason } => {
                     let mapped = map_disconnect(reason.clone());

@@ -1142,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-wifi"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "async-trait",
  "chrono",

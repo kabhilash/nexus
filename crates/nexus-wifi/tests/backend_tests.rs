@@ -260,6 +260,67 @@ async fn discovery_scan_match_connect_emits_link_ready() {
     h.shutdown().await;
 }
 
+/// A `SupplicantState::Connected` re-emit for the **same BSSID** —
+/// what the wpa_supplicant adapter's reconciliation tick produces
+/// every `RECONCILE_INTERVAL` (2 s) — must NOT fan out a fresh
+/// `WifiLinkReady`. Without the gate it caused the connectivity
+/// probe to re-run every 2 s and inflated the connect-success
+/// metrics on every reconcile.
+#[tokio::test]
+async fn duplicate_supplicant_connected_does_not_re_emit_link_ready() {
+    let profile = wifi_profile(b"corp", "correcthorse", 10);
+    let mut h = Harness::start(vec![profile], WifiConfig::default()).await;
+    let bssid = MacAddr([0xAA; 6]);
+    let ssid = Ssid::new(b"corp".to_vec()).unwrap();
+
+    h.supplicant
+        .set_scan_results(2, vec![bss(bssid.0, b"corp", -45, SecurityMode::Wpa2Psk)]);
+    h.supplicant.set_connect_outcome(2, MockBehavior::Success);
+    let _ = h
+        .event_tx
+        .send(NexusEvent::InterfaceDiscovered(wifi_interface(2, "wlan0")));
+
+    // Wait for the first (genuine) LinkReady from the connect path.
+    h.expect_event(
+        |e| matches!(e, NexusEvent::WifiLinkReady { ifindex: 2 }),
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Inject a same-BSSID Connected re-emit, exactly what the
+    // reconciliation tick would produce.
+    let _ = h.sup_tx.send(SupplicantEvent::State {
+        ifindex: 2,
+        state: nexus_wifi::supplicant::SupplicantState::Connected {
+            bssid,
+            ssid,
+            frequency: 5180,
+        },
+    });
+
+    // Drain the bus for a short window and assert no further
+    // LinkReady arrives. A LinkReady within 300 ms means the gate
+    // didn't take.
+    let deadline = Instant::now() + Duration::from_millis(300);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, h.event_rx.recv()).await {
+            Ok(Ok(NexusEvent::WifiLinkReady { ifindex: 2 })) => {
+                panic!(
+                    "duplicate SupplicantState::Connected re-emitted WifiLinkReady — \
+                     reconciliation tick fan-out is back"
+                );
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    h.shutdown().await;
+}
+
 /// DD-003 §6.3: a Fail(BadCredentials) outcome surfaces as a
 /// Disconnected { CredentialsInvalid } and does NOT transition to
 /// Connected.
