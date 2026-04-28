@@ -672,6 +672,17 @@ impl ManagerOps for ZbusManagerOps {
         Ok(path.as_str().to_owned())
     }
 
+    async fn wifi_set_powered(&self, ifname: &str, on: bool) -> Result<(), NexusctlError> {
+        let path = resolve_interface_by_ifname(&self.connection, ifname).await?;
+        let wifi = WifiProxy::builder(&self.connection)
+            .path(path)
+            .map_err(from_zbus_error)?
+            .build()
+            .await
+            .map_err(from_zbus_error)?;
+        wifi.set_powered(on).await.map_err(from_zbus_error)
+    }
+
     async fn bt_set_powered(&self, adapter: &str, on: bool) -> Result<(), NexusctlError> {
         let path = resolve_interface_by_ifname(&self.connection, adapter).await?;
         let bt = BluetoothProxy::builder(&self.connection)

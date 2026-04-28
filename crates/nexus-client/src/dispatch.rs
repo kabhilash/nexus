@@ -30,6 +30,7 @@ pub fn command_is_mutating(command: &Option<Command>) -> bool {
                 | WifiSub::ConnectProfile { .. }
                 | WifiSub::Disconnect { .. }
                 | WifiSub::Forget { .. }
+                | WifiSub::Power { .. }
         ),
         Some(Command::Bt { sub }) => matches!(
             sub,
@@ -146,6 +147,17 @@ pub async fn dispatch(
             }
             WifiSub::Forget { reference } => {
                 commands::wifi::forget(ops, reference, format, &ctx, stdout).await
+            }
+            WifiSub::Power { state, iface } => {
+                commands::wifi::power(
+                    ops,
+                    iface.as_deref(),
+                    state.as_bool(),
+                    format,
+                    &ctx,
+                    stdout,
+                )
+                .await
             }
             WifiSub::Profiles => commands::wifi::profiles(ops, format, &ctx, stdout).await,
         },

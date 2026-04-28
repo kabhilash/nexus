@@ -124,6 +124,25 @@ pub async fn connect_profile(
     render(&outcome, format, ctx, w).map_err(io_err)
 }
 
+pub async fn power(
+    ops: &dyn ManagerOps,
+    iface: Option<&str>,
+    on: bool,
+    format: OutputFormat,
+    ctx: &RenderContext,
+    w: &mut dyn Write,
+) -> Result<(), NexusctlError> {
+    let target = resolve_wifi_iface(ops, iface).await?;
+    ops.wifi_set_powered(&target, on).await?;
+    let outcome = MutationOutcome {
+        action: "wifi power".into(),
+        subject: target,
+        id: None,
+        note: Some(if on { "on".into() } else { "off".into() }),
+    };
+    render(&outcome, format, ctx, w).map_err(io_err)
+}
+
 pub async fn disconnect(
     ops: &dyn ManagerOps,
     iface: Option<&str>,

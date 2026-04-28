@@ -529,6 +529,17 @@ pub trait ManagerOps: Send + Sync {
         })
     }
 
+    /// Toggle soft-rfkill for a Wi-Fi interface. Maps to a property
+    /// write on `fi.nexus.Wifi.Powered`; the daemon-side writer
+    /// enforces the `fi.nexus.set_power` polkit action and routes
+    /// through the wifi backend's rfkill plumbing. `on=false`
+    /// asserts the soft block; `on=true` releases it.
+    async fn wifi_set_powered(&self, _ifname: &str, _on: bool) -> Result<(), NexusctlError> {
+        Err(NexusctlError::Unsupported {
+            detail: "wifi_set_powered".into(),
+        })
+    }
+
     // ---- Mutating: bluetooth ----
 
     async fn bt_set_powered(&self, _adapter: &str, _on: bool) -> Result<(), NexusctlError> {

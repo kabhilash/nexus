@@ -38,6 +38,13 @@ pub trait Wifi {
     #[zbus(property, name = "Powered")]
     fn powered(&self) -> zbus::Result<bool>;
 
+    /// Property setter for `Powered`. zbus emits a
+    /// `Properties.Set` call under the hood. The daemon-side
+    /// implementation enforces the `fi.nexus.set_power` polkit
+    /// action and routes through the wifi backend's rfkill writer.
+    #[zbus(property, name = "Powered")]
+    fn set_powered(&self, on: bool) -> zbus::Result<()>;
+
     /// `Scan(params: a{sv}) -> (job_id: s)`. Pass an empty dict for
     /// the default "active probe every frequency" behaviour. The
     /// returned ULID correlates the subsequent

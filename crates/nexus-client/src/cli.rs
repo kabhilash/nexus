@@ -420,6 +420,15 @@ pub enum WifiSub {
         #[arg(long = "pause-auto-connect")]
         pause_auto_connect: bool,
     },
+    /// Toggle soft-rfkill for a Wi-Fi interface (the
+    /// `fi.nexus.Wifi.Powered` setter). `on` releases the soft
+    /// block; `off` asserts it. With multiple Wi-Fi interfaces
+    /// present, pass `iface` explicitly; otherwise nexusctl
+    /// auto-selects the only one.
+    Power {
+        state: OnOff,
+        iface: Option<String>,
+    },
     /// Delete a stored Wi-Fi profile (matched by SSID or ULID).
     Forget { reference: String },
     /// List saved Wi-Fi profiles with SSID, security, priority,
