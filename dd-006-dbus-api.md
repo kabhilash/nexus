@@ -21,6 +21,7 @@
    - 5.1 [Properties](#51-properties)
    - 5.2 [Methods](#52-methods)
    - 5.3 [Signals](#53-signals)
+   - 5.4 [Internet-reachability probe](#54-internet-reachability-probe)
 6. [Interface Objects](#6-interface-objects)
    - 6.1 [Common Interface](#61-common-interface)
    - 6.2 [Ethernet Interface](#62-ethernet-interface)
@@ -46,6 +47,7 @@
     - 12.1 [PropertiesChanged](#121-propertieschanged)
     - 12.2 [Coalescing](#122-coalescing)
     - 12.3 [Atomicity](#123-atomicity)
+    - 12.4 [Edge ordering: properties before StateChanged](#124-edge-ordering-properties-before-statechanged)
 13. [Introspection and Discoverability](#13-introspection-and-discoverability)
 14. [Service Activation and Readiness](#14-service-activation-and-readiness)
     - 14.1 [Service Activation](#service-activation)
@@ -215,6 +217,7 @@ The Manager additionally implements `org.freedesktop.DBus.ObjectManager` so clie
 | `EthernetProfiles` | `ao` | read | Array of object paths for stored Ethernet profiles |
 | `WifiProfiles` | `ao` | read | Array of object paths for stored Wi-Fi profiles |
 | `MasterKeySource` | `s` | read | `"tpm"` \| `"keyring"` \| `"file"` — active source per DD-007 §4.2 |
+| `InternetConnectivity` | `s` | read | Last observed internet-reachability state. One of `"internetUnknown"`, `"internetOnline"`, `"internetCaptivePortal"`, `"internetOffline"`. See §5.4 |
 
 Example `ApiCapabilities` tokens: `"wifi.wpa3"`, `"wifi.owe"`, `"eth.dot1x"`, `"profile.rotate"`. Clients check for tokens rather than comparing versions.
 
@@ -351,7 +354,35 @@ MasterKeyRotated(job_id: s, report: a{sv})
     Fired when a RotateMasterKey job completes (successfully or not).
     report dict contains "outcome" (s: "success"|"failed"),
     "profiles_rewritten" (u), "duration_ms" (t), and on failure "error" (s).
+
+InternetConnectivityChanged(state: s)
+    Fired when the daemon's internet-reachability probe transitions
+    between states. state is one of "internetUnknown",
+    "internetOnline", "internetCaptivePortal", "internetOffline".
+    Mirrors the Manager.InternetConnectivity property; see §5.4 for
+    the probe model and event semantics.
 ```
+
+### 5.4 Internet-reachability probe
+
+`InternetConnectivity` is the daemon's coarse answer to "does this device have a working path to the internet right now?". A probe runs an HTTP/1.1 `GET` against a configurable generate-204 endpoint (default `http://connectivity-check.ubuntu.com/`, configurable in `nexus.toml`).
+
+**State values.**
+- `internetUnknown` — pre-probe initial value. Surfaced once at startup before the first probe completes; never re-entered after the first transition.
+- `internetOnline` — probe URL returned the expected `204 No Content`.
+- `internetCaptivePortal` — probe URL responded with a different status (typically `200` with an HTML login page, or a `3xx` redirect to one). Strong evidence of a captive portal in the path.
+- `internetOffline` — DNS failure, connection refused, timeout, or any other transport-level failure.
+
+**Event-driven, no periodic backstop.** The probe is purely event-driven and runs on three triggers:
+1. Once at daemon startup, before the first wire event, so consumers never observe `internetUnknown` after the first event-loop tick on a host where carriers were already up.
+2. On every `WifiLinkReady` / `EthLinkReady` from the event bus.
+3. On the *last* `WifiLinkLost` / `EthLinkLost` (i.e., the carrier-set going empty), where the state flips to `internetOffline` immediately without waiting for a probe round-trip — there is nothing reachable to probe.
+
+There is no periodic re-probe: between link transitions the published state is sticky. This keeps the probe from generating background traffic on quiet, otherwise-online devices and avoids the false-flap pattern of probes racing against scheduled re-checks.
+
+**Signal semantics.** `InternetConnectivityChanged` fires only on transitions, not on every probe. A consumer that polls the property gets the same view as one that subscribes; the property mirrors the signal exactly.
+
+**Failure isolation.** A malformed probe URL is rejected at startup and stops the probe loop; the property stays at `internetUnknown` and a `subsystem_unavailable` notification fires. A probe round-trip that exceeds the configured timeout (default 5 s) is treated as `internetOffline` for that round.
 
 ---
 
@@ -412,7 +443,16 @@ The sentinel tuple is a D-Bus-layer construct — the Wi-Fi Backend's state mach
 | `ScanResults` | `ao` | read | Array of scan-result object paths (§8) |
 | `Supplicant` | `s` | read | `"wpa_supplicant"` \| `"iwd"` |
 | `RoamingMode` | `s` | read/write | `"off"` \| `"supplicant"` \| `"nexus"` |
-| `Powered` | `b` | read/write | Whether rfkill is released for this interface |
+| `Powered` | `b` | read/write | Whether rfkill is released for this interface. See "Powered=off side effects" below |
+
+**Powered=off side effects.** When `Powered` transitions from `true` to `false` (operator write of `Powered=false`, hardware kill switch, or any out-of-band sysfs/`/dev/rfkill` write), the D-Bus layer brings every Wi-Fi-scoped property into a "no association" view at the same edge as the `Powered` change:
+
+- `State` is forced to `"disconnected"` (with `details.reason = "rf_killed"` on the accompanying `StateChanged`).
+- `ConnectedBss` is reset to the all-empty sentinel tuple.
+- `SignalDbm` and `Frequency` are zeroed.
+- `ScanResults` is emptied; the per-BSSID `fi.nexus.ScanResult` child objects are unregistered, with one `ObjectManager.InterfacesRemoved` per object path.
+
+This holds regardless of how the radio was powered down: an operator `Powered=false`, a hardware switch flip, and a direct `/sys/class/rfkill/rfkillN/soft` write all converge on the same observable surface. A power-on cycle starts with an empty scan cache that the next `ScanComplete` repopulates. Clients that previously cached a scan-result path list across power cycles will see those paths fail with `NotFound` after the cycle and must re-read `ScanResults` after each `Powered=true` edge — see the lifecycle note in the integration knowledge graph for `prop:fi.nexus.Wifi.ScanResults`.
 
 **Methods:**
 
@@ -461,12 +501,26 @@ Connect(profile: o) -> (job_id: s)
     (still sticky). Only explicit Disconnect or daemon restart clears
     the stickiness.
 
-    ConnectComplete fires on the first terminal state for the attempt:
-    Connected (success) or Disconnected{reason} (failure). The
-    backend's internal retry loop continues independently, but each
-    operator-initiated Connect resolves to exactly one ConnectComplete.
-    If a Disconnect arrives before either edge, the in-flight
-    ConnectComplete fires with reason="cancelled".
+    ConnectComplete fires once per Connect job, on the *converged*
+    terminal edge for the attempt — not on every Disconnected reason
+    the backend passes through. The terminal set is:
+      success: a transition to Connected.
+      failure: a Disconnected{reason} whose reason is in the terminal
+               set { credentials_invalid | rf_killed |
+               supplicant_unavailable }.
+    Transient disconnects — HandshakeTimeout, ApInitiated, Inactivity,
+    ProtocolError, PostSleepRecovery, DriverWedge, Unspecified, Other —
+    are NOT terminal: the backend's cooldown + sticky-retry loop
+    continues, and the eventual converged transition (a successful
+    Connected, or a CredentialsInvalid promotion after the BSSID
+    failure threshold trips per DD-003 §6.3) is what fires
+    ConnectComplete. Consumers SHOULD NOT special-case these reasons;
+    earlier builds (before nexus-dbus 0.13.1) leaked them and forced
+    consumers to keep their own connect-watchdog timers.
+
+    If a Disconnect arrives before the verdict, the in-flight
+    ConnectComplete fires with reason="cancelled" from the Disconnect
+    handler.
     Errors: fi.nexus.Error.NotFound, fi.nexus.Error.InvalidArgument, fi.nexus.Error.AuthFailed
 
 Disconnect(params: a{sv}) -> (job_id: s)
@@ -916,29 +970,44 @@ StateChanged(new_state: s, details: a{sv})
     state transition; clients should pick one and ignore the other.
 
 ConnectComplete(job_id: s, success: b, reason: s)
-    Terminal signal for an operator-initiated Connect. `job_id`
-    matches the value returned by `Connect`. `success` is true when
-    the interface reached `Connected` for the attempt; false when it
-    reached `Disconnected{reason}` first or when the in-flight
-    Connect was cancelled by an explicit `Disconnect`.
+    Converged terminal signal for an operator-initiated Connect.
+    `job_id` matches the value returned by `Connect`. Exactly one
+    ConnectComplete fires per accepted Connect call.
+
+    `success` is true when the interface reached `Connected` for
+    the attempt; false when it reached a Disconnected{reason} in
+    the terminal-failure set, or was cancelled by an explicit
+    Disconnect.
     `reason` on success is `""`. On failure it is one of:
       "credentials_invalid"   — bad PSK / EAP credentials, or the
                                  profile is now flagged
-                                 CredentialsInvalid.
-      "server_unreachable"    — the AAA / RADIUS server backing the
-                                 EAP exchange could not be reached.
-      "handshake_timeout"     — 4-way handshake did not complete in
-                                 time.
+                                 CredentialsInvalid (including the
+                                 BSSID-failure-threshold promotion
+                                 from sticky retry, DD-003 §6.3).
       "rf_killed"             — interface entered Disconnected
-                                 because rfkill was asserted.
+                                 because rfkill was asserted before
+                                 the attempt converged.
       "supplicant_unavailable"— wpa_supplicant / iwd dropped off the
                                  bus mid-attempt (NameOwnerChanged
                                  to no owner).
       "cancelled"             — operator issued `Disconnect` before
-                                 the attempt reached a terminal edge.
-      "other"                 — any reason not in the list above
-                                 (transient AP-initiated disconnect,
-                                 protocol error, driver wedge, etc.).
+                                 the attempt converged.
+    Transient reasons (HandshakeTimeout, ApInitiated, Inactivity,
+    ProtocolError, PostSleepRecovery, DriverWedge, Unspecified,
+    Other) are NOT terminal and never appear here; the backend's
+    sticky-retry path swallows them and the eventual converged
+    transition fires ConnectComplete instead. See §6.3 Connect for
+    the rationale and the historical leak before nexus-dbus 0.13.1.
+
+    Ordering. A successful ConnectComplete is emitted *after* the
+    PropertiesChanged batch that brings `fi.nexus.Wifi.State` to
+    `"connected"` and `fi.nexus.Wifi.ConnectedBss` /
+    `fi.nexus.Interface.OperState` / `fi.nexus.Interface.Carrier`
+    into a connected-consistent view, *and after* the typed
+    `fi.nexus.Wifi.StateChanged("connected", …)` and
+    `fi.nexus.Interface.StateChanged("connected", …)` signals. See
+    §12.4. A consumer that reads any of these properties on the
+    ConnectComplete edge sees the post-connect values.
 
 DisconnectComplete(job_id: s, success: b, reason: s)
     Terminal signal for an operator-initiated Disconnect. `job_id`
@@ -1101,6 +1170,16 @@ Cold properties bypass the batcher entirely and emit `PropertiesChanged` immedia
 ### 12.3 Atomicity
 
 When multiple properties change in response to a single backend event, Nexus emits a single `PropertiesChanged` with all of them batched. For example, when a Wi-Fi interface connects, `State`, `ConnectedBss`, `SignalDbm`, and `Frequency` all change together and appear in one signal.
+
+### 12.4 Edge ordering: properties before StateChanged
+
+A consistency guarantee that holds across the wire:
+
+- **Properties first, signals second.** When a backend event drives both a property update and a technology-specific `StateChanged` signal (e.g., `fi.nexus.Wifi.StateChanged`, `fi.nexus.Bluetooth.StateChanged`), the daemon emits the `PropertiesChanged` carrying the new property values *before* the `StateChanged`. A consumer that woke on `StateChanged` and then read any of the affected properties sees the post-edge values, not the pre-edge ones.
+- **Same rule for completion signals.** Job-terminal signals (`Wifi.ConnectComplete`, `Wifi.DisconnectComplete`, `Wifi.ScanComplete`) fire *after* the `StateChanged` and `PropertiesChanged` that bring the relevant state into a consistent view. See §6.3 ConnectComplete for the explicit rule.
+- **No re-emission of unchanged state.** A `StateChanged` is only emitted when the cached state actually changes. The state-watcher path re-reads the authoritative value and dedupes against its last published value before emitting; spurious supplicant chatter that does not change the public state is dropped.
+
+These invariants exist so that consumers can use the signal as an *edge* and the property as the *level* without racing — a pattern integrators rely on to avoid bespoke debouncing logic. Earlier builds (before nexus-dbus 0.13.x) did not enforce the ordering and forced consumers to re-read with a short delay; do not regress.
 
 ---
 

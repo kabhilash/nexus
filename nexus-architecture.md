@@ -184,6 +184,11 @@ Default configuration: `wifi.backend = "wpa_supplicant"`. Default Cargo features
 
 **Profile Store.** Persists per-technology configuration to disk under `/var/lib/nexus/`. Credentials are encrypted at rest. Detailed design: [DD-007: Profile Store](./dd-007-profile-store.md)
 
+**Cross-cutting subsystems.** A small number of features sit alongside the per-technology backends rather than inside any single one:
+
+- **Rfkill watcher / writer.** Owns `/dev/rfkill` end-to-end. The reader (a non-blocking fd wrapped in `tokio::io::unix::AsyncFd`) republishes every kernel rfkill edge — hardware switches, `rfkill` userspace, sysfs writes, the kernel's synthetic `RFKILL_OP_ADD` events at open time — onto the event bus as `WifiRfkillChanged`. The writer (a blocking fd guarded by `spawn_blocking`) accepts `WifiCommand::SetPowered` from the operator-facing `fi.nexus.Wifi.Powered` property. Rfkill is a first-class state-machine input for the Wi-Fi backend, not just a flag (DD-003 §13.5). Lives in `nexus-wifi::rfkill`; the Bluetooth backend may grow a parallel arm if Bluetooth-specific rfkill ever needs the same first-class treatment.
+- **Connectivity probe.** A small daemon-scope task runs an HTTP/1.1 GET against a generate-204 endpoint (default `http://connectivity-check.ubuntu.com/`) on every `WifiLinkReady` / `EthLinkReady`, plus once at startup, and forces `internetOffline` immediately on the last `LinkLost`. Surfaces as the `fi.nexus.Manager.InternetConnectivity` property and `InternetConnectivityChanged` signal (DD-006 §5.4). Event-driven only — no periodic backstop. Lives in `nexus-daemon::connectivity` and produces only `NexusEvent::InternetConnectivityChanged`; it intentionally has no per-interface state of its own.
+
 ---
 
 ## 6. Event Bus

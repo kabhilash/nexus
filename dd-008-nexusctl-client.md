@@ -212,15 +212,34 @@ nexusctl
 │
 ├── wifi                              Wi-Fi operations
 │   ├── list                          List Wi-Fi interfaces
-│   ├── show <iface>                  Show current connection, signal, etc.
+│   ├── show <iface>                  Show the connection card: SSID/security/
+│   │                                  signal, IP rows (delegated to networkd
+│   │                                  /resolved — see §6.6), and an
+│   │                                  "Alternative APs" table of the other
+│   │                                  in-range BSSes for the connected SSID
 │   ├── scan [<iface>]                Trigger a scan; print results. If <iface>
 │   │                                  is omitted and exactly one Wi-Fi
 │   │                                  interface exists, uses it. With zero
 │   │                                  interfaces: error (exit 1). With two or
 │   │                                  more: error with a list (exit 2, usage).
 │   ├── connect <ssid> [--iface X]    Connect by SSID (prompts for PSK if open/unknown)
-│   ├── connect-profile <profile>     Connect using a stored profile (by ULID or SSID)
-│   ├── disconnect [<iface>]          Disconnect
+│   ├── connect-profile <profile>     Connect using a stored profile (by ULID, label, or SSID)
+│   ├── disconnect [<iface>]          Disconnect. With --pause-auto-connect,
+│   │      [--pause-auto-connect]     also block the active profile from
+│   │                                  auto-connect for this session (runtime-
+│   │                                  only; profile's on-disk auto_connect
+│   │                                  field is not modified — DD-006 §6.3)
+│   ├── power on|off [<iface>]        Toggle soft-rfkill via the
+│   │                                  fi.nexus.Wifi.Powered property (DD-006
+│   │                                  §6.3). Single-Wi-Fi-interface implied
+│   │                                  when unambiguous, same selection
+│   │                                  semantics as `wifi scan`
+│   ├── profiles                      List saved Wi-Fi profiles with SSID,
+│   │                                  security, priority, auto-connect, and
+│   │                                  credential status. The kind-agnostic
+│   │                                  `profile list --kind wifi` returns a
+│   │                                  generic row; this returns Wi-Fi-specific
+│   │                                  columns
 │   └── forget <ssid|ulid>            Remove a stored Wi-Fi profile
 │
 ├── bt                                Bluetooth operations
@@ -397,7 +416,23 @@ Bitrate:     866 Mbps
 Security:    WPA2-Personal
 Profile:     01ARZ3NDEKTSV4RRFFQ69G5FAV
 Connected:   2m 47s ago
+
+[ip]
+  IPv4:         10.0.4.27
+  IPv4 prefix:  24
+  IPv4 gateway: 10.0.4.1
+  IPv6:         2001:db8::a1
+  IPv6 gateway: fe80::1
+  DNS:          10.0.4.1, 2001:db8::1
+
+[alt aps]
+  aa:11:bb:22:cc:34  Ch 36  5180 MHz  -67 dBm  wpa2_personal
+  aa:11:bb:22:cc:35  Ch 149 5745 MHz  -71 dBm  wpa2_personal
 ```
+
+The `[ip]` block is sourced off-Nexus from systemd-networkd + resolved over D-Bus (Nexus owns the link layer and explicitly delegates IP — see the architecture doc and the integration knowledge graph's `ui_design_patterns.connected_card_recipe`). Missing services collapse to a single `unavailable: …` line so a stripped-down rootfs doesn't fail the whole command. Empty values render as `—`.
+
+The `[alt aps]` block lists every BSSID currently in the scan cache for the connected SSID, minus the one we're associated with. Up to 8 rows; the rest collapse into `(N more)`. Driven by the integration knowledge graph's `ui_design_patterns.alternative_aps_for_connected_ssid`.
 
 Colors (when enabled):
 - Green for healthy states (connected, up, authenticated, fix)
@@ -1114,7 +1149,7 @@ Add `--terse`, `--pretty`, `--format`. Implement the full error translation tabl
 
 ### Phase 4 — Mutating commands (non-interactive path)
 
-`wifi connect` (with `--psk` non-interactive), `wifi disconnect`, `bt power`, `bt connect`, `bt disconnect`, `bt forget`, `bt trust`, `profile add-wifi` (with `--psk`), `profile remove`, `power set`.
+`wifi connect` (with `--psk` non-interactive), `wifi disconnect` (with optional `--pause-auto-connect`), `wifi power on|off`, `wifi profiles`, `bt power`, `bt connect`, `bt disconnect`, `bt forget`, `bt trust`, `profile add-wifi` (with `--psk`), `profile remove`, `power set`.
 
 **Exit criterion:** Every non-interactive mutating command works. PolicyKit denial produces the correct error and exit code.
 
