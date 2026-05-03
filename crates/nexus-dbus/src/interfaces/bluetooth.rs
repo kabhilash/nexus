@@ -322,15 +322,15 @@ fn decode_discovery_filter(
 /// backend applies the per-prompt-kind map (so this function never
 /// needs to know which kind of prompt is pending). Recognised shapes:
 ///
-/// - `s:"cancel"`      → [`PairingAnswer::Cancel`]
+/// - `s:"cancel"` → [`PairingAnswer::Cancel`]
 /// - `s:"acknowledge"` → [`PairingAnswer::Acknowledge`]
-/// - `s:<other>`       → [`PairingAnswer::Pin`] (backend validates
-///                        length + printable-ASCII for RequestPin,
-///                        and rejects the Pin variant for every
-///                        other kind)
-/// - `u:<n>`           → [`PairingAnswer::Passkey`] (backend
-///                        validates the 0..=999_999 range)
-/// - `b:<v>`           → [`PairingAnswer::Accept`]
+/// - `s:<other>` → [`PairingAnswer::Pin`]
+/// - `u:<n>` → [`PairingAnswer::Passkey`]
+/// - `b:<v>` → [`PairingAnswer::Accept`]
+///
+/// The backend validates length + printable-ASCII on the `Pin`
+/// variant for RequestPin prompts (and rejects `Pin` for every
+/// other prompt kind), and the `0..=999_999` range on `Passkey`.
 ///
 /// Any other variant type returns `fi.nexus.Error.InvalidArgument`
 /// with a message naming the expected types.

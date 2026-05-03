@@ -52,6 +52,7 @@ pub async fn scan(
     render(&results, format, ctx, w).map_err(io_err)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     ops: &dyn ManagerOps,
     ssid: &str,

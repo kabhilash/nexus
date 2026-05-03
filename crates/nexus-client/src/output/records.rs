@@ -1,15 +1,14 @@
 //! `Render` impls for every Phase 3 view type.
 //!
 //! Each impl follows the same shape:
-//! - `render_human`  — comfy-table for lists, vertical key/value
-//!                      for single records.
-//! - `render_terse`  — one record per line, `emit` helper takes
-//!                      `(&str, &str)` pairs so `--fields` filtering
-//!                      works uniformly.
-//! - `render_json`   — delegate to [`super::json::write`].
+//! - `render_human` — comfy-table for lists, vertical key/value for
+//!   single records.
+//! - `render_terse` — one record per line, `emit` helper takes
+//!   `(&str, &str)` pairs so `--fields` filtering works uniformly.
+//! - `render_json` — delegate to [`super::json::write`].
 //! - `render_pretty` — same vertical block as human for single
-//!                      records; list views render per-record
-//!                      blocks separated by a blank line.
+//!   records; list views render per-record blocks separated by a
+//!   blank line.
 //!
 //! `escape_terse` from the parent module does the separator
 //! escaping; `vertical_block` is the shared helper for aligned
@@ -72,7 +71,7 @@ fn terse_pairs(
         Some(list) => {
             let known: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
             for name in list {
-                if !known.iter().any(|k| *k == name.as_str()) {
+                if !known.contains(&name.as_str()) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!("unknown field `{name}`; supported: {}", known.join(", ")),
@@ -1003,15 +1002,11 @@ impl Render for crate::watch::WatchEvent {
         // `--fields` filter picks columns; default is time, kind,
         // then every flat field in insertion-order (alphabetical
         // since we use BTreeMap).
-        let mut all: Vec<(&'static str, String)> = Vec::new();
-        // We need 'static str keys; intern via Box::leak on each
-        // distinct key for `--fields` parity. To avoid that per-
-        // event leak, just stream with owned strings and bypass
-        // `terse_pairs` for WatchEvent.
-        all.push(("time", self.time.clone()));
-        all.push(("kind", self.kind.clone()));
-        let _ = ctx;
-        // Flat fields follow. Emit values directly.
+        //
+        // We bypass `terse_pairs` for WatchEvent because that helper
+        // wants `&'static str` keys, and per-event Box::leak interning
+        // would leak the lifetime of every distinct key — owned-string
+        // streaming directly into `out` avoids that.
         let mut out = String::new();
         out.push_str(&self.time);
         out.push_str(&ctx.separator);

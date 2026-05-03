@@ -140,15 +140,16 @@ impl EthernetBackend {
             {
                 self.on_carrier_down(ifindex).await?;
             }
-            NexusEvent::InterfaceRemoved { ifindex } => {
-                if self.interfaces.remove(&ifindex).is_some() {
-                    self.auth_ctx.remove(&ifindex);
-                    if let Some(auth) = self.auth_backend.as_mut() {
-                        let _ = auth.detach(ifindex).await;
-                    }
-                    if let Some(ifname) = self.ifname_hint(ifindex) {
-                        m::record_link_lost(&ifname, m::link_lost_reason::REMOVED);
-                    }
+            NexusEvent::InterfaceRemoved { ifindex }
+                if self.interfaces.contains_key(&ifindex) =>
+            {
+                self.interfaces.remove(&ifindex);
+                self.auth_ctx.remove(&ifindex);
+                if let Some(auth) = self.auth_backend.as_mut() {
+                    let _ = auth.detach(ifindex).await;
+                }
+                if let Some(ifname) = self.ifname_hint(ifindex) {
+                    m::record_link_lost(&ifname, m::link_lost_reason::REMOVED);
                 }
             }
             NexusEvent::EthAuthStateChanged { ifindex, state } => {
@@ -212,6 +213,11 @@ impl EthernetBackend {
     }
 
     async fn on_carrier_up(&mut self, ifindex: u32) -> Result<()> {
+        // Local enum for the dispatch decision. `StartAuth` carries a
+        // `Dot1xEapConfig` (~hundreds of bytes with passwords + cert
+        // paths), the other variants carry only an ifname — this is a
+        // by-design size disparity for a one-shot stack-only value.
+        #[allow(clippy::large_enum_variant)]
         enum Action {
             NoAuth {
                 ifname: String,

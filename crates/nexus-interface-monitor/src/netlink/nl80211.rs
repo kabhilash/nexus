@@ -314,6 +314,18 @@ fn read_small_uint(attr: &super::parser::NetlinkAttribute<'_>) -> Result<u32, Pa
     Ok(u32::from(attr.payload[0]))
 }
 
+// Internal helper to keep the test readable.
+#[cfg(test)]
+trait CommandU32 {
+    fn to_ne_bytes_u32(self) -> [u8; 4];
+}
+#[cfg(test)]
+impl CommandU32 for u8 {
+    fn to_ne_bytes_u32(self) -> [u8; 4] {
+        (self as u32).to_ne_bytes()
+    }
+}
+
 #[cfg(test)]
 mod wiphy_tests {
     use super::super::parser::{NLMSG_HDRLEN, encode_attribute, parse_header};
@@ -462,17 +474,5 @@ mod wiphy_tests {
         );
         assert!(caps.supports_ap_uapsd);
         assert!(caps.supports_roaming);
-    }
-}
-
-// Internal helper to keep the test readable.
-#[cfg(test)]
-trait CommandU32 {
-    fn to_ne_bytes_u32(self) -> [u8; 4];
-}
-#[cfg(test)]
-impl CommandU32 for u8 {
-    fn to_ne_bytes_u32(self) -> [u8; 4] {
-        (self as u32).to_ne_bytes()
     }
 }

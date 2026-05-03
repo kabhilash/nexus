@@ -9,6 +9,17 @@
 //! with its arguments. Individual tests assert the recording matches
 //! what the handler should have done, without a real D-Bus round-trip.
 
+// `Recorder` has many fields; tests routinely fill in just one or two via
+// `let mut rec = Recorder::default(); rec.foo = ...;` rather than spelling
+// out the full `Recorder { foo: ..., ..Default::default() }` shape every
+// time — keeps each test focused on the field that matters to it.
+#![allow(clippy::field_reassign_with_default)]
+// `psk_env_guard()` returns a `MutexGuard` that serialises the three
+// tests which mutate `NEXUSCTL_PSK` — by design held across
+// `commands::wifi::connect(...).await` so concurrent tests can't race
+// on the env var.
+#![allow(clippy::await_holding_lock)]
+
 use std::sync::{Arc, Mutex};
 
 /// Serializes the three tests that mutate `NEXUSCTL_PSK`. cargo test

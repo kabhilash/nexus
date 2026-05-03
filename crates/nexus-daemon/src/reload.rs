@@ -8,12 +8,12 @@
 //!    and the live config is unchanged.
 //! 3. Diff the new config against the live one field-by-field.
 //! 4. Classify every differing field as:
-//!    - `applied`   — the change took effect at runtime.
-//!    - `deferred`  — the field is startup-only; the change is kept
-//!                    in the live config so subsequent restarts pick
-//!                    it up, but runtime behaviour is unchanged.
-//!    - `errors`    — applying the change failed; the field keeps
-//!                    its prior value.
+//!    - `applied` — the change took effect at runtime.
+//!    - `deferred` — the field is startup-only; the change is kept
+//!      in the live config so subsequent restarts pick it up, but
+//!      runtime behaviour is unchanged.
+//!    - `errors` — applying the change failed; the field keeps its
+//!      prior value.
 //! 5. Swap the live config atomically.
 //!
 //! # What's actually reloadable today
@@ -489,6 +489,11 @@ pub fn diff_config(old: &Config, new: &Config, log_setter: &LogLevelSetter) -> R
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+// Tests routinely build a `Config` by `let mut x = Config::default();
+// x.field = ...;`. Spelling out the full struct-update form on every
+// test would obscure the field actually under test, so the
+// pattern stays in test code.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use std::sync::Mutex;

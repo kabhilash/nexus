@@ -100,14 +100,14 @@ impl BluetoothAddrExt for MacAddr {
             return Err(ParseMacAddrError::WrongLength(bytes.len()));
         }
         let mut out = [0u8; 6];
-        for i in 0..6 {
+        for (i, byte) in out.iter_mut().enumerate() {
             let off = i * 3;
             if i < 5 && bytes[off + 2] != b':' {
                 return Err(ParseMacAddrError::MissingColon(off + 2));
             }
             let hi = hex_nibble(bytes[off]).ok_or(ParseMacAddrError::InvalidHex(off))?;
             let lo = hex_nibble(bytes[off + 1]).ok_or(ParseMacAddrError::InvalidHex(off + 1))?;
-            out[i] = (hi << 4) | lo;
+            *byte = (hi << 4) | lo;
         }
         Ok(MacAddr(out))
     }

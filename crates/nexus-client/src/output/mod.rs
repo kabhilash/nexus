@@ -33,19 +33,14 @@ pub mod records;
 pub mod terse;
 
 /// Which renderer to dispatch to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 #[value(rename_all = "lower")]
 pub enum OutputFormat {
+    #[default]
     Human,
     Terse,
     Json,
     Pretty,
-}
-
-impl Default for OutputFormat {
-    fn default() -> Self {
-        OutputFormat::Human
-    }
 }
 
 /// How much colour to emit. Human/pretty renderers consult this

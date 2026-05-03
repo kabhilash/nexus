@@ -129,7 +129,7 @@ fn resolve_fields<'a>(
     supported: &'static [&'static str],
 ) -> io::Result<Vec<&'a str>> {
     match requested {
-        None => Ok(supported.iter().copied().collect()),
+        None => Ok(supported.to_vec()),
         Some(list) => {
             let mut out: Vec<&str> = Vec::with_capacity(list.len());
             for name in list {

@@ -256,6 +256,7 @@ pub(crate) fn secretstring(value: &str) -> nexus_profile_store::SecretString {
 /// [`WifiError::Rfkill`](error::WifiError::Rfkill) — tests for that
 /// path go through deployments with a real `/dev/rfkill`.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_wifi_backend_with_test_rfkill_rx(
     event_tx: broadcast::Sender<NexusEvent>,
     supplicant_tx: broadcast::Sender<SupplicantEvent>,

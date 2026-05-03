@@ -21,9 +21,10 @@ use super::{AuthFailureReason, AuthState, WiredAuthBackend};
 use crate::error::{EthernetError, Result};
 
 /// Canned behavior for one ifindex.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum MockScenario {
     /// Emit `Authenticated` immediately after `authenticate`.
+    #[default]
     ImmediateSuccess,
     /// Emit `Failed { reason }` immediately after `authenticate`.
     ImmediateFailure(AuthFailureReason),
@@ -37,12 +38,6 @@ pub enum MockScenario {
     /// Emit `Authenticating` and nothing else — simulates a backend
     /// that never completes (operator must reset).
     Hang,
-}
-
-impl Default for MockScenario {
-    fn default() -> Self {
-        MockScenario::ImmediateSuccess
-    }
 }
 
 /// Shared state the mock publishes its scenarios through. Cheap to

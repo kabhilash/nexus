@@ -396,12 +396,11 @@ impl<P: Prompt> PairingFlow<P> {
         loop {
             tokio::select! {
                 biased;
-                ev = self.events.next() => match ev {
-                    Some(PairingEvent::Complete { success: true, .. }) => {
+                ev = self.events.next() => {
+                    if let Some(PairingEvent::Complete { success: true, .. }) = ev {
                         let _ = self.prompt.render_outcome(&PairingOutcome::Paired).await;
                         return PairingOutcome::Paired;
                     }
-                    Some(_) | None => {}
                 },
                 _ = &mut grace => {
                     let _ = self.prompt.render_outcome(&PairingOutcome::TimedOut).await;

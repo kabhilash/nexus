@@ -82,6 +82,7 @@ pub async fn add_wifi(
     .map_err(io_err)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn add_ethernet(
     ops: &dyn ManagerOps,
     ifname: Option<&str>,

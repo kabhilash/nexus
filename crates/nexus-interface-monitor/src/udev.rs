@@ -142,7 +142,7 @@ fn looks_like_gnss(device: &Device) -> bool {
         .property_value("ID_USB_DRIVER")
         .and_then(|s| s.to_str())
     {
-        if KNOWN_USB_DRIVERS.iter().any(|d| *d == driver) {
+        if KNOWN_USB_DRIVERS.contains(&driver) {
             return true;
         }
     }

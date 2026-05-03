@@ -20,6 +20,7 @@ use crate::watch::{Filter, WatchStream, WatchSubset, filter};
 /// Run the watch loop. Caller passes the `sigint` future so tests
 /// can drive it deterministically; production callers pass
 /// `tokio::signal::ctrl_c()`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run<S>(
     mut stream: Box<dyn WatchStream>,
     subset: WatchSubset,

@@ -291,7 +291,7 @@ mod tests {
         let bsses = vec![bss([0x01; 6], b"corp", -40, SecurityMode::Wpa2Psk)];
         let mut paused = HashSet::new();
         paused.insert(p.id);
-        assert!(select_network(&[p.clone()], &bsses, &paused).is_none());
+        assert!(select_network(std::slice::from_ref(&p), &bsses, &paused).is_none());
         // And without the pause, the same profile is selected.
         assert!(select_network(&[p], &bsses, &HashSet::new()).is_some());
     }

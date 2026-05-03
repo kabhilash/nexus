@@ -204,7 +204,7 @@ mod tests {
     fn refresh_interface_counts_does_not_panic_on_empty_or_mixed() {
         register();
         refresh_interface_counts(std::iter::empty());
-        let infos = vec![ethernet(2), ethernet(3), wireless(4), bluetooth(0)];
+        let infos = [ethernet(2), ethernet(3), wireless(4), bluetooth(0)];
         refresh_interface_counts(infos.iter());
     }
 
