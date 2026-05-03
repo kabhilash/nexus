@@ -1292,8 +1292,28 @@ async fn emit_manager_notification_event(
     }
 }
 
-/// Emit `fi.nexus.Manager.InternetConnectivityChanged(state: s)`.
-/// Best-effort — a failure to emit is logged at debug.
+/// Emit a connectivity transition on both the bare
+/// `fi.nexus.Manager.InternetConnectivityChanged(state: s)` signal and
+/// `org.freedesktop.DBus.Properties.PropertiesChanged` for the
+/// `InternetConnectivity` property. Best-effort — failures are logged
+/// at debug.
+///
+/// Two emits per transition is deliberate. The bare signal is the
+/// preferred subscription point per DD-006 / the integration graph,
+/// but the property is annotated `emits-change` in introspection, and
+/// generic property-watching clients (libgio, dbus-next, QtDBus
+/// property caches) bind on `PropertiesChanged`. The connectivity
+/// state is mutated outside the zbus property API — `apply_event`
+/// writes the field on the shared `State` directly — so zbus' own
+/// auto-emit (which fires only when a `#[zbus(property)]` setter is
+/// invoked) never runs. Without this manual emit the `emits-change`
+/// annotation lies and the integration graph's "or watch
+/// PropertiesChanged" subscription pattern is non-functional.
+///
+/// Putting the value in `changed_properties` rather than
+/// `invalidated_properties` saves every subscriber a Properties.Get
+/// round-trip; payload is ~30 bytes and the signal is rare (link
+/// transitions only).
 async fn emit_manager_internet_connectivity_changed(connection: &zbus::Connection, state: &str) {
     let Ok(manager_path) = ObjectPath::try_from(MANAGER_PATH) else {
         return;
@@ -1301,7 +1321,7 @@ async fn emit_manager_internet_connectivity_changed(connection: &zbus::Connectio
     if let Err(e) = connection
         .emit_signal(
             None::<&str>,
-            manager_path,
+            manager_path.clone(),
             "fi.nexus.Manager",
             "InternetConnectivityChanged",
             &(state,),
@@ -1309,6 +1329,27 @@ async fn emit_manager_internet_connectivity_changed(connection: &zbus::Connectio
         .await
     {
         tracing::debug!(error = ?e, state, "Manager.InternetConnectivityChanged emit failed");
+    }
+
+    let mut changed: std::collections::HashMap<&str, zbus::zvariant::Value<'_>> =
+        std::collections::HashMap::new();
+    changed.insert("InternetConnectivity", zbus::zvariant::Value::from(state));
+    let invalidated: &[&str] = &[];
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            manager_path,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &("fi.nexus.Manager", changed, invalidated),
+        )
+        .await
+    {
+        tracing::debug!(
+            error = ?e,
+            state,
+            "Manager.PropertiesChanged(InternetConnectivity) emit failed",
+        );
     }
 }
 

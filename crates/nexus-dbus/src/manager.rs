@@ -579,13 +579,19 @@ impl Manager {
         report: HashMap<String, OwnedValue>,
     ) -> zbus::Result<()>;
 
-    // `InternetConnectivityChanged(state: s)` is emitted via
-    // `connection.emit_signal` from the service event loop (see
-    // `service::emit_manager_internet_connectivity_changed`). It is
-    // NOT declared with `#[zbus(signal)]` here because zbus
-    // auto-generates an `internet_connectivity_changed`
+    // `InternetConnectivityChanged(state: s)` and the matching
+    // `org.freedesktop.DBus.Properties.PropertiesChanged` for the
+    // `InternetConnectivity` property are both emitted from the
+    // service event loop via `connection.emit_signal` (see
+    // `service::emit_manager_internet_connectivity_changed`). The
+    // bare signal is NOT declared with `#[zbus(signal)]` here
+    // because zbus auto-generates an `internet_connectivity_changed`
     // PropertiesChanged emitter from the `InternetConnectivity`
-    // property above, and the names collide.
+    // property above, and the Rust names collide. The property is
+    // mutated outside the zbus property API (the broadcast-event
+    // loop writes `state.internet_connectivity` directly), so the
+    // auto-emit never fires either way — the manual dual emit is
+    // what honours the `emits-change` introspection annotation.
 }
 
 impl Manager {
