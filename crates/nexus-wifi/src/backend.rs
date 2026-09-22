@@ -380,7 +380,7 @@ impl WifiBackend {
     /// Monitor hasn't enumerated yet) are dropped — the next event
     /// after the interface lands will reflect current state.
     async fn on_rfkill(&mut self, state: RfkillState) {
-        let Some(ifindex) = self.ifindex_for_wiphy(&state.wiphy_name) else {
+        let Some(ifindex) = self.ifindex_for_wiphy(&state) else {
             tracing::debug!(
                 wiphy = %state.wiphy_name,
                 powered = state.powered,
@@ -481,9 +481,30 @@ impl WifiBackend {
         matches!(self.interface_powered.get(&ifindex), Some(false))
     }
 
-    fn ifindex_for_wiphy(&self, wiphy_name: &str) -> Option<u32> {
+    /// Correlate an incoming rfkill edge to the interface it belongs
+    /// to. Primary match is `state.device_path` against each
+    /// candidate wiphy's own sysfs device path (see
+    /// `rfkill::wiphy_device_path`) — robust against drivers that
+    /// register the WLAN rfkill's `name` independently of
+    /// `NL80211_ATTR_WIPHY_NAME`. Falls back to a `wiphy_name` string
+    /// match when `device_path` is unavailable (e.g. hwsim / unit
+    /// tests, which inject `RfkillState` directly with no sysfs
+    /// backing).
+    fn ifindex_for_wiphy(&self, state: &RfkillState) -> Option<u32> {
+        if let Some(device_path) = &state.device_path {
+            let by_device = self.interfaces.iter().find_map(|(ifindex, entry)| match &entry.info.kind {
+                InterfaceKind::Wireless { wiphy_name, .. } => {
+                    (crate::rfkill::wiphy_device_path(wiphy_name).as_ref() == Some(device_path))
+                        .then_some(*ifindex)
+                }
+                _ => None,
+            });
+            if by_device.is_some() {
+                return by_device;
+            }
+        }
         self.interfaces.iter().find_map(|(ifindex, entry)| match &entry.info.kind {
-            InterfaceKind::Wireless { wiphy_name: w, .. } if w == wiphy_name => Some(*ifindex),
+            InterfaceKind::Wireless { wiphy_name, .. } if wiphy_name == &state.wiphy_name => Some(*ifindex),
             _ => None,
         })
     }

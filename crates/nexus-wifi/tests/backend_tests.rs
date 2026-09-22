@@ -125,6 +125,7 @@ impl Harness {
             .expect("harness built without rfkill plumbing; use start_with_rfkill");
         tx.send(nexus_wifi::rfkill::RfkillState {
             wiphy_name: wiphy_name.to_owned(),
+            device_path: None,
             powered,
         })
         .await

@@ -17,11 +17,18 @@
 //!
 //! The watcher filters to `RFKILL_TYPE_WLAN (1)` events, resolves
 //! each event's `idx` to its wiphy name via
-//! `/sys/class/rfkill/rfkillN/name`, and emits
-//! `RfkillState { wiphy_name, powered }` over an mpsc to the Wi-Fi
-//! backend. The backend performs the `wiphy_name → ifindex` lookup
-//! (it already owns the per-interface registry) and republishes as
-//! `NexusEvent::WifiRfkillChanged`.
+//! `/sys/class/rfkill/rfkillN/name` and to the canonical sysfs path
+//! of its parent device via `rfkillN/device`, and emits
+//! `RfkillState { wiphy_name, device_path, powered }` over an mpsc to
+//! the Wi-Fi backend. The backend performs the `ifindex` lookup (it
+//! already owns the per-interface registry) primarily via
+//! `device_path` — falling back to `wiphy_name` when it can't be
+//! resolved — and republishes as `NexusEvent::WifiRfkillChanged`. The
+//! `device_path` detour exists because some out-of-tree drivers
+//! register the WLAN rfkill's `name` independently of
+//! `NL80211_ATTR_WIPHY_NAME` (see `resolve_rfkill_idx` below), so a
+//! `wiphy_name` string match alone can silently drop every edge for
+//! those wiphys.
 //!
 //! The writer lives on the same open fd. `set_blocked(wiphy_name,
 //! soft)` resolves the wiphy to its rfkill `idx` by scanning
@@ -72,12 +79,19 @@ const RFKILL_EVENT_SIZE: usize = size_of::<RfkillEvent>();
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Edge emitted by the reader task to the Wi-Fi backend. Keyed on
-/// wiphy name because the watcher doesn't need the interface
-/// registry; the backend that receives this already owns it.
+/// Edge emitted by the reader task to the Wi-Fi backend. The watcher
+/// doesn't need the interface registry; the backend that receives
+/// this already owns it and does the `ifindex` correlation.
 #[derive(Debug, Clone)]
 pub struct RfkillState {
     pub wiphy_name: String,
+    /// Canonical sysfs path of the rfkill's parent device (normally
+    /// the wiphy's own `struct device`, i.e. what
+    /// `/sys/class/ieee80211/<wiphy_name>` also resolves to).
+    /// `None` when the `device` symlink is missing or can't be
+    /// resolved. Prefer this over `wiphy_name` for correlation — see
+    /// the module doc comment and `resolve_rfkill_idx`.
+    pub device_path: Option<PathBuf>,
     pub powered: bool,
 }
 
@@ -217,8 +231,10 @@ fn translate(ev: &RfkillEvent) -> Option<RfkillState> {
             return None;
         }
     };
+    let device_path = read_rfkill_device_path(idx);
     Some(RfkillState {
         wiphy_name,
+        device_path,
         powered: ev.soft == 0 && ev.hard == 0,
     })
 }
@@ -326,6 +342,27 @@ fn read_rfkill_name(idx: u32) -> io::Result<String> {
     Ok(s.trim().to_owned())
 }
 
+/// Canonical sysfs path of rfkill index `idx`'s parent device, e.g.
+/// what `rfkill{idx}/device` resolves to. `None` if the symlink is
+/// absent or dangling — the caller falls back to `name`-based
+/// correlation in that case.
+fn read_rfkill_device_path(idx: u32) -> Option<PathBuf> {
+    std::fs::canonicalize(format!("/sys/class/rfkill/rfkill{idx}/device")).ok()
+}
+
+/// Canonical sysfs path of the wiphy named `wiphy_name`'s own
+/// `struct device`, i.e. `/sys/class/ieee80211/<wiphy_name>` resolved
+/// through its symlink. This is the value both correlation
+/// directions compare against: [`resolve_rfkill_idx`] (wiphy_name →
+/// rfkill idx, for writes) and the Wi-Fi backend's `ifindex_for_wiphy`
+/// (an incoming rfkill event's [`RfkillState::device_path`] → ifindex,
+/// for the kernel event stream). `None` when unavailable — e.g. the
+/// wiphy hasn't registered yet, or a hwsim/test environment without a
+/// real `/sys/class/ieee80211` tree.
+pub(crate) fn wiphy_device_path(wiphy_name: &str) -> Option<PathBuf> {
+    std::fs::canonicalize(format!("/sys/class/ieee80211/{wiphy_name}")).ok()
+}
+
 /// Read the current soft / hard bits for `wiphy_name` from sysfs.
 /// Used by the Wi-Fi backend on `InterfaceDiscovered` to synthesize
 /// the initial `WifiRfkillChanged` event, since the watcher's own
@@ -345,11 +382,30 @@ pub fn read_current_state(wiphy_name: &str) -> io::Result<bool> {
     Ok(soft == 0 && hard == 0)
 }
 
-/// Walk `/sys/class/rfkill/rfkill*` looking for an entry whose
-/// `name` file contains `wiphy_name` and whose `type` is `wlan`.
-/// Returns the rfkill index.
+/// Walk `/sys/class/rfkill/rfkill*` looking for the `wlan`-type entry
+/// backed by the wiphy named `wiphy_name`. Returns the rfkill index.
+///
+/// Primary match: the rfkill's `device` symlink and
+/// `/sys/class/ieee80211/<wiphy_name>` both resolve to the same real
+/// sysfs device. cfg80211-integrated WLAN rfkill entries are
+/// allocated with the wiphy's own `struct device` as their parent, so
+/// this holds regardless of what the rfkill's own `name` file says.
+///
+/// That matters because some out-of-tree drivers register the WLAN
+/// rfkill's `name` independently of `NL80211_ATTR_WIPHY_NAME` — on
+/// one board seen in the field, nl80211 reports the wiphy as
+/// `mwiphy0` while its rfkill entry's `name` file reads `phy0`, so a
+/// name-string match never hits and every soft-rfkill write fails
+/// with `NotFound`, even though plain `rfkill unblock` flips the same
+/// radio by hand. Falls back to the old name match when the wiphy's
+/// sysfs node can't be resolved (e.g. hwsim / unit-test
+/// environments), so drivers where `name` already agrees keep
+/// working unchanged.
 fn resolve_rfkill_idx(wiphy_name: &str) -> io::Result<u32> {
+    let wiphy_device = wiphy_device_path(wiphy_name);
+
     let dir = Path::new("/sys/class/rfkill");
+    let mut name_fallback: Option<u32> = None;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let fname = entry.file_name();
@@ -360,25 +416,32 @@ fn resolve_rfkill_idx(wiphy_name: &str) -> io::Result<u32> {
         let Ok(idx) = idx_str.parse::<u32>() else {
             continue;
         };
-        let type_path = entry.path().join("type");
-        let name_path = entry.path().join("name");
-        let ty = std::fs::read_to_string(&type_path)
+        let ty = std::fs::read_to_string(entry.path().join("type"))
             .map(|s| s.trim().to_owned())
             .unwrap_or_default();
         if ty != "wlan" {
             continue;
         }
-        let name = std::fs::read_to_string(&name_path)
+
+        if let Some(wiphy_device) = &wiphy_device {
+            if read_rfkill_device_path(idx).as_ref() == Some(wiphy_device) {
+                return Ok(idx);
+            }
+        }
+
+        let name = std::fs::read_to_string(entry.path().join("name"))
             .map(|s| s.trim().to_owned())
             .unwrap_or_default();
         if name == wiphy_name {
-            return Ok(idx);
+            name_fallback.get_or_insert(idx);
         }
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("no rfkill entry for wiphy '{wiphy_name}'"),
-    ))
+    name_fallback.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no rfkill entry for wiphy '{wiphy_name}'"),
+        )
+    })
 }
 
 #[cfg(test)]
