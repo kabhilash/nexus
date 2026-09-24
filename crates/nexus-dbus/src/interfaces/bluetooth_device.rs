@@ -8,6 +8,7 @@ use std::sync::Arc;
 use nexus_core::BluetoothAddrExt;
 use zbus::fdo;
 use zbus::message::Header;
+use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 
 use crate::authz::actions;
@@ -332,4 +333,28 @@ impl BluetoothDeviceIface {
             .await
             .map_err(fdo::Error::from)
     }
+
+    /// `StateChanged(state: s)` — DD-006 §6.6. Mirrors `State`
+    /// property transitions so clients don't have to poll. Emitted
+    /// from the service event loop
+    /// (`service::emit_bt_device_state_changed`) via raw
+    /// `connection.emit_signal`, same reasoning as
+    /// `fi.nexus.Bluetooth`'s pairing signals — this declaration
+    /// exists for introspection only. Named `bt_state_changed` in
+    /// Rust (rather than `state_changed`) because zbus's
+    /// `#[zbus(property)]` macro already reserves that identifier as
+    /// the `State` property's own generic-PropertiesChanged notifier
+    /// — `name = "StateChanged"` keeps the wire signal name correct.
+    #[zbus(signal, name = "StateChanged")]
+    pub async fn bt_state_changed(emitter: &SignalEmitter<'_>, state: &str) -> zbus::Result<()>;
+
+    /// `ConnectionChanged(connected: b)` — DD-006 §6.6. Emitted from
+    /// the service event loop
+    /// (`service::emit_bt_device_connection_changed`) via raw
+    /// `connection.emit_signal`.
+    #[zbus(signal)]
+    pub async fn connection_changed(
+        emitter: &SignalEmitter<'_>,
+        connected: bool,
+    ) -> zbus::Result<()>;
 }

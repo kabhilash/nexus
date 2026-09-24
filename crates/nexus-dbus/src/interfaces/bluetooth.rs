@@ -355,6 +355,20 @@ impl BluetoothIface {
         reason: &str,
     ) -> zbus::Result<()>;
 
+    /// `StateChanged(state: s)` — DD-006 §6.4. Mirrors `State`
+    /// property transitions (`unavailable`/`present`/`powered`/
+    /// `discovering`/`gone`) so clients don't have to poll. Emitted
+    /// from the service event loop (`service::emit_bt_adapter_state_changed`)
+    /// via raw `connection.emit_signal`, same as the pairing signals
+    /// above — this declaration exists for introspection so typed
+    /// proxy clients see the signal's shape. Named `bt_state_changed`
+    /// in Rust (rather than `state_changed`) because zbus's
+    /// `#[zbus(property)]` macro already reserves that identifier as
+    /// the `State` property's own generic-PropertiesChanged notifier
+    /// — `name = "StateChanged"` keeps the wire signal name correct.
+    #[zbus(signal, name = "StateChanged")]
+    pub async fn bt_state_changed(emitter: &SignalEmitter<'_>, state: &str) -> zbus::Result<()>;
+
     #[zbus(property, name = "Discoverable")]
     async fn discoverable(&self) -> bool {
         self.with_cache(false, |c| c.discoverable).await

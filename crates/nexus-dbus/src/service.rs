@@ -851,19 +851,28 @@ async fn handle_event(
             discovering,
         } => {
             if let Some(ifname) = state_lookup_bluetooth_ifname(state, &adapter).await {
-                if let Some(e) = state.write().await.interfaces.get_mut(&ifname) {
-                    if let InterfaceKindData::Bluetooth(c) = &mut e.kind_data {
-                        c.powered = powered;
-                        c.discovering = discovering;
-                        c.state = if discovering {
-                            "discovering"
-                        } else if powered {
-                            "powered"
-                        } else {
-                            "present"
+                let new_state = if discovering {
+                    "discovering"
+                } else if powered {
+                    "powered"
+                } else {
+                    "present"
+                }
+                .to_owned();
+                let changed = {
+                    let mut guard = state.write().await;
+                    match guard.interfaces.get_mut(&ifname).map(|e| &mut e.kind_data) {
+                        Some(InterfaceKindData::Bluetooth(c)) => {
+                            let old_state = std::mem::replace(&mut c.state, new_state.clone());
+                            c.powered = powered;
+                            c.discovering = discovering;
+                            old_state != new_state
                         }
-                        .to_owned();
+                        _ => false,
                     }
+                };
+                if changed {
+                    emit_bt_adapter_state_changed(connection, &ifname, &new_state).await;
                 }
             }
         }
@@ -871,10 +880,10 @@ async fn handle_event(
             handle_bt_device_discovered(connection, state, services, info).await?;
         }
         NexusEvent::BtDeviceConnected { adapter, address } => {
-            set_bt_device_connected(state, &adapter, address, true).await;
+            set_bt_device_connected(connection, state, &adapter, address, true).await;
         }
         NexusEvent::BtDeviceDisconnected { adapter, address } => {
-            set_bt_device_connected(state, &adapter, address, false).await;
+            set_bt_device_connected(connection, state, &adapter, address, false).await;
         }
         NexusEvent::BtDeviceRemoved { adapter, address } => {
             handle_bt_device_removed(connection, state, &adapter, address).await?;
@@ -1276,7 +1285,8 @@ async fn handle_bt_device_discovered(
     };
     let key = bluetooth_device_key(&info.address);
     let derived_state = snapshot_device_state(&info);
-    let was_present = {
+    let address = info.address;
+    let (was_present, connected_changed, state_changed) = {
         let mut guard = state.write().await;
         let Some(e) = guard.interfaces.get_mut(&ifname) else {
             return Ok(());
@@ -1286,15 +1296,20 @@ async fn handle_bt_device_discovered(
         };
         match c.known_devices.get_mut(&key) {
             Some(existing) => {
+                let old_connected = existing.info.connected;
+                let old_state = std::mem::replace(&mut existing.state, derived_state.clone());
                 existing.info = info.clone();
-                existing.state = derived_state;
-                true
+                (
+                    true,
+                    old_connected != info.connected,
+                    old_state != derived_state,
+                )
             }
             None => {
                 let mut fresh = BtDeviceState::from_info(info.clone());
-                fresh.state = derived_state;
+                fresh.state = derived_state.clone();
                 c.known_devices.insert(key.clone(), fresh);
-                false
+                (false, false, false)
             }
         }
     };
@@ -1305,6 +1320,25 @@ async fn handle_bt_device_discovered(
             "bluetooth device discovered",
         );
         register_bluetooth_device(connection, services, &ifname, info.address).await?;
+    } else {
+        // A device already known to us reported new properties
+        // (re-sighted during a scan, RSSI/Name resolved, or a
+        // property changed via BlueZ's initial snapshot on
+        // reconnect). Announce only the fields that actually moved —
+        // `NexusEvent::BtDeviceConnected`/`Disconnected` normally
+        // carries connect/disconnect transitions, but the initial
+        // `GetManagedObjects` republish after a BlueZ reconnect can
+        // also surface an already-connected device through this
+        // path, so this doubles as a backstop (same reasoning as
+        // `nexus_bluetooth::backend::refresh_adapter_properties`'s
+        // polling backstop) — a harmless duplicate signal in the
+        // rare case both paths fire for the same transition.
+        if connected_changed {
+            emit_bt_device_connection_changed(connection, &ifname, address, info.connected).await;
+        }
+        if state_changed {
+            emit_bt_device_state_changed(connection, &ifname, address, &derived_state).await;
+        }
     }
     Ok(())
 }
@@ -1416,8 +1450,10 @@ async fn handle_bt_device_removed(
 /// BlueZ's `Connected` onto the cached `BtDeviceInfo` and re-derives
 /// `State` (see `snapshot_device_state`). A no-op if the device isn't
 /// cached yet, matching the same benign-race tolerance as
-/// `BtAdapterChanged`'s handler above.
+/// `BtAdapterChanged`'s handler above. Announces real transitions via
+/// `fi.nexus.BluetoothDevice.ConnectionChanged`/`.StateChanged`.
 async fn set_bt_device_connected(
+    connection: &zbus::Connection,
     state: &Arc<RwLock<State>>,
     adapter: &str,
     address: nexus_core::MacAddr,
@@ -1427,14 +1463,116 @@ async fn set_bt_device_connected(
         return;
     };
     let key = bluetooth_device_key(&address);
-    let mut guard = state.write().await;
-    if let Some(e) = guard.interfaces.get_mut(&ifname) {
-        if let InterfaceKindData::Bluetooth(c) = &mut e.kind_data {
-            if let Some(dev) = c.known_devices.get_mut(&key) {
-                dev.info.connected = connected;
-                dev.state = snapshot_device_state(&dev.info);
-            }
-        }
+    let (connected_changed, state_changed, new_state) = {
+        let mut guard = state.write().await;
+        let Some(e) = guard.interfaces.get_mut(&ifname) else {
+            return;
+        };
+        let InterfaceKindData::Bluetooth(c) = &mut e.kind_data else {
+            return;
+        };
+        let Some(dev) = c.known_devices.get_mut(&key) else {
+            return;
+        };
+        let old_connected = dev.info.connected;
+        dev.info.connected = connected;
+        let new_state = snapshot_device_state(&dev.info);
+        let old_state = std::mem::replace(&mut dev.state, new_state.clone());
+        (old_connected != connected, old_state != new_state, new_state)
+    };
+    if connected_changed {
+        emit_bt_device_connection_changed(connection, &ifname, address, connected).await;
+    }
+    if state_changed {
+        emit_bt_device_state_changed(connection, &ifname, address, &new_state).await;
+    }
+}
+
+/// `fi.nexus.Bluetooth.StateChanged` on a real `State` transition
+/// only — a no-op re-delivery of the same value (e.g. a redundant
+/// reconcile-tick poll) must not spam clients, same framing as
+/// `emit_wifi_state_changed`.
+async fn emit_bt_adapter_state_changed(
+    connection: &zbus::Connection,
+    ifname: &str,
+    state_label: &str,
+) {
+    let Ok(path) = ObjectPath::try_from(interface_path(ifname)) else {
+        return;
+    };
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            path,
+            "fi.nexus.Bluetooth",
+            "StateChanged",
+            &state_label,
+        )
+        .await
+    {
+        tracing::debug!(error = ?e, ifname, state = state_label, "Bluetooth.StateChanged emit failed");
+    }
+}
+
+/// `fi.nexus.BluetoothDevice.ConnectionChanged` on a real `Connected`
+/// transition only.
+async fn emit_bt_device_connection_changed(
+    connection: &zbus::Connection,
+    adapter_ifname: &str,
+    address: nexus_core::MacAddr,
+    connected: bool,
+) {
+    let Ok(path) = ObjectPath::try_from(bluetooth_device_path(adapter_ifname, &address)) else {
+        return;
+    };
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            path,
+            "fi.nexus.BluetoothDevice",
+            "ConnectionChanged",
+            &connected,
+        )
+        .await
+    {
+        tracing::debug!(
+            error = ?e,
+            adapter = adapter_ifname,
+            "BluetoothDevice.ConnectionChanged emit failed",
+        );
+    }
+}
+
+/// `fi.nexus.BluetoothDevice.StateChanged` on a real `State`
+/// transition only. Shared by both the connect/disconnect path
+/// (`set_bt_device_connected`) and the discovery-upsert path
+/// (`handle_bt_device_discovered`) so a state change is announced
+/// regardless of which event carried it.
+async fn emit_bt_device_state_changed(
+    connection: &zbus::Connection,
+    adapter_ifname: &str,
+    address: nexus_core::MacAddr,
+    state_label: &str,
+) {
+    let Ok(path) = ObjectPath::try_from(bluetooth_device_path(adapter_ifname, &address)) else {
+        return;
+    };
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            path,
+            "fi.nexus.BluetoothDevice",
+            "StateChanged",
+            &state_label,
+        )
+        .await
+    {
+        tracing::debug!(
+            error = ?e,
+            adapter = adapter_ifname,
+            state = state_label,
+            "BluetoothDevice.StateChanged emit failed",
+        );
     }
 }
 

@@ -648,6 +648,350 @@ async fn bluetooth_device_appears_updates_and_disappears() {
     handle.stop().await;
 }
 
+/// Subscribe to a single-`s`-arg signal on `path`/`iface`/`member`
+/// via an explicit `MatchRule` (mirrors `mutating_tests.rs`'s
+/// `Wifi.StateChanged` tests) and collect bodies until `want` have
+/// arrived or `timeout` elapses, whichever comes first.
+async fn collect_string_signal(
+    client: &Connection,
+    path: &str,
+    iface: &str,
+    member: &str,
+    want: usize,
+    timeout: Duration,
+) -> Vec<String> {
+    let mut stream = subscribe_signal(client, path, iface, member).await;
+    let mut got = Vec::new();
+    let deadline = std::time::Instant::now() + timeout;
+    while got.len() < want && std::time::Instant::now() < deadline {
+        let remaining =
+            deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(1);
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Ok((s,)) = msg.body().deserialize::<(String,)>() {
+                    got.push(s);
+                }
+            }
+            _ => break,
+        }
+    }
+    got
+}
+
+/// Same as [`collect_string_signal`] but for a single-`b`-arg signal.
+async fn collect_bool_signal(
+    client: &Connection,
+    path: &str,
+    iface: &str,
+    member: &str,
+    want: usize,
+    timeout: Duration,
+) -> Vec<bool> {
+    let mut stream = subscribe_signal(client, path, iface, member).await;
+    let mut got = Vec::new();
+    let deadline = std::time::Instant::now() + timeout;
+    while got.len() < want && std::time::Instant::now() < deadline {
+        let remaining =
+            deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(1);
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(msg))) => {
+                if let Ok((b,)) = msg.body().deserialize::<(bool,)>() {
+                    got.push(b);
+                }
+            }
+            _ => break,
+        }
+    }
+    got
+}
+
+async fn subscribe_signal(
+    client: &Connection,
+    path: &str,
+    iface: &str,
+    member: &str,
+) -> zbus::MessageStream {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface(iface)
+        .unwrap()
+        .member(member)
+        .unwrap()
+        .path(path)
+        .unwrap()
+        .build();
+    zbus::MessageStream::for_match_rule(rule, client, None)
+        .await
+        .unwrap_or_else(|e| panic!("subscribe {iface}.{member}: {e}"))
+}
+
+/// DD-006 §6.6 live-update surface: `fi.nexus.BluetoothDevice`'s
+/// `StateChanged`/`ConnectionChanged` signals fire on real
+/// transitions (discovered→paired via the discovery-upsert path,
+/// paired→connected and connected→paired via the connect/disconnect
+/// events) and are suppressed on a no-op re-delivery of the same
+/// value — so a UI can watch a device without polling.
+#[tokio::test]
+async fn bluetooth_device_state_and_connection_changed_signals() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
+    let (_tmp, store) = start_store().await;
+    let handle = spawn_dbus_service(
+        event_tx.subscribe(),
+        store,
+        DbusConfig {
+            bus_name: "fi.nexus1.test_btdev_signals".into(),
+            use_session_bus: false,
+            address: Some(bus.addr.clone()),
+            version: "0.1.0-test".into(),
+            auth: nexus_dbus::always_allow(),
+            ops: nexus_dbus::NoopOps::arc(),
+            rate_limits: nexus_dbus::RateLimits::default(),
+            enabled_features: nexus_dbus::EnabledFeatures::default(),
+            ethernet_auth_backend: "none".to_owned(),
+            wifi_supplicant: "wpa_supplicant".to_owned(),
+            wifi_roaming_mode: "supplicant".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let adapter_info = InterfaceInfo {
+        ifindex: 5,
+        ifname: "hci0".into(),
+        mac: [0x00, 0x1A, 0x7D, 0xDA, 0x71, 0x14],
+        mtu: 0,
+        operstate: OperState::Up,
+        carrier: true,
+        kind: InterfaceKind::Bluetooth {
+            hci_name: "hci0".into(),
+            hci_index: 0,
+            bt_address: MacAddr([0x00, 0x1A, 0x7D, 0xDA, 0x71, 0x14]),
+            bluez_path: "/org/bluez/hci0".into(),
+        },
+        discovered_at: std::time::Instant::now(),
+    };
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(adapter_info))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let device_path = "/fi/nexus1/interface/hci0/device/AA_BB_CC_DD_EE_FF";
+    let address = MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+
+    let state_task = tokio::spawn({
+        let client = client.clone();
+        let device_path = device_path.to_owned();
+        async move {
+            collect_string_signal(
+                &client,
+                &device_path,
+                "fi.nexus.BluetoothDevice",
+                "StateChanged",
+                2,
+                Duration::from_millis(900),
+            )
+            .await
+        }
+    });
+    let connection_task = tokio::spawn({
+        let client = client.clone();
+        let device_path = device_path.to_owned();
+        async move {
+            collect_bool_signal(
+                &client,
+                &device_path,
+                "fi.nexus.BluetoothDevice",
+                "ConnectionChanged",
+                2,
+                Duration::from_millis(900),
+            )
+            .await
+        }
+    });
+    // Give the match rules time to register before anything's emitted.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 1. Initial discovery — a brand-new object, no "old" value to
+    // transition from, so no signal.
+    event_tx
+        .send(NexusEvent::BtDeviceDiscovered(bt_device_info(
+            "/org/bluez/hci0",
+            address,
+        )))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 2. Re-sighted with Paired now true (discovered -> paired) via
+    // the discovery-upsert path.
+    let mut paired_info = bt_device_info("/org/bluez/hci0", address);
+    paired_info.paired = true;
+    event_tx
+        .send(NexusEvent::BtDeviceDiscovered(paired_info.clone()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 3. Identical re-delivery (still paired, still disconnected) —
+    // must not emit a second StateChanged.
+    event_tx
+        .send(NexusEvent::BtDeviceDiscovered(paired_info))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 4. Connect (paired -> connected) via the dedicated event path.
+    event_tx
+        .send(NexusEvent::BtDeviceConnected {
+            adapter: "/org/bluez/hci0".into(),
+            address,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 5. Redundant Connected event — already connected, must not
+    // emit again.
+    event_tx
+        .send(NexusEvent::BtDeviceConnected {
+            adapter: "/org/bluez/hci0".into(),
+            address,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 6. Disconnect (connected -> paired).
+    event_tx
+        .send(NexusEvent::BtDeviceDisconnected {
+            adapter: "/org/bluez/hci0".into(),
+            address,
+        })
+        .unwrap();
+
+    let states: Vec<String> = state_task.await.unwrap();
+    let connections: Vec<bool> = connection_task.await.unwrap();
+
+    assert_eq!(
+        states,
+        vec!["paired".to_owned(), "connected".to_owned()],
+        "expected exactly discovered->paired and paired->connected, no dupes; got {states:?}",
+    );
+    assert_eq!(
+        connections,
+        vec![true, false],
+        "expected exactly one ConnectionChanged per real transition \
+         (Connect -> true, Disconnect -> false), with the redundant \
+         re-delivery of Connect suppressed; got {connections:?}",
+    );
+
+    handle.stop().await;
+}
+
+/// The adapter-level `fi.nexus.Bluetooth.StateChanged` fires on a
+/// real `Powered`/`Discovering`-derived `State` transition and is
+/// suppressed on a no-op re-delivery.
+#[tokio::test]
+async fn bluetooth_adapter_state_changed_signal() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
+    let (_tmp, store) = start_store().await;
+    let handle = spawn_dbus_service(
+        event_tx.subscribe(),
+        store,
+        DbusConfig {
+            bus_name: "fi.nexus1.test_bt_adapter_signal".into(),
+            use_session_bus: false,
+            address: Some(bus.addr.clone()),
+            version: "0.1.0-test".into(),
+            auth: nexus_dbus::always_allow(),
+            ops: nexus_dbus::NoopOps::arc(),
+            rate_limits: nexus_dbus::RateLimits::default(),
+            enabled_features: nexus_dbus::EnabledFeatures::default(),
+            ethernet_auth_backend: "none".to_owned(),
+            wifi_supplicant: "wpa_supplicant".to_owned(),
+            wifi_roaming_mode: "supplicant".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let adapter_info = InterfaceInfo {
+        ifindex: 6,
+        ifname: "hci0".into(),
+        mac: [0x00, 0x1A, 0x7D, 0xDA, 0x71, 0x15],
+        mtu: 0,
+        operstate: OperState::Up,
+        carrier: true,
+        kind: InterfaceKind::Bluetooth {
+            hci_name: "hci0".into(),
+            hci_index: 0,
+            bt_address: MacAddr([0x00, 0x1A, 0x7D, 0xDA, 0x71, 0x15]),
+            bluez_path: "/org/bluez/hci0".into(),
+        },
+        discovered_at: std::time::Instant::now(),
+    };
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(adapter_info))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = bus.connection().await;
+    let adapter_path = "/fi/nexus1/interface/hci0";
+    let task = tokio::spawn({
+        let client = client.clone();
+        async move {
+            collect_string_signal(
+                &client,
+                adapter_path,
+                "fi.nexus.Bluetooth",
+                "StateChanged",
+                2,
+                Duration::from_millis(900),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // present -> powered (real transition).
+    event_tx
+        .send(NexusEvent::BtAdapterChanged {
+            adapter: "/org/bluez/hci0".into(),
+            powered: true,
+            discovering: false,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Identical re-delivery — must not emit again.
+    event_tx
+        .send(NexusEvent::BtAdapterChanged {
+            adapter: "/org/bluez/hci0".into(),
+            powered: true,
+            discovering: false,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // powered -> discovering (real transition).
+    event_tx
+        .send(NexusEvent::BtAdapterChanged {
+            adapter: "/org/bluez/hci0".into(),
+            powered: true,
+            discovering: true,
+        })
+        .unwrap();
+
+    let states: Vec<String> = task.await.unwrap();
+    assert_eq!(
+        states,
+        vec!["powered".to_owned(), "discovering".to_owned()],
+        "expected exactly two real transitions, no dupe for the identical re-delivery; got {states:?}",
+    );
+
+    handle.stop().await;
+}
+
 #[tokio::test]
 async fn gnss_interface_properties_readable() {
     let bus = Bus::spawn().await;
