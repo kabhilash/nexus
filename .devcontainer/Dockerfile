@@ -56,6 +56,13 @@ RUN curl -sSfL https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/
 RUN cargo binstall --no-confirm --version 0.19.0 cargo-deny
 # cargo-llvm-cov: source-based code coverage via LLVM instrumentation
 RUN cargo binstall --no-confirm --version 0.8.5 cargo-llvm-cov
+# cargo-outdated: reports dependencies with newer versions available
+# outside their current Cargo.toml requirement (major-version bumps
+# `cargo update` alone can't reach).
+RUN cargo binstall --no-confirm --version 0.19.0 cargo-outdated
+# cargo-edit: adds `cargo upgrade` for bumping Cargo.toml requirements
+# themselves, including across major versions.
+RUN cargo binstall --no-confirm --version 0.13.13 cargo-edit
 
 # Create runtime directory for nexus socket
 RUN mkdir -p /run/nexus && chmod 755 /run/nexus
