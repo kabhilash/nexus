@@ -49,7 +49,7 @@ where
 {
     let mut table = Table::new();
     table
-        .load_preset(NOTHING)
+        .load_style(NOTHING)
         .set_content_arrangement(ContentArrangement::Disabled)
         .set_header(headers.iter().map(|h| Cell::new(*h)).collect::<Vec<_>>());
     fill(&mut table);

@@ -119,7 +119,7 @@ impl Render for Vec<InterfaceSummary> {
         }
         let mut table = Table::new();
         table
-            .load_preset(NOTHING)
+            .load_style(NOTHING)
             .set_content_arrangement(ContentArrangement::Disabled)
             .set_header(vec![
                 Cell::new(""),

@@ -16,7 +16,7 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 libc = { workspace = true }
-sd-notify = "0.4"
+sd-notify = "0.5"
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -239,7 +239,7 @@ async fn run(args: CliArgs) -> Result<()> {
     // Tell systemd we're ready. When NOTIFY_SOCKET is unset (running
     // outside systemd / tests) this is a no-op. Errors are logged but
     // non-fatal — a broken notify socket shouldn't stop the daemon.
-    if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+    if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
         warn!(error = ?e, "sd_notify READY failed");
     }
 
@@ -247,7 +247,7 @@ async fn run(args: CliArgs) -> Result<()> {
     info!("shutdown signalled — joining supervisors");
     // Inform systemd so it marks the unit as stopping rather than
     // still-active during the join window.
-    if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]) {
+    if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Stopping]) {
         warn!(error = ?e, "sd_notify STOPPING failed");
     }
     for (name, join) in supervisors {
