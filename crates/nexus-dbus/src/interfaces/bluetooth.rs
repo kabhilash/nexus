@@ -5,9 +5,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nexus_core::PairingAnswer;
+use nexus_core::{PairingAnswer, PairingJobId};
+use ulid::Ulid;
 use zbus::fdo;
 use zbus::message::Header;
+use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use crate::authz::actions;
@@ -64,6 +66,27 @@ impl BluetoothIface {
             .unwrap_or_else(|| format!("/org/bluez/{}", self.ifname))
     }
 
+    /// Resolve a `fi.nexus.BluetoothDevice` object path (as passed to
+    /// `Pair(device: o)` / `CancelPairing(device: o)`) into the raw
+    /// BlueZ device path `nexus-bluetooth`'s `BtCommand`s expect.
+    /// There's no reverse-path-parsing shortcut here (unlike
+    /// `BluetoothDeviceIface::device_bluez_path`, which already knows
+    /// its own address) — this searches this adapter's cached
+    /// `known_devices` for an entry whose reconstructed path matches,
+    /// returning `None` (→ `fi.nexus.Error.UnknownDevice`) if the
+    /// path isn't a child of this adapter.
+    async fn resolve_device_bluez_path(&self, device: &str) -> Option<String> {
+        let guard = self.services.state.read().await;
+        let InterfaceKindData::Bluetooth(c) = &guard.interfaces.get(&self.ifname)?.kind_data
+        else {
+            return None;
+        };
+        c.known_devices.values().find_map(|d| {
+            let path = bluetooth_device_path(&self.ifname, &d.info.address);
+            (path == device).then(|| d.info.device_path.clone())
+        })
+    }
+
     fn check_feature(&self) -> fdo::Result<()> {
         self.services
             .enabled
@@ -91,13 +114,26 @@ impl BluetoothIface {
 
 #[zbus::interface(name = "fi.nexus.Bluetooth")]
 impl BluetoothIface {
-    /// `Address` is the adapter's BD_ADDR. It's a hardware ID — it
-    /// doesn't change at runtime — so we read it from
-    /// `InterfaceInfo.kind` (set once on `InterfaceDiscovered`)
-    /// rather than the mutable `BluetoothAdapterState.address`,
-    /// which only gets populated on the BlueZ-side
-    /// `BtAdapterChanged` event and was empty for adapters whose
-    /// only event was the initial discovery.
+    /// `Address` is the adapter's BD_ADDR. It's a hardware ID that's
+    /// fixed once the controller is fully up, but the value Nexus
+    /// first observes at discovery can be a zeroed placeholder for
+    /// two different reasons: some controllers (BCM/Cypress/Marvell)
+    /// have firmware that finishes loading *after* the kernel
+    /// registers the HCI device (`nexus-interface-monitor::udev` can
+    /// catch up on the resulting `change` uevent), and UART/serdev-
+    /// attached controllers (no USB HCI device) never expose a kernel
+    /// sysfs address at all, in which case that path never fires.
+    /// BlueZ's own `Adapter1.Address` is authoritative and covers
+    /// both cases — `nexus-bluetooth`'s reconcile loop
+    /// (`BluezClient::refresh_adapter`, DD-004 §7.3) polls it and
+    /// corrects `InterfaceInfo.kind` via `NexusEvent::MacChanged`
+    /// whenever it disagrees with the cache. We read from
+    /// `InterfaceInfo.kind` here rather than the mutable
+    /// `BluetoothAdapterState.address` (which only gets populated on
+    /// the BlueZ-side `BtAdapterChanged` event and was empty for
+    /// adapters whose only event was the initial discovery), so this
+    /// property can change post-discovery — in practice rarely, and
+    /// usually just once.
     #[zbus(property, name = "Address")]
     async fn address(&self) -> String {
         use nexus_core::BluetoothAddrExt;
@@ -207,6 +243,117 @@ impl BluetoothIface {
             .await
             .map_err(fdo::Error::from)
     }
+
+    /// `Pair(device: o) -> (job_id: s)` — DD-006 §6.4. Returns a
+    /// pairing job id (ULID string) that correlates subsequent
+    /// `PairingPrompt` and `PairingComplete` signals on this adapter
+    /// object.
+    async fn pair(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        device: OwnedObjectPath,
+    ) -> fdo::Result<String> {
+        self.check_feature()?;
+        self.require_auth(&hdr, actions::CONNECT).await?;
+        let device_path = self
+            .resolve_device_bluez_path(device.as_str())
+            .await
+            .ok_or_else(|| {
+                fdo::Error::from(DbusError::NotFound(format!("unknown device: {device}")))
+            })?;
+        let job_id = self
+            .services
+            .ops
+            .bt_pair(&device_path)
+            .await
+            .map_err(fdo::Error::from)?;
+        Ok(job_id.0.to_string())
+    }
+
+    /// `CancelPairing(device: o) -> ()` — DD-006 §6.4. Cancel an
+    /// in-flight pairing. Maps to BlueZ's `CancelPairing`.
+    async fn cancel_pairing(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        device: OwnedObjectPath,
+    ) -> fdo::Result<()> {
+        self.check_feature()?;
+        self.require_auth(&hdr, actions::CONNECT).await?;
+        let device_path = self
+            .resolve_device_bluez_path(device.as_str())
+            .await
+            .ok_or_else(|| {
+                fdo::Error::from(DbusError::NotFound(format!("unknown device: {device}")))
+            })?;
+        self.services
+            .ops
+            .bt_cancel_pairing(&device_path)
+            .await
+            .map_err(fdo::Error::from)
+    }
+
+    /// `AnswerPairingPrompt(job_id: s, answer: v) -> ()` — DD-006
+    /// §6.4. `answer`'s D-Bus type varies with the pending prompt's
+    /// kind (`s` for PIN/acknowledge/the universal "cancel", `u` for
+    /// a passkey, `b` for accept/reject); [`decode_pairing_answer`]
+    /// does the type-shape parsing. The backend then validates the
+    /// parsed answer against the *actually* pending kind
+    /// (`nexus_bluetooth::pairing::validate_answer`) before resolving
+    /// the Agent's oneshot — this method never needs to know which
+    /// kind of prompt is pending.
+    async fn answer_pairing_prompt(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        job_id: String,
+        answer: Value<'_>,
+    ) -> fdo::Result<()> {
+        self.check_feature()?;
+        self.require_auth(&hdr, actions::CONNECT).await?;
+        let job_id = Ulid::from_string(&job_id)
+            .map(PairingJobId)
+            .map_err(|e| fdo::Error::from(DbusError::InvalidArgument(format!("bad job_id: {e}"))))?;
+        let answer = decode_pairing_answer(&answer).map_err(fdo::Error::from)?;
+        self.services
+            .ops
+            .bt_answer_pairing_prompt(job_id, answer)
+            .await
+            .map_err(fdo::Error::from)
+    }
+
+    /// `PairingStarted(job_id: s, device: o)` — DD-006 §6.4. Emitted
+    /// from the service event loop (`service::emit_bt_pairing_started`)
+    /// via raw `connection.emit_signal`, same as `fi.nexus.Manager`'s
+    /// event-driven signals — this declaration exists for
+    /// introspection so typed proxy clients see the signal's shape.
+    #[zbus(signal)]
+    pub async fn pairing_started(
+        emitter: &SignalEmitter<'_>,
+        job_id: &str,
+        device: &ObjectPath<'_>,
+    ) -> zbus::Result<()>;
+
+    /// `PairingPrompt(job_id: s, kind: s, data: a{sv})` — DD-006
+    /// §6.4. See that section for `kind`'s value set and `data`'s
+    /// per-kind keys.
+    #[zbus(signal)]
+    pub async fn pairing_prompt(
+        emitter: &SignalEmitter<'_>,
+        job_id: &str,
+        kind: &str,
+        data: HashMap<String, OwnedValue>,
+    ) -> zbus::Result<()>;
+
+    /// `PairingComplete(job_id: s, success: b, reason: s)` — DD-006
+    /// §6.4. `reason` is `""` on success, else one of `"rejected"` /
+    /// `"timeout"` / `"auth_failed"` / `"connection_failed"` /
+    /// `"other"`.
+    #[zbus(signal)]
+    pub async fn pairing_complete(
+        emitter: &SignalEmitter<'_>,
+        job_id: &str,
+        success: bool,
+        reason: &str,
+    ) -> zbus::Result<()>;
 
     #[zbus(property, name = "Discoverable")]
     async fn discoverable(&self) -> bool {

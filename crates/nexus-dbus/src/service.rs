@@ -10,7 +10,10 @@
 
 use std::sync::Arc;
 
-use nexus_core::{InterfaceKind, NexusEvent};
+use nexus_core::{
+    BluetoothAddrExt, BtFailureReason, InterfaceKind, MacAddr, NexusEvent, PairingJobId,
+    PairingPromptData, PairingPromptKind,
+};
 use nexus_profile_store::ProfileStore;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -21,12 +24,14 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 use crate::authz::AuthChecker;
 use crate::backend_ops::BackendOps;
 use crate::interfaces::{
-    BluetoothIface, EthernetIface, GnssIface, InterfaceIface, WifiIface, iface_names,
+    BluetoothDeviceIface, BluetoothIface, EthernetIface, GnssIface, InterfaceIface, WifiIface,
+    iface_names,
 };
 use crate::manager::Manager;
 use crate::object_manager::{self, IfaceMap, ObjectManager};
 use crate::paths::{
-    MANAGER_PATH, ethernet_profile_path, interface_path, scan_result_path, wifi_profile_path,
+    MANAGER_PATH, bluetooth_device_key, bluetooth_device_path, ethernet_profile_path,
+    interface_path, scan_result_path, wifi_profile_path,
 };
 use crate::profiles::{
     EthernetProfileIface, ProfileIface, ProfileKind, WifiProfileIface,
@@ -36,7 +41,7 @@ use crate::properties::COALESCE_WINDOW;
 use crate::rate_limit::{RateLimiter, RateLimits};
 use crate::scan_results::ScanResultIface;
 use crate::services::{EnabledFeatures, Services};
-use crate::state::{InterfaceKindData, InterfaceState, State};
+use crate::state::{BtDeviceState, InterfaceKindData, InterfaceState, State};
 
 /// Configuration for [`spawn_dbus_service`].
 #[derive(Clone)]
@@ -478,6 +483,23 @@ async fn handle_event(
                 }
             }
         }
+        NexusEvent::MacChanged { ifindex, mac } => {
+            if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
+                let path = interface_path(&ifname);
+                let mut guard = state.write().await;
+                if let Some(e) = guard.interfaces.get_mut(&ifname) {
+                    if e.info.mac != mac.0 {
+                        e.info.mac = mac.0;
+                        if let nexus_core::InterfaceKind::Bluetooth { bt_address, .. } =
+                            &mut e.info.kind
+                        {
+                            *bt_address = mac;
+                        }
+                        services.batcher.mark(&path, "fi.nexus.Interface", "Mac");
+                    }
+                }
+            }
+        }
         NexusEvent::WifiRfkillChanged { ifindex, powered } => {
             if let Some(ifname) = state_lookup_ifname_by_ifindex(state, ifindex).await {
                 let path = interface_path(&ifname);
@@ -845,6 +867,31 @@ async fn handle_event(
                 }
             }
         }
+        NexusEvent::BtDeviceDiscovered(info) => {
+            handle_bt_device_discovered(connection, state, services, info).await?;
+        }
+        NexusEvent::BtDeviceConnected { adapter, address } => {
+            set_bt_device_connected(state, &adapter, address, true).await;
+        }
+        NexusEvent::BtDeviceDisconnected { adapter, address } => {
+            set_bt_device_connected(state, &adapter, address, false).await;
+        }
+        NexusEvent::BtDeviceRemoved { adapter, address } => {
+            handle_bt_device_removed(connection, state, &adapter, address).await?;
+        }
+        NexusEvent::BtPairingStarted { job_id, device } => {
+            emit_bt_pairing_started(connection, state, job_id, &device).await;
+        }
+        NexusEvent::BtPairingPrompt { job_id, kind, data } => {
+            emit_bt_pairing_prompt(connection, state, job_id, kind, &data).await;
+        }
+        NexusEvent::BtPairingComplete {
+            job_id,
+            success,
+            reason,
+        } => {
+            emit_bt_pairing_complete(connection, state, job_id, success, reason).await;
+        }
         event @ (NexusEvent::GnssTpvReceived { .. }
         | NexusEvent::GnssSatellites { .. }
         | NexusEvent::GnssFixChanged { .. }
@@ -1179,6 +1226,425 @@ async fn unregister_scan_result(
         .await;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bluetooth device objects (DD-006 §6.6) — mirrors the scan-result
+// register/update/unregister lifecycle above.
+// ---------------------------------------------------------------------------
+
+/// Derive `BluetoothDevice.State` from a raw property snapshot.
+/// This is *not* nexus-bluetooth's full per-device state machine
+/// (DD-004 §5.1 also has transient `pairing`/`connecting`/
+/// `disconnecting`/`failed` states, driven by pairing-flow events
+/// this module doesn't subscribe to) — just enough derivation from
+/// steady-state BlueZ properties that the property doesn't sit stuck
+/// at `"discovered"` for an already-paired or already-connected
+/// device.
+fn snapshot_device_state(info: &nexus_core::BtDeviceInfo) -> String {
+    if info.connected {
+        "connected"
+    } else if info.paired {
+        "paired"
+    } else {
+        "discovered"
+    }
+    .to_owned()
+}
+
+/// `NexusEvent::BtDeviceDiscovered` fires both for a device's first
+/// appearance and on every subsequent property snapshot (see that
+/// variant's doc comment in `nexus-core`) — so this is an upsert:
+/// register a `BluetoothDeviceIface` object the first time a given
+/// adapter+address pair is seen, and just refresh the cached
+/// `BtDeviceInfo` on every later call.
+async fn handle_bt_device_discovered(
+    connection: &zbus::Connection,
+    state: &Arc<RwLock<State>>,
+    services: &Arc<Services>,
+    info: nexus_core::BtDeviceInfo,
+) -> crate::errors::Result<()> {
+    use nexus_core::BluetoothAddrExt;
+
+    let Some(ifname) = state_lookup_bluetooth_ifname(state, &info.adapter).await else {
+        debug!(
+            adapter = %info.adapter,
+            address = %info.address.to_bluez(),
+            "bt device discovered before its adapter was registered; dropping",
+        );
+        return Ok(());
+    };
+    let key = bluetooth_device_key(&info.address);
+    let derived_state = snapshot_device_state(&info);
+    let was_present = {
+        let mut guard = state.write().await;
+        let Some(e) = guard.interfaces.get_mut(&ifname) else {
+            return Ok(());
+        };
+        let InterfaceKindData::Bluetooth(c) = &mut e.kind_data else {
+            return Ok(());
+        };
+        match c.known_devices.get_mut(&key) {
+            Some(existing) => {
+                existing.info = info.clone();
+                existing.state = derived_state;
+                true
+            }
+            None => {
+                let mut fresh = BtDeviceState::from_info(info.clone());
+                fresh.state = derived_state;
+                c.known_devices.insert(key.clone(), fresh);
+                false
+            }
+        }
+    };
+    if !was_present {
+        info!(
+            adapter = %ifname,
+            address = %info.address.to_bluez(),
+            "bluetooth device discovered",
+        );
+        register_bluetooth_device(connection, services, &ifname, info.address).await?;
+    }
+    Ok(())
+}
+
+/// Register a `BluetoothDeviceIface` object and announce it via
+/// `ObjectManager.InterfacesAdded`. Mirrors `register_scan_result`.
+async fn register_bluetooth_device(
+    connection: &zbus::Connection,
+    services: &Arc<Services>,
+    adapter_ifname: &str,
+    address: nexus_core::MacAddr,
+) -> crate::errors::Result<()> {
+    use nexus_core::BluetoothAddrExt;
+
+    let path = bluetooth_device_path(adapter_ifname, &address);
+    let obj_path = ObjectPath::try_from(path.clone())
+        .map_err(|e| crate::errors::DbusError::InvalidArgument(format!("{e}")))?;
+    let owned = OwnedObjectPath::from(obj_path);
+    let srv = connection.object_server();
+    srv.at(
+        owned.clone(),
+        BluetoothDeviceIface::new(
+            Arc::clone(services),
+            adapter_ifname,
+            bluetooth_device_key(&address),
+        ),
+    )
+    .await?;
+    let mut ifaces: IfaceMap = std::collections::HashMap::new();
+    let mut props: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+        std::collections::HashMap::new();
+    if let Ok(v) = zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::new(
+        address.to_bluez(),
+    )) {
+        props.insert("Address".to_owned(), v);
+    }
+    ifaces.insert("fi.nexus.BluetoothDevice".to_owned(), props);
+    if let Ok(mgr_ref) = srv.interface::<_, ObjectManager>(MANAGER_PATH).await {
+        let _ = ObjectManager::interfaces_added(mgr_ref.signal_emitter(), owned, ifaces).await;
+    }
+    Ok(())
+}
+
+/// Unregister a `BluetoothDeviceIface` object and announce its
+/// departure via `ObjectManager.InterfacesRemoved`. Mirrors
+/// `unregister_scan_result`.
+async fn unregister_bluetooth_device(
+    connection: &zbus::Connection,
+    adapter_ifname: &str,
+    address: nexus_core::MacAddr,
+) -> crate::errors::Result<()> {
+    let path = bluetooth_device_path(adapter_ifname, &address);
+    let obj_path = ObjectPath::try_from(path.clone())
+        .map_err(|e| crate::errors::DbusError::InvalidArgument(format!("{e}")))?;
+    let owned = OwnedObjectPath::from(obj_path);
+    let srv = connection.object_server();
+    let _ = srv.remove::<BluetoothDeviceIface, _>(owned.clone()).await;
+    if let Ok(mgr_ref) = srv.interface::<_, ObjectManager>(MANAGER_PATH).await {
+        let _ = ObjectManager::interfaces_removed(
+            mgr_ref.signal_emitter(),
+            owned,
+            vec!["fi.nexus.BluetoothDevice".to_owned()],
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// `NexusEvent::BtDeviceRemoved` — currently only fired by
+/// `nexus-bluetooth`'s discovery-TTL garbage collector. Drops the
+/// cache entry and unregisters the D-Bus object; a no-op if the
+/// device (or its adapter) isn't in the cache, which covers the
+/// benign race of the removal racing an adapter's own teardown.
+async fn handle_bt_device_removed(
+    connection: &zbus::Connection,
+    state: &Arc<RwLock<State>>,
+    adapter: &str,
+    address: nexus_core::MacAddr,
+) -> crate::errors::Result<()> {
+    use nexus_core::BluetoothAddrExt;
+
+    let Some(ifname) = state_lookup_bluetooth_ifname(state, adapter).await else {
+        return Ok(());
+    };
+    let key = bluetooth_device_key(&address);
+    let existed = {
+        let mut guard = state.write().await;
+        guard
+            .interfaces
+            .get_mut(&ifname)
+            .map(|e| match &mut e.kind_data {
+                InterfaceKindData::Bluetooth(c) => c.known_devices.remove(&key).is_some(),
+                _ => false,
+            })
+            .unwrap_or(false)
+    };
+    if existed {
+        info!(
+            adapter = %ifname,
+            address = %address.to_bluez(),
+            "bluetooth device removed",
+        );
+        unregister_bluetooth_device(connection, &ifname, address).await?;
+    }
+    Ok(())
+}
+
+/// `NexusEvent::BtDeviceConnected` / `BtDeviceDisconnected` — mirrors
+/// BlueZ's `Connected` onto the cached `BtDeviceInfo` and re-derives
+/// `State` (see `snapshot_device_state`). A no-op if the device isn't
+/// cached yet, matching the same benign-race tolerance as
+/// `BtAdapterChanged`'s handler above.
+async fn set_bt_device_connected(
+    state: &Arc<RwLock<State>>,
+    adapter: &str,
+    address: nexus_core::MacAddr,
+    connected: bool,
+) {
+    let Some(ifname) = state_lookup_bluetooth_ifname(state, adapter).await else {
+        return;
+    };
+    let key = bluetooth_device_key(&address);
+    let mut guard = state.write().await;
+    if let Some(e) = guard.interfaces.get_mut(&ifname) {
+        if let InterfaceKindData::Bluetooth(c) = &mut e.kind_data {
+            if let Some(dev) = c.known_devices.get_mut(&key) {
+                dev.info.connected = connected;
+                dev.state = snapshot_device_state(&dev.info);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pairing signals (DD-006 §6.4) — fired from the event loop, not a
+// method handler, so these use the same raw `connection.emit_signal`
+// mechanism as `emit_manager_notification_event` rather than a
+// `SignalEmitter` obtained from an in-flight method call. The
+// `#[zbus(signal)]` declarations on `BluetoothIface` exist purely for
+// introspection; nothing calls their macro-generated helpers.
+// ---------------------------------------------------------------------------
+
+/// Split a BlueZ device path (`<adapter>/dev_XX_XX_...`) into its
+/// adapter path and address. `nexus-dbus` doesn't depend on
+/// `nexus-bluetooth` (it only knows backends through `BackendOps`
+/// and the `NexusEvent` bus), so this duplicates the tiny parsing
+/// `nexus_bluetooth::bluez::object_manager::{adapter_from_device_path,
+/// address_from_device_path}` already do, rather than adding a
+/// cross-crate dependency for two one-liners.
+fn parse_bluez_device_path(path: &str) -> Option<(String, MacAddr)> {
+    let (adapter, tail) = path.rsplit_once('/')?;
+    let hex = tail.strip_prefix("dev_")?;
+    let mac_str = hex.replace('_', ":");
+    let address = MacAddr::from_bluez(&mac_str).ok()?;
+    Some((adapter.to_owned(), address))
+}
+
+/// DD-006 §6.4's `kind` wire strings. Duplicates
+/// `nexus_bluetooth::pairing::prompt_kind_label` for the same
+/// no-cross-crate-dependency reason as `parse_bluez_device_path`.
+fn pairing_prompt_kind_label(kind: PairingPromptKind) -> &'static str {
+    match kind {
+        PairingPromptKind::RequestPin => "request_pin",
+        PairingPromptKind::RequestPasskey => "request_passkey",
+        PairingPromptKind::DisplayPasskey => "display_passkey",
+        PairingPromptKind::DisplayPin => "display_pin",
+        PairingPromptKind::RequestConfirmation => "request_confirmation",
+        PairingPromptKind::RequestAuthorization => "request_authorization",
+        PairingPromptKind::AuthorizeService => "authorize_service",
+    }
+}
+
+/// DD-006 §6.4's `PairingComplete` `reason` wire strings — `""` on
+/// success, else one of the five failure buckets. Distinct from
+/// `nexus_bluetooth::backend`'s `pair_outcome_label`, which is a
+/// coarser 4-bucket *metrics* label (folds `ConnectionFailed` into
+/// a generic bucket); the wire contract needs the fifth value kept
+/// separate.
+fn pairing_failure_reason_label(reason: Option<&BtFailureReason>) -> &'static str {
+    match reason {
+        None => "",
+        Some(BtFailureReason::PairingRejected) => "rejected",
+        Some(BtFailureReason::PairingTimeout) => "timeout",
+        Some(BtFailureReason::PairingAuthFailed) => "auth_failed",
+        Some(BtFailureReason::ConnectionFailed) => "connection_failed",
+        Some(BtFailureReason::Unknown(_)) => "other",
+    }
+}
+
+/// `NexusEvent::BtPairingStarted` → `fi.nexus.Bluetooth.PairingStarted`.
+/// Also records `job_id → adapter ifname` in `State::pairing_jobs`,
+/// since the later, device-less `BtPairingComplete` needs it to know
+/// which adapter object to fire on.
+async fn emit_bt_pairing_started(
+    connection: &zbus::Connection,
+    state: &Arc<RwLock<State>>,
+    job_id: PairingJobId,
+    device_bluez_path: &str,
+) {
+    let Some((adapter_bluez_path, address)) = parse_bluez_device_path(device_bluez_path) else {
+        warn!(
+            device = device_bluez_path,
+            "BtPairingStarted: unparseable device path"
+        );
+        return;
+    };
+    let Some(ifname) = state_lookup_bluetooth_ifname(state, &adapter_bluez_path).await else {
+        warn!(
+            adapter = %adapter_bluez_path,
+            "BtPairingStarted: adapter not registered"
+        );
+        return;
+    };
+    state.write().await.pairing_jobs.insert(job_id, ifname.clone());
+    let Ok(adapter_path) = ObjectPath::try_from(interface_path(&ifname)) else {
+        return;
+    };
+    let Ok(device_path) = ObjectPath::try_from(bluetooth_device_path(&ifname, &address)) else {
+        return;
+    };
+    let job_id_str = job_id.0.to_string();
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            adapter_path,
+            "fi.nexus.Bluetooth",
+            "PairingStarted",
+            &(job_id_str.as_str(), device_path),
+        )
+        .await
+    {
+        tracing::debug!(error = ?e, job_id = %job_id_str, "Bluetooth.PairingStarted emit failed");
+    }
+}
+
+/// `NexusEvent::BtPairingPrompt` → `fi.nexus.Bluetooth.PairingPrompt`.
+async fn emit_bt_pairing_prompt(
+    connection: &zbus::Connection,
+    state: &Arc<RwLock<State>>,
+    job_id: PairingJobId,
+    kind: PairingPromptKind,
+    data: &PairingPromptData,
+) {
+    use std::collections::HashMap;
+    use zbus::zvariant::{OwnedValue, Value};
+
+    let Some((adapter_bluez_path, address)) = parse_bluez_device_path(&data.device_path) else {
+        warn!(
+            device = %data.device_path,
+            "BtPairingPrompt: unparseable device path"
+        );
+        return;
+    };
+    let Some(ifname) = state_lookup_bluetooth_ifname(state, &adapter_bluez_path).await else {
+        return;
+    };
+    let Ok(adapter_path) = ObjectPath::try_from(interface_path(&ifname)) else {
+        return;
+    };
+
+    let mut dict: HashMap<String, OwnedValue> = HashMap::new();
+    if let Ok(dp) = ObjectPath::try_from(bluetooth_device_path(&ifname, &address)) {
+        if let Ok(v) = OwnedValue::try_from(Value::from(dp)) {
+            dict.insert("device".to_owned(), v);
+        }
+    }
+    if let Some(pk) = data.passkey {
+        if let Ok(v) = OwnedValue::try_from(Value::new(pk)) {
+            dict.insert("passkey".to_owned(), v);
+        }
+    }
+    if let Some(ref pin) = data.pincode {
+        if let Ok(v) = OwnedValue::try_from(Value::new(pin.clone())) {
+            dict.insert("pin".to_owned(), v);
+        }
+    }
+    if let Some(ref uuid) = data.service_uuid {
+        if let Ok(v) = OwnedValue::try_from(Value::new(uuid.clone())) {
+            dict.insert("service_uuid".to_owned(), v);
+        }
+    }
+
+    let job_id_str = job_id.0.to_string();
+    let kind_label = pairing_prompt_kind_label(kind);
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            adapter_path,
+            "fi.nexus.Bluetooth",
+            "PairingPrompt",
+            &(job_id_str.as_str(), kind_label, dict),
+        )
+        .await
+    {
+        tracing::debug!(
+            error = ?e,
+            job_id = %job_id_str,
+            kind = kind_label,
+            "Bluetooth.PairingPrompt emit failed",
+        );
+    }
+}
+
+/// `NexusEvent::BtPairingComplete` → `fi.nexus.Bluetooth.PairingComplete`.
+/// Consumes the `job_id → adapter ifname` entry `emit_bt_pairing_started`
+/// recorded — this event carries no device/adapter field of its own.
+async fn emit_bt_pairing_complete(
+    connection: &zbus::Connection,
+    state: &Arc<RwLock<State>>,
+    job_id: PairingJobId,
+    success: bool,
+    reason: Option<BtFailureReason>,
+) {
+    let ifname = state.write().await.pairing_jobs.remove(&job_id);
+    let Some(ifname) = ifname else {
+        debug!(job_id = %job_id.0, "BtPairingComplete for an untracked job");
+        return;
+    };
+    let Ok(adapter_path) = ObjectPath::try_from(interface_path(&ifname)) else {
+        return;
+    };
+    let job_id_str = job_id.0.to_string();
+    let reason_label = pairing_failure_reason_label(reason.as_ref());
+    if let Err(e) = connection
+        .emit_signal(
+            None::<&str>,
+            adapter_path,
+            "fi.nexus.Bluetooth",
+            "PairingComplete",
+            &(job_id_str.as_str(), success, reason_label),
+        )
+        .await
+    {
+        tracing::debug!(
+            error = ?e,
+            job_id = %job_id_str,
+            success,
+            "Bluetooth.PairingComplete emit failed",
+        );
+    }
 }
 
 async fn unregister_ethernet_profile(
@@ -1834,5 +2300,70 @@ async fn apply_gnss_event(state: &Arc<RwLock<State>>, event: NexusEvent) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_bluez_device_path ---------------------------------------
+
+    #[test]
+    fn parse_bluez_device_path_splits_adapter_and_address() {
+        let (adapter, address) =
+            parse_bluez_device_path("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF").unwrap();
+        assert_eq!(adapter, "/org/bluez/hci0");
+        assert_eq!(address, MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]));
+    }
+
+    #[test]
+    fn parse_bluez_device_path_rejects_missing_dev_prefix() {
+        assert!(parse_bluez_device_path("/org/bluez/hci0/AA_BB_CC_DD_EE_FF").is_none());
+    }
+
+    #[test]
+    fn parse_bluez_device_path_rejects_malformed_address() {
+        assert!(parse_bluez_device_path("/org/bluez/hci0/dev_not_a_mac").is_none());
+    }
+
+    #[test]
+    fn parse_bluez_device_path_rejects_no_slash() {
+        assert!(parse_bluez_device_path("no-slash-here").is_none());
+    }
+
+    // --- pairing_prompt_kind_label ---------------------------------------
+
+    #[test]
+    fn pairing_prompt_kind_label_covers_every_variant() {
+        let cases = [
+            (PairingPromptKind::RequestPin, "request_pin"),
+            (PairingPromptKind::RequestPasskey, "request_passkey"),
+            (PairingPromptKind::DisplayPasskey, "display_passkey"),
+            (PairingPromptKind::DisplayPin, "display_pin"),
+            (PairingPromptKind::RequestConfirmation, "request_confirmation"),
+            (PairingPromptKind::RequestAuthorization, "request_authorization"),
+            (PairingPromptKind::AuthorizeService, "authorize_service"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(pairing_prompt_kind_label(kind), expected, "{kind:?}");
+        }
+    }
+
+    // --- pairing_failure_reason_label -------------------------------------
+
+    #[test]
+    fn pairing_failure_reason_label_covers_every_variant() {
+        assert_eq!(pairing_failure_reason_label(None), "");
+        let cases = [
+            (BtFailureReason::PairingRejected, "rejected"),
+            (BtFailureReason::PairingTimeout, "timeout"),
+            (BtFailureReason::PairingAuthFailed, "auth_failed"),
+            (BtFailureReason::ConnectionFailed, "connection_failed"),
+            (BtFailureReason::Unknown("whatever".into()), "other"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(pairing_failure_reason_label(Some(&reason)), expected);
+        }
     }
 }

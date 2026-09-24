@@ -44,6 +44,13 @@ pub struct MockBluezState {
     pub pairable: HashMap<String, bool>,
     pub discovering: HashMap<String, bool>,
     pub trusted: HashMap<String, bool>,
+    /// BlueZ's own view of each adapter's `Address` — independent of
+    /// `powered`/`discovering` since real BlueZ never changes
+    /// `Adapter1.Address` via `PropertiesChanged`. Read by
+    /// [`BluezClient::refresh_adapter`]; set directly via
+    /// [`MockBluezClient::set_adapter_address`] rather than through
+    /// a synthesized signal.
+    pub address: HashMap<String, MacAddr>,
     /// Calls the backend has made. Tests pattern-match on this.
     pub calls: Vec<MockCall>,
     /// Canned error for the next call of the given name, popped on
@@ -62,6 +69,7 @@ pub struct MockBluezSnapshot {
     pub pairable: HashMap<String, bool>,
     pub discovering: HashMap<String, bool>,
     pub trusted: HashMap<String, bool>,
+    pub address: HashMap<String, MacAddr>,
     pub calls: Vec<MockCall>,
 }
 
@@ -79,6 +87,7 @@ pub enum MockCall {
     ConnectDevice(String),
     DisconnectDevice(String),
     ForgetDevice(String, String),
+    RefreshAdapter(String),
 }
 
 /// Full mock client. Cheap to clone (Arc'd state + broadcast
@@ -124,6 +133,7 @@ impl MockBluezClient {
             pairable: guard.pairable.clone(),
             discovering: guard.discovering.clone(),
             trusted: guard.trusted.clone(),
+            address: guard.address.clone(),
             calls: guard.calls.clone(),
         }
     }
@@ -253,6 +263,34 @@ impl MockBluezClient {
         );
     }
 
+    /// Set BlueZ's adapter properties without emitting
+    /// `PropertiesChanged` or `InterfacesAdded` — simulates the
+    /// signal (or the initial `ObjectManager` snapshot) getting
+    /// lost, so tests can exercise the reconcile-driven self-heal
+    /// path ([`BluezClient::refresh_adapter`]) independently of the
+    /// signal-driven one.
+    pub fn set_adapter_props_silently(&self, adapter_path: &str, powered: bool, discovering: bool) {
+        let mut guard = self.state.lock().unwrap();
+        guard.powered.insert(adapter_path.to_owned(), powered);
+        guard
+            .discovering
+            .insert(adapter_path.to_owned(), discovering);
+    }
+
+    /// Set BlueZ's own view of an adapter's `Address`, as
+    /// [`BluezClient::refresh_adapter`] would read it. Separate from
+    /// [`Self::set_adapter_props_silently`] since real BlueZ never
+    /// changes `Adapter1.Address` via `PropertiesChanged` — there's
+    /// no signal-driven equivalent to bypass, only the initial value
+    /// a test wants `refresh_adapter` to observe.
+    pub fn set_adapter_address(&self, adapter_path: &str, address: MacAddr) {
+        self.state
+            .lock()
+            .unwrap()
+            .address
+            .insert(adapter_path.to_owned(), address);
+    }
+
     /// Queue a canned error for the next call to the named method.
     /// Name matches the `MockCall` variant name in lowercase snake
     /// case, e.g. `"connect_device"`.
@@ -287,6 +325,19 @@ impl BluezClient for MockBluezClient {
 
     fn is_connected(&self) -> bool {
         self.state.lock().unwrap().connected
+    }
+
+    async fn refresh_adapter(&self, adapter: &str) -> Result<(bool, bool, MacAddr)> {
+        self.record(MockCall::RefreshAdapter(adapter.to_owned()));
+        let guard = self.state.lock().unwrap();
+        let powered = guard.powered.get(adapter).copied().unwrap_or(false);
+        let discovering = guard.discovering.get(adapter).copied().unwrap_or(false);
+        let address = guard
+            .address
+            .get(adapter)
+            .copied()
+            .unwrap_or(MacAddr([0; 6]));
+        Ok((powered, discovering, address))
     }
 
     async fn set_powered(&self, adapter: &str, on: bool) -> Result<()> {

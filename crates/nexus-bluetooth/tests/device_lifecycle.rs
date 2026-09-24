@@ -214,11 +214,136 @@ async fn pair_on_unknown_device_errors() {
     let _ = tokio::time::timeout(Duration::from_secs(2), handle.join).await;
 }
 
+#[tokio::test]
+async fn gc_emits_bt_device_removed_for_expired_unpaired_device() {
+    // An unpaired, unbonded, disconnected device past its discovery
+    // TTL must be evicted *and* announced on the bus — otherwise the
+    // D-Bus layer's KnownDevices/per-device object never learns it's
+    // gone (DD-004 §13.2's `discovery_device_ttl_s`).
+    let (event_tx, _rx0) = broadcast::channel::<NexusEvent>(64);
+    let mut event_rx = event_tx.subscribe();
+    let (_tmp, store) = start_store().await;
+
+    let mock = Arc::new(MockBluezClient::new(event_tx.clone()));
+    let client: Arc<dyn BluezClient> = mock.clone();
+    mock.connect().await.unwrap();
+    let config = BluetoothConfig {
+        discovery_device_ttl_s: 1,
+        ..BluetoothConfig::default()
+    };
+    let handle = spawn_bluetooth_backend(client, store, event_tx.clone(), config);
+
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(bt_interface(
+            6,
+            "hci5",
+            "/org/bluez/hci5",
+            MacAddr([0; 6]),
+        )))
+        .unwrap();
+    mock.publish_adapter("/org/bluez/hci5", true, false).await;
+
+    let addr = MacAddr([0x99, 0x88, 0x77, 0x66, 0x55, 0x44]);
+    mock.publish_device("/org/bluez/hci5", addr, false).await;
+    await_event(
+        &mut event_rx,
+        |e| matches!(e, NexusEvent::BtDeviceDiscovered(info) if info.address == addr),
+    )
+    .await;
+
+    // The reconcile tick (and therefore GC) only runs once per
+    // second; with `discovery_device_ttl_s: 1`, worst case (discovery
+    // landing just after a tick fires) eviction needs up to ~2 ticks.
+    // `await_event`'s fixed 2s window is too tight for that margin, so
+    // this waits longer explicitly rather than risk flaking on
+    // `await_event`'s deadline.
+    let event = await_event_timeout(
+        &mut event_rx,
+        |e| {
+            matches!(
+                e,
+                NexusEvent::BtDeviceRemoved { adapter, address }
+                    if adapter == "/org/bluez/hci5" && *address == addr
+            )
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(matches!(event, NexusEvent::BtDeviceRemoved { .. }));
+
+    handle.shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.join).await;
+}
+
+#[tokio::test]
+async fn gc_keeps_paired_devices_past_ttl() {
+    // DD-004 §13.2: paired devices are kept indefinitely regardless
+    // of the discovery TTL — only Forget removes them.
+    let (event_tx, _rx0) = broadcast::channel::<NexusEvent>(64);
+    let mut event_rx = event_tx.subscribe();
+    let (_tmp, store) = start_store().await;
+
+    let mock = Arc::new(MockBluezClient::new(event_tx.clone()));
+    let client: Arc<dyn BluezClient> = mock.clone();
+    mock.connect().await.unwrap();
+    let config = BluetoothConfig {
+        discovery_device_ttl_s: 1,
+        ..BluetoothConfig::default()
+    };
+    let handle = spawn_bluetooth_backend(client, store, event_tx.clone(), config);
+
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(bt_interface(
+            7,
+            "hci6",
+            "/org/bluez/hci6",
+            MacAddr([0; 6]),
+        )))
+        .unwrap();
+    mock.publish_adapter("/org/bluez/hci6", true, false).await;
+
+    let addr = MacAddr([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]);
+    // `paired = true` — this is the branch that must survive GC.
+    mock.publish_device("/org/bluez/hci6", addr, true).await;
+    await_event(
+        &mut event_rx,
+        |e| matches!(e, NexusEvent::BtDeviceDiscovered(info) if info.address == addr),
+    )
+    .await;
+
+    // Give the reconcile tick well past the 1s TTL a chance to run
+    // (up to ~2 ticks worst case, since GC only checks once/second),
+    // then confirm no BtDeviceRemoved ever showed up for this device.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let mut removed = false;
+    while let Ok(e) = event_rx.try_recv() {
+        if matches!(&e, NexusEvent::BtDeviceRemoved { address, .. } if *address == addr) {
+            removed = true;
+        }
+    }
+    assert!(!removed, "paired device must not be GC'd by TTL");
+
+    handle.shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.join).await;
+}
+
 async fn await_event<F: Fn(&NexusEvent) -> bool>(
     rx: &mut broadcast::Receiver<NexusEvent>,
     pred: F,
 ) -> NexusEvent {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    await_event_timeout(rx, pred, Duration::from_secs(2)).await
+}
+
+/// Like [`await_event`], but with an explicit deadline instead of
+/// the default 2s — for waits with a known-longer worst case (e.g. a
+/// reconcile-tick-driven event, where a 1Hz tick plus a short TTL can
+/// legitimately take close to two tick intervals).
+async fn await_event_timeout<F: Fn(&NexusEvent) -> bool>(
+    rx: &mut broadcast::Receiver<NexusEvent>,
+    pred: F,
+    timeout: Duration,
+) -> NexusEvent {
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut seen = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

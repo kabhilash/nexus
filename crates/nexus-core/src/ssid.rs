@@ -56,7 +56,7 @@ impl fmt::Debug for Ssid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match std::str::from_utf8(&self.0) {
             Ok(s) => write!(f, "Ssid({s:?})"),
-            Err(_) => write!(f, "Ssid({:?})", &self.0),
+            Err(_) => write!(f, "Ssid({:?})", self.0),
         }
     }
 }

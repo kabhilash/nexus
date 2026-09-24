@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use nexus_core::{
-    BssCapabilities, BssInfo, DisconnectReason, InterfaceInfo, InterfaceKind, MacAddr,
-    NexusEvent, OperState, SecurityMode, Ssid, WifiState,
+    BluetoothAddrExt, BssCapabilities, BssInfo, BtAddressType, BtDeviceInfo, BtTransport,
+    DisconnectReason, InterfaceInfo, InterfaceKind, MacAddr, NexusEvent, OperState, PairingAnswer,
+    PairingJobId, PairingPromptData, PairingPromptKind, SecurityMode, Ssid, WifiState,
 };
 use nexus_dbus::backend_ops::BackendOps;
 use nexus_dbus::{
@@ -22,6 +23,7 @@ use nexus_profile_store::{InMemoryKeySource, ProfileFileStore, ProfileStore};
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::broadcast;
+use ulid::Ulid;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 // ---------------------------------------------------------------------------
@@ -2302,6 +2304,207 @@ async fn bluetooth_start_discovery_denied_returns_auth_failed() {
         "ops saw start_discovery despite deny: {:?}",
         ops.calls()
     );
+    handle.stop().await;
+}
+
+fn bt_device_info(adapter: &str, address: MacAddr) -> BtDeviceInfo {
+    BtDeviceInfo {
+        adapter: adapter.to_owned(),
+        device_path: format!("{adapter}/{}", address.to_object_path_component()),
+        address,
+        address_type: BtAddressType::LePublic,
+        name: Some("Test Phone".to_owned()),
+        alias: None,
+        rssi: None,
+        tx_power: None,
+        uuids: vec![],
+        transport: BtTransport::Le,
+        manufacturer_data: Default::default(),
+        paired: false,
+        bonded: false,
+        trusted: false,
+        blocked: false,
+        connected: false,
+    }
+}
+
+/// Pull messages off `stream` until one whose D-Bus member matches
+/// `want_member`, with a 2s deadline. Non-matching signals (there
+/// shouldn't be any on this narrowly-scoped match rule, but a stray
+/// retry wouldn't be a hang) are silently skipped.
+async fn next_signal(stream: &mut zbus::MessageStream, want_member: &str) -> zbus::Message {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let msg = tokio::time::timeout(remaining, stream.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for signal {want_member}"))
+            .expect("stream ended")
+            .expect("message error");
+        if msg.header().member().map(|m| m.as_str()) == Some(want_member) {
+            return msg;
+        }
+    }
+}
+
+/// End-to-end coverage of DD-006 §6.4's pairing surface: `Pair`
+/// dispatches to the backend and returns a job id; the three
+/// pairing signals fire on the *adapter* object with the documented
+/// shapes; `AnswerPairingPrompt` parses the raw variant into a
+/// `PairingAnswer` before forwarding it; and `PairingComplete` —
+/// which carries no device/adapter field of its own — still resolves
+/// to the right adapter via the `job_id → ifname` correlation
+/// `emit_bt_pairing_started` records.
+#[tokio::test]
+async fn bluetooth_pairing_flow_dispatches_and_emits_signals() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ops = RecordingOps::new();
+    let (handle, event_tx) = spawn(
+        &bus,
+        "fi.nexus1.test_pairing",
+        always_allow(),
+        Arc::clone(&ops) as Arc<dyn BackendOps>,
+    )
+    .await;
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(hci_info()))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let address = MacAddr([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+    let bluez_device_path = "/org/bluez/hci0/dev_11_22_33_44_55_66";
+    event_tx
+        .send(NexusEvent::BtDeviceDiscovered(bt_device_info(
+            "/org/bluez/hci0",
+            address,
+        )))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let client = bus.connection().await;
+    let device_path =
+        OwnedObjectPath::try_from("/fi/nexus1/interface/hci0/device/11_22_33_44_55_66").unwrap();
+
+    // Subscribe to every fi.nexus.Bluetooth signal on the adapter
+    // path before triggering any of them.
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("fi.nexus.Bluetooth")
+        .unwrap()
+        .path("/fi/nexus1/interface/hci0")
+        .unwrap()
+        .build();
+    let mut stream = zbus::MessageStream::for_match_rule(rule, &client, None)
+        .await
+        .expect("subscribe fi.nexus.Bluetooth signals");
+
+    // 1. Pair(device) dispatches to the backend with the resolved
+    // BlueZ device path and returns a job id.
+    let reply = client
+        .call_method(
+            Some("fi.nexus1.test_pairing"),
+            "/fi/nexus1/interface/hci0",
+            Some("fi.nexus.Bluetooth"),
+            "Pair",
+            &(device_path.clone(),),
+        )
+        .await
+        .expect("Pair");
+    let job_id: String = reply.body().deserialize().unwrap();
+    assert!(!job_id.is_empty());
+    assert!(
+        ops.calls().iter().any(|c| matches!(
+            c,
+            RecordedCall::BtPair { device_path } if device_path == bluez_device_path
+        )),
+        "ops.calls() = {:?}",
+        ops.calls()
+    );
+    let job = PairingJobId(Ulid::from_string(&job_id).unwrap());
+
+    // 2. PairingStarted — simulates what the real backend emits once
+    // bt_pair succeeds.
+    event_tx
+        .send(NexusEvent::BtPairingStarted {
+            job_id: job,
+            device: bluez_device_path.to_owned(),
+        })
+        .unwrap();
+    let started = next_signal(&mut stream, "PairingStarted").await;
+    let (started_job, started_device): (String, OwnedObjectPath) =
+        started.body().deserialize().unwrap();
+    assert_eq!(started_job, job_id);
+    assert_eq!(started_device, device_path);
+
+    // 3. PairingPrompt — checks the kind label and the `data` dict's
+    // per-kind keys, including the device object-path resolution.
+    event_tx
+        .send(NexusEvent::BtPairingPrompt {
+            job_id: job,
+            kind: PairingPromptKind::RequestConfirmation,
+            data: PairingPromptData {
+                device_path: bluez_device_path.to_owned(),
+                passkey: Some(123_456),
+                pincode: None,
+                service_uuid: None,
+            },
+        })
+        .unwrap();
+    let prompt = next_signal(&mut stream, "PairingPrompt").await;
+    let (prompt_job, kind, data): (String, String, HashMap<String, OwnedValue>) =
+        prompt.body().deserialize().unwrap();
+    assert_eq!(prompt_job, job_id);
+    assert_eq!(kind, "request_confirmation");
+    assert_eq!(
+        u32::try_from(data.get("passkey").unwrap().clone()).unwrap(),
+        123_456
+    );
+    let data_device: OwnedObjectPath =
+        OwnedObjectPath::try_from(data.get("device").unwrap().clone()).unwrap();
+    assert_eq!(data_device, device_path);
+    assert!(!data.contains_key("pin"));
+    assert!(!data.contains_key("service_uuid"));
+
+    // 4. AnswerPairingPrompt parses the raw `b` variant into
+    // PairingAnswer::Accept and forwards it with the parsed job id.
+    client
+        .call_method(
+            Some("fi.nexus1.test_pairing"),
+            "/fi/nexus1/interface/hci0",
+            Some("fi.nexus.Bluetooth"),
+            "AnswerPairingPrompt",
+            &(job_id.as_str(), Value::new(true)),
+        )
+        .await
+        .expect("AnswerPairingPrompt");
+    assert!(
+        ops.calls().iter().any(|c| matches!(
+            c,
+            RecordedCall::BtAnswerPairingPrompt { job_id: j, answer }
+                if *j == job && *answer == PairingAnswer::Accept(true)
+        )),
+        "ops.calls() = {:?}",
+        ops.calls()
+    );
+
+    // 5. PairingComplete carries no device/adapter field — this is
+    // the part that only works if `job_id → ifname` correlation
+    // (recorded in step 2) actually resolved the adapter object.
+    event_tx
+        .send(NexusEvent::BtPairingComplete {
+            job_id: job,
+            success: true,
+            reason: None,
+        })
+        .unwrap();
+    let complete = next_signal(&mut stream, "PairingComplete").await;
+    let (complete_job, success, reason): (String, bool, String) =
+        complete.body().deserialize().unwrap();
+    assert_eq!(complete_job, job_id);
+    assert!(success);
+    assert_eq!(reason, "");
+
     handle.stop().await;
 }
 

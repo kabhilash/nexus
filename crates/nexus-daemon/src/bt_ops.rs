@@ -17,10 +17,8 @@
 //!
 //! Live: `bt_set_powered`, `bt_set_discoverable`, `bt_set_pairable`,
 //! `bt_set_trusted`, `bt_start_discovery`, `bt_stop_discovery`,
-//! `bt_connect_device`, `bt_disconnect_device`, `bt_forget_device`.
-//! Pairing-flow methods (`Pair` / `AnswerPairingPrompt` /
-//! `CancelPairing`) are deferred — they need the prompt-signal
-//! plumbing landed first.
+//! `bt_connect_device`, `bt_disconnect_device`, `bt_forget_device`,
+//! `bt_pair`, `bt_cancel_pairing`, `bt_answer_pairing_prompt`.
 
 use std::sync::Arc;
 
@@ -28,6 +26,7 @@ use async_trait::async_trait;
 use nexus_bluetooth::{
     BtCommand, BtError, DiscoveryFilter, DiscoveryTransport,
 };
+use nexus_core::{PairingAnswer, PairingJobId};
 use nexus_dbus::{BackendOps, BtDiscoveryFilter, DbusError, ReloadReport, Result};
 use tokio::sync::{mpsc, oneshot};
 
@@ -51,15 +50,30 @@ impl BtBackendOps {
 /// Most failures classify as `ResourceBusy` (bluez is up but
 /// something disagreed) rather than `NotFound`; the latter is
 /// reserved for "BlueZ doesn't know this adapter."
+///
+/// Pairing-specific mappings follow DD-006 §6.4's per-method error
+/// lists: `Pair` documents `InvalidState` for "device already
+/// pairing or paired" (→ `AlreadyPairing`), `AnswerPairingPrompt`
+/// documents `UnknownPairingJob` and `InvalidArgument` for "wrong
+/// variant type for the prompt kind" (→ `InvalidPromptAnswer`, which
+/// carries `nexus_bluetooth::pairing::validate_answer`'s reason
+/// text). `UnknownPairingJob` itself maps onto the same generic
+/// `NotFound` category `UnknownDevice`/`UnknownAdapter` already use —
+/// see DD-006 §11's error-name-vs-category note in
+/// `nexus_dbus::errors`, the wire name comes from the message
+/// prefix, not a dedicated enum variant per DD-006 label.
 fn map_bt_error(e: BtError) -> DbusError {
     match e {
         BtError::UnknownAdapter(_) => DbusError::NotFound(e.to_string()),
         BtError::UnknownDevice(_) => DbusError::NotFound(e.to_string()),
+        BtError::UnknownPairingJob(_) => DbusError::NotFound(e.to_string()),
+        BtError::AlreadyPairing => DbusError::InvalidState(e.to_string()),
+        BtError::InvalidPromptAnswer(_) => DbusError::InvalidArgument(e.to_string()),
         BtError::NotConnected => DbusError::ResourceBusy(e.to_string()),
         // BlueZ-side rejections (busy, timeouts, in-flight conflicts)
-        // and pairing-flow errors come through as ResourceBusy so
-        // clients get a "try again" hint without surfacing internal
-        // states.
+        // and everything else (including a prompt oneshot the Agent
+        // gave up waiting on) come through as ResourceBusy so clients
+        // get a "try again" hint without surfacing internal states.
         _ => DbusError::ResourceBusy(e.to_string()),
     }
 }
@@ -206,6 +220,51 @@ impl BackendOps for BtBackendOps {
             device_path,
             on,
             responder,
+        })
+        .await
+    }
+
+    /// `bt_pair` returns a `PairingJobId`, not `()`, so it can't use
+    /// the `dispatch` helper (hardcoded to `Result<()>` responders) —
+    /// inlined here rather than generalizing `dispatch` for the one
+    /// caller that needs a typed reply.
+    async fn bt_pair(&self, device_path: &str) -> Result<PairingJobId> {
+        let (tx, rx) = oneshot::channel();
+        self.commands
+            .send(BtCommand::Pair {
+                device_path: device_path.to_owned(),
+                responder: tx,
+            })
+            .await
+            .map_err(|_| DbusError::FeatureDisabled("bluetooth: backend channel closed".into()))?;
+        match rx.await {
+            Ok(r) => r.map_err(map_bt_error),
+            Err(_) => Err(DbusError::FeatureDisabled(
+                "bluetooth: backend dropped the reply".into(),
+            )),
+        }
+    }
+
+    async fn bt_cancel_pairing(&self, device_path: &str) -> Result<()> {
+        let device_path = device_path.to_owned();
+        dispatch(&self.commands, |responder| BtCommand::CancelPairing {
+            device_path,
+            responder,
+        })
+        .await
+    }
+
+    async fn bt_answer_pairing_prompt(
+        &self,
+        job_id: PairingJobId,
+        answer: PairingAnswer,
+    ) -> Result<()> {
+        dispatch(&self.commands, |responder| {
+            BtCommand::AnswerPairingPrompt {
+                job_id,
+                answer,
+                responder,
+            }
         })
         .await
     }

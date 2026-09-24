@@ -59,14 +59,25 @@ pub fn scan_result_path(ifname: &str, bssid: &MacAddr) -> String {
     )
 }
 
+/// The `device_key` a `BluetoothAdapterState.known_devices` entry is
+/// keyed by, and that `BluetoothDeviceIface.device_key` matches — the
+/// tail path component of [`bluetooth_device_path`]. Exposed
+/// separately so callers that need just the map key (not a full
+/// path, e.g. to look up or register a device) don't have to
+/// string-split it back out of the path.
+pub fn bluetooth_device_key(device: &MacAddr) -> String {
+    let [a, b, c, d, e, g] = device.0;
+    format!("{a:02X}_{b:02X}_{c:02X}_{d:02X}_{e:02X}_{g:02X}")
+}
+
 /// Build the per-device object path under a Bluetooth adapter. See
 /// DD-006 §6.6 — device addresses render as `AA_BB_CC_DD_EE_FF`.
 pub fn bluetooth_device_path(adapter_ifname: &str, device: &MacAddr) -> String {
-    let [a, b, c, d, e, g] = device.0;
     format!(
-        "{}/{}/device/{a:02X}_{b:02X}_{c:02X}_{d:02X}_{e:02X}_{g:02X}",
+        "{}/{}/device/{}",
         INTERFACE_ROOT,
-        escape_component(adapter_ifname)
+        escape_component(adapter_ifname),
+        bluetooth_device_key(device),
     )
 }
 
@@ -127,6 +138,14 @@ mod tests {
             bluetooth_device_path("hci0", &m),
             "/fi/nexus1/interface/hci0/device/AA_BB_CC_DD_EE_FF"
         );
+    }
+
+    #[test]
+    fn bluetooth_device_key_matches_the_path_tail() {
+        let m = MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        let key = bluetooth_device_key(&m);
+        assert_eq!(key, "AA_BB_CC_DD_EE_FF");
+        assert!(bluetooth_device_path("hci0", &m).ends_with(&key));
     }
 
     #[test]

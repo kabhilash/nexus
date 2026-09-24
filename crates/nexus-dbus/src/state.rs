@@ -7,11 +7,11 @@
 //! object so D-Bus clients see `PropertiesChanged` signals in
 //! real time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use nexus_core::{
     BssInfo, BtDeviceInfo, ConnectivityState, FixMode, GnssFix, InterfaceInfo, InterfaceKind,
-    MacAddr, SatInfo, WifiState,
+    MacAddr, PairingJobId, SatInfo, WifiState,
 };
 use nexus_profile_store::{BluetoothProfile, EthernetProfile, WifiProfile};
 
@@ -283,6 +283,15 @@ pub struct State {
     pub ethernet_profiles: BTreeMap<String, EthernetProfile>,
     /// Bluetooth profiles keyed by ULID string.
     pub bluetooth_profiles: BTreeMap<String, BluetoothProfile>,
+
+    /// Adapter ifname a pairing job belongs to, so `BtPairingComplete`
+    /// (which carries no device/adapter field — see DD-006 §6.4's
+    /// `PairingComplete(job_id, success, reason)`) knows which
+    /// `fi.nexus.Bluetooth` object to fire the signal on. Populated
+    /// when `BtPairingStarted` arrives (which does carry a device
+    /// path to resolve the adapter from); removed once
+    /// `BtPairingComplete` for that job has fired.
+    pub pairing_jobs: HashMap<PairingJobId, String>,
 }
 
 impl State {

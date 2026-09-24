@@ -312,7 +312,7 @@
     { "id": "prop:fi.nexus.Interface.Ifindex", "type": "Property", "label": "Interface.Ifindex",
       "attrs": { "sig": "u", "access": "read" } },
     { "id": "prop:fi.nexus.Interface.Mac", "type": "Property", "label": "Interface.Mac",
-      "attrs": { "sig": "ay", "access": "read", "note": "Empty for GNSS." } },
+      "attrs": { "sig": "ay", "access": "read", "note": "Empty for GNSS. For a Bluetooth adapter, may read as all-zero right after the adapter first appears — either briefly (firmware on some BCM/Cypress/Marvell parts sets the real BD_ADDR after kernel registration) or indefinitely on UART/serdev-attached controllers, which never expose a kernel sysfs address at all. Nexus self-corrects it from BlueZ's own Adapter1.Address (polled once per second while connected) in both cases, with no PropertiesChanged signal on this property today, so a zeroed value seen immediately after discovery is worth a re-Get a second or two later rather than treated as a permanent fault." } },
     { "id": "prop:fi.nexus.Interface.Kind", "type": "Property", "label": "Interface.Kind",
       "attrs": { "sig": "s", "access": "read", "values": ["ethernet", "wifi", "bluetooth", "gnss"] } },
     { "id": "prop:fi.nexus.Interface.OperState", "type": "Property", "label": "Interface.OperState",
@@ -487,7 +487,8 @@
                  "common_keys": ["ht", "vht", "he", "ft (802.11r)", "pmf_required"] } },
 
     { "id": "prop:fi.nexus.Bluetooth.Address", "type": "Property", "label": "Bluetooth.Address",
-      "attrs": { "sig": "s", "access": "read", "format": "XX:XX:XX:XX:XX:XX" } },
+      "attrs": { "sig": "s", "access": "read", "format": "XX:XX:XX:XX:XX:XX",
+        "note": "Same self-correcting-zero caveat as Interface.Mac (see that node) — reads as 00:00:00:00:00:00 right after adapter discovery until Nexus's next BlueZ poll (up to ~1s) corrects it from Adapter1.Address, the authoritative source." } },
     { "id": "prop:fi.nexus.Bluetooth.Powered", "type": "Property", "label": "Bluetooth.Powered (adapter)",
       "attrs": {
         "sig": "b",

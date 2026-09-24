@@ -47,6 +47,28 @@ pub enum NexusEvent {
         ifindex: u32,
         state: crate::interface::OperState,
     },
+    /// A previously-discovered interface's hardware address was
+    /// corrected in place — same identity (`ifindex`/`ifname`), one
+    /// field updated. Ordinary netlink-tracked interfaces never hit
+    /// this path today (a kernel-side MAC change folds silently into
+    /// the next classified snapshot); it exists for Bluetooth
+    /// adapters, whose discovery-time address can be a zeroed
+    /// placeholder for two different reasons: some controllers set
+    /// their real BD_ADDR via firmware *after* udev's initial `Add`
+    /// event, so the first read races firmware load (see
+    /// `nexus-interface-monitor::udev::bluetooth_from_device`'s doc
+    /// comment); others (UART/serdev-attached controllers, no USB
+    /// HCI device) never expose a kernel sysfs address at all, in
+    /// which case `nexus-bluetooth`'s reconcile loop is what corrects
+    /// it, from BlueZ's own authoritative `Adapter1.Address` (DD-004
+    /// §7.3). Consumers should update their cached address field in
+    /// place rather than treating this as a fresh discovery — unlike
+    /// a rename, the identity hasn't changed, so there's no
+    /// `InterfaceRemoved` paired with it.
+    MacChanged {
+        ifindex: u32,
+        mac: MacAddr,
+    },
 
     // --- Ethernet Backend ---
     EthAuthStateChanged {
@@ -163,6 +185,21 @@ pub enum NexusEvent {
         address: MacAddr,
     },
     BtDeviceDisconnected {
+        adapter: String,
+        address: MacAddr,
+    },
+    /// A device entry was dropped from the backend's own registry —
+    /// currently only fired by `nexus-bluetooth`'s discovery-TTL
+    /// garbage collector (DD-004 §13.2's `discovery_device_ttl_s`,
+    /// which only evicts unpaired/unbonded/unconnected entries;
+    /// paired devices are kept indefinitely and removed only via an
+    /// explicit `Forget`, which does not fire this event). Distinct
+    /// from `BtDeviceDisconnected`: a device can disconnect and stay
+    /// known (still paired, or just not yet TTL-expired) — this
+    /// means the device is gone from Nexus's view entirely, so
+    /// consumers should drop any per-device state (D-Bus object,
+    /// cache entry) rather than just clearing a connected flag.
+    BtDeviceRemoved {
         adapter: String,
         address: MacAddr,
     },

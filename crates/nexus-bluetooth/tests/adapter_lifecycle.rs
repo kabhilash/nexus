@@ -118,6 +118,113 @@ async fn adapter_progresses_unavailable_present_powered_discovering_gone() {
 }
 
 #[tokio::test]
+async fn reconcile_self_heals_a_missed_adapter_props_signal() {
+    // Boot-time race: BlueZ already has the adapter powered, but the
+    // initial ObjectManager snapshot / PropertiesChanged signal never
+    // reached Nexus (both daemons started in the same instant). The
+    // reconcile tick's `refresh_adapter` backstop (DD-004 §7.3)
+    // should catch it up within one tick without any explicit signal.
+    let (event_tx, _rx0) = broadcast::channel::<NexusEvent>(64);
+    let mut event_rx = event_tx.subscribe();
+    let (_tmp, store) = start_store().await;
+
+    let mock = Arc::new(MockBluezClient::new(event_tx.clone()));
+    let client: Arc<dyn BluezClient> = mock.clone();
+    mock.connect().await.unwrap();
+    let handle =
+        spawn_bluetooth_backend(client, store, event_tx.clone(), BluetoothConfig::default());
+
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(bt_interface(
+            3,
+            "hci2",
+            "/org/bluez/hci2",
+        )))
+        .unwrap();
+    // BlueZ's own truth is "powered" — set it *silently*, with no
+    // InterfacesAdded/PropertiesChanged signal, so the backend has no
+    // way to learn it except by polling `refresh_adapter`.
+    mock.set_adapter_props_silently("/org/bluez/hci2", true, false);
+
+    let event = await_event(&mut event_rx, |e| {
+        matches!(
+            e,
+            NexusEvent::BtAdapterChanged {
+                adapter,
+                powered: true,
+                ..
+            } if adapter == "/org/bluez/hci2"
+        )
+    })
+    .await;
+    assert!(matches!(event, NexusEvent::BtAdapterChanged { .. }));
+
+    // The mock's address map was never configured for this adapter,
+    // so `refresh_adapter` reports the zero default every tick. That
+    // must never be treated as a correction against the real cached
+    // address (`bt_interface`'s non-zero mac) — confirm a further
+    // tick doesn't emit a spurious MacChanged regressing it to zero.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    while let Ok(e) = event_rx.try_recv() {
+        assert!(
+            !matches!(e, NexusEvent::MacChanged { .. }),
+            "unexpected MacChanged from an unconfigured (zero) mock address: {e:?}"
+        );
+    }
+
+    handle.shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.join).await;
+}
+
+#[tokio::test]
+async fn reconcile_corrects_address_from_bluez_when_sysfs_never_had_one() {
+    // UART/serdev-attached controllers never populate a kernel sysfs
+    // address at all, so nexus-interface-monitor's udev probe stamps
+    // [0; 6] at discovery and no `change` uevent ever arrives to fix
+    // it (there's no sysfs file to begin with). BlueZ's own
+    // Adapter1.Address is authoritative and is what the reconcile
+    // loop's `refresh_adapter` polls instead (DD-004 §7.3).
+    let (event_tx, _rx0) = broadcast::channel::<NexusEvent>(64);
+    let mut event_rx = event_tx.subscribe();
+    let (_tmp, store) = start_store().await;
+
+    let mock = Arc::new(MockBluezClient::new(event_tx.clone()));
+    let client: Arc<dyn BluezClient> = mock.clone();
+    mock.connect().await.unwrap();
+    let handle =
+        spawn_bluetooth_backend(client, store, event_tx.clone(), BluetoothConfig::default());
+
+    // Discovered with the zeroed placeholder udev stamps when it
+    // never finds a sysfs address.
+    let mut zeroed = bt_interface(4, "hci3", "/org/bluez/hci3");
+    zeroed.mac = [0; 6];
+    if let InterfaceKind::Bluetooth { bt_address, .. } = &mut zeroed.kind {
+        *bt_address = MacAddr([0; 6]);
+    }
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(zeroed))
+        .unwrap();
+
+    // BlueZ, however, has always known the real address.
+    mock.set_adapter_address(
+        "/org/bluez/hci3",
+        MacAddr([0x34, 0x90, 0xEA, 0xAD, 0xAB, 0xC3]),
+    );
+
+    let event = await_event(&mut event_rx, |e| {
+        matches!(
+            e,
+            NexusEvent::MacChanged { mac, .. } if mac.0 == [0x34, 0x90, 0xEA, 0xAD, 0xAB, 0xC3]
+        )
+    })
+    .await;
+    assert!(matches!(event, NexusEvent::MacChanged { .. }));
+
+    handle.shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.join).await;
+}
+
+#[tokio::test]
 async fn bluez_disconnect_marks_adapter_unavailable_and_clears_devices() {
     let (event_tx, _rx0) = broadcast::channel::<NexusEvent>(64);
     let mut event_rx = event_tx.subscribe();

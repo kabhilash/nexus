@@ -35,6 +35,7 @@ pub mod event_label {
     pub const INTERFACE_REMOVED: &str = "interface_removed";
     pub const CARRIER_CHANGED: &str = "carrier_changed";
     pub const OPERSTATE_CHANGED: &str = "operstate_changed";
+    pub const MAC_CHANGED: &str = "mac_changed";
 }
 
 /// Describe every metric with its unit and help text. Safe to call

@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use nexus_core::{
-    InterfaceInfo, InterfaceKind, NexusEvent, NotificationData, NotificationValue, OperState,
+    BluetoothAddrExt, BtAddressType, BtDeviceInfo, BtTransport, InterfaceInfo, InterfaceKind,
+    MacAddr, NexusEvent, NotificationData, NotificationValue, OperState,
 };
 use nexus_dbus::{DbusConfig, spawn_dbus_service};
 use nexus_profile_store::{InMemoryKeySource, ProfileFileStore, ProfileStore};
@@ -417,6 +418,232 @@ async fn bluetooth_interface_properties_readable() {
     ] {
         assert!(props.contains_key(key), "missing {key}");
     }
+
+    handle.stop().await;
+}
+
+fn bt_device_info(adapter: &str, address: MacAddr) -> BtDeviceInfo {
+    BtDeviceInfo {
+        adapter: adapter.to_owned(),
+        device_path: format!(
+            "{adapter}/{}",
+            address.to_object_path_component()
+        ),
+        address,
+        address_type: BtAddressType::LePublic,
+        name: Some("Test Phone".to_owned()),
+        alias: None,
+        rssi: Some(-60),
+        tx_power: None,
+        uuids: vec![],
+        transport: BtTransport::Le,
+        manufacturer_data: Default::default(),
+        paired: false,
+        bonded: false,
+        trusted: false,
+        blocked: false,
+        connected: false,
+    }
+}
+
+/// DD-006 §6.6 end-to-end: a device discovered via BlueZ gets a live
+/// `fi.nexus.BluetoothDevice` object, shows up in the adapter's
+/// `KnownDevices`, updates on a `Connected` transition, and both the
+/// object and the `KnownDevices` entry disappear on removal. Mirrors
+/// `phase7_10_tests.rs`'s `scan_result_objects_appear_and_disappear`
+/// for the Wi-Fi side.
+#[tokio::test]
+async fn bluetooth_device_appears_updates_and_disappears() {
+    let bus = Bus::spawn().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (event_tx, _rx) = broadcast::channel::<NexusEvent>(64);
+    let (_tmp, store) = start_store().await;
+    let handle = spawn_dbus_service(
+        event_tx.subscribe(),
+        store,
+        DbusConfig {
+            bus_name: "fi.nexus1.test_btdev".into(),
+            use_session_bus: false,
+            address: Some(bus.addr.clone()),
+            version: "0.1.0-test".into(),
+            auth: nexus_dbus::always_allow(),
+            ops: nexus_dbus::NoopOps::arc(),
+            rate_limits: nexus_dbus::RateLimits::default(),
+            enabled_features: nexus_dbus::EnabledFeatures::default(),
+            ethernet_auth_backend: "none".to_owned(),
+            wifi_supplicant: "wpa_supplicant".to_owned(),
+            wifi_roaming_mode: "supplicant".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let adapter_info = InterfaceInfo {
+        ifindex: 4,
+        ifname: "hci0".into(),
+        mac: [0x00, 0x1A, 0x7D, 0xDA, 0x71, 0x13],
+        mtu: 0,
+        operstate: OperState::Up,
+        carrier: true,
+        kind: InterfaceKind::Bluetooth {
+            hci_name: "hci0".into(),
+            hci_index: 0,
+            bt_address: MacAddr([0x00, 0x1A, 0x7D, 0xDA, 0x71, 0x13]),
+            bluez_path: "/org/bluez/hci0".into(),
+        },
+        discovered_at: std::time::Instant::now(),
+    };
+    event_tx
+        .send(NexusEvent::InterfaceDiscovered(adapter_info))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let address = MacAddr([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    event_tx
+        .send(NexusEvent::BtDeviceDiscovered(bt_device_info(
+            "/org/bluez/hci0",
+            address,
+        )))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let client = bus.connection().await;
+    let device_path =
+        OwnedObjectPath::try_from("/fi/nexus1/interface/hci0/device/AA_BB_CC_DD_EE_FF").unwrap();
+
+    // 1. Appears in GetManagedObjects.
+    let reply = client
+        .call_method(
+            Some("fi.nexus1.test_btdev"),
+            "/fi/nexus1",
+            Some("org.freedesktop.DBus.ObjectManager"),
+            "GetManagedObjects",
+            &(),
+        )
+        .await
+        .expect("GetManagedObjects");
+    let objects: HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>> =
+        reply.body().deserialize().unwrap();
+    assert!(
+        objects.contains_key(&device_path),
+        "device path missing from object tree: {:?}",
+        objects.keys().collect::<Vec<_>>()
+    );
+
+    // 2. Adapter's KnownDevices lists it.
+    let known: Vec<OwnedObjectPath> = client
+        .call_method(
+            Some("fi.nexus1.test_btdev"),
+            "/fi/nexus1/interface/hci0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("fi.nexus.Bluetooth", "KnownDevices"),
+        )
+        .await
+        .expect("Get KnownDevices")
+        .body()
+        .deserialize::<zbus::zvariant::Value<'_>>()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(known.contains(&device_path), "KnownDevices = {known:?}");
+
+    // 3. Properties reflect the discovered snapshot.
+    let reply = client
+        .call_method(
+            Some("fi.nexus1.test_btdev"),
+            device_path.as_str(),
+            Some("org.freedesktop.DBus.Properties"),
+            "GetAll",
+            &("fi.nexus.BluetoothDevice",),
+        )
+        .await
+        .expect("GetAll fi.nexus.BluetoothDevice");
+    let props: HashMap<String, OwnedValue> = reply.body().deserialize().unwrap();
+    assert_eq!(
+        props.get("Address").unwrap().downcast_ref::<&str>().unwrap(),
+        "AA:BB:CC:DD:EE:FF"
+    );
+    assert_eq!(
+        props.get("Name").unwrap().downcast_ref::<&str>().unwrap(),
+        "Test Phone"
+    );
+    assert_eq!(
+        props.get("State").unwrap().downcast_ref::<&str>().unwrap(),
+        "discovered"
+    );
+    assert!(!bool::try_from(props.get("Connected").unwrap().clone()).unwrap());
+
+    // 4. Connected transition updates Connected + derived State.
+    event_tx
+        .send(NexusEvent::BtDeviceConnected {
+            adapter: "/org/bluez/hci0".into(),
+            address,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let reply = client
+        .call_method(
+            Some("fi.nexus1.test_btdev"),
+            device_path.as_str(),
+            Some("org.freedesktop.DBus.Properties"),
+            "GetAll",
+            &("fi.nexus.BluetoothDevice",),
+        )
+        .await
+        .expect("GetAll after connect");
+    let props: HashMap<String, OwnedValue> = reply.body().deserialize().unwrap();
+    assert!(bool::try_from(props.get("Connected").unwrap().clone()).unwrap());
+    assert_eq!(
+        props.get("State").unwrap().downcast_ref::<&str>().unwrap(),
+        "connected"
+    );
+
+    // 5. Removal drops the object and the KnownDevices entry.
+    event_tx
+        .send(NexusEvent::BtDeviceRemoved {
+            adapter: "/org/bluez/hci0".into(),
+            address,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let reply = client
+        .call_method(
+            Some("fi.nexus1.test_btdev"),
+            "/fi/nexus1",
+            Some("org.freedesktop.DBus.ObjectManager"),
+            "GetManagedObjects",
+            &(),
+        )
+        .await
+        .expect("GetManagedObjects after removal");
+    let objects: HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>> =
+        reply.body().deserialize().unwrap();
+    assert!(
+        !objects.contains_key(&device_path),
+        "device path should be gone after BtDeviceRemoved"
+    );
+
+    let known: Vec<OwnedObjectPath> = client
+        .call_method(
+            Some("fi.nexus1.test_btdev"),
+            "/fi/nexus1/interface/hci0",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("fi.nexus.Bluetooth", "KnownDevices"),
+        )
+        .await
+        .expect("Get KnownDevices after removal")
+        .body()
+        .deserialize::<zbus::zvariant::Value<'_>>()
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert!(
+        !known.contains(&device_path),
+        "KnownDevices should no longer list the removed device: {known:?}"
+    );
 
     handle.stop().await;
 }

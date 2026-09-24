@@ -261,6 +261,36 @@ impl BluetoothDeviceIface {
             .map_err(|e| zbus::Error::from(zbus::fdo::Error::from(e)))
     }
 
+    /// `Pair() -> (job_id: s)` — `fi.nexus.connect`. DD-006 §6.6.
+    /// Shortcut for `fi.nexus.Bluetooth.Pair(this)`; the returned job
+    /// id correlates `PairingPrompt`/`PairingComplete` signals fired
+    /// on the *adapter* object (§6.4), not this one.
+    async fn pair(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<String> {
+        self.check_feature()?;
+        self.require_auth(&hdr, actions::CONNECT).await?;
+        let path = self.device_bluez_path().await;
+        let job_id = self
+            .services
+            .ops
+            .bt_pair(&path)
+            .await
+            .map_err(fdo::Error::from)?;
+        Ok(job_id.0.to_string())
+    }
+
+    /// `CancelPairing() -> ()` — `fi.nexus.connect`. DD-006 §6.6.
+    /// Shortcut for `fi.nexus.Bluetooth.CancelPairing(this)`.
+    async fn cancel_pairing(&self, #[zbus(header)] hdr: Header<'_>) -> fdo::Result<()> {
+        self.check_feature()?;
+        self.require_auth(&hdr, actions::CONNECT).await?;
+        let path = self.device_bluez_path().await;
+        self.services
+            .ops
+            .bt_cancel_pairing(&path)
+            .await
+            .map_err(fdo::Error::from)
+    }
+
     /// `Connect() -> ()` — `fi.nexus.connect`. DD-006 §6.6.
     /// Forwards to `nexus_bluetooth::BtCommand::Connect` which
     /// drives BlueZ's `org.bluez.Device1.Connect`.

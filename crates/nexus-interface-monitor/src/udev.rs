@@ -95,10 +95,25 @@ fn bluetooth_from_device(device: &Device) -> Option<BluetoothAdapter> {
     // On controllers whose firmware sets the BD_ADDR after the
     // initial registration (Raspberry Pi BCM43xx, CYW43xx, several
     // Marvell parts), the cached value is `00:00:00:00:00:00` even
-    // though the kernel logs the real address moments later — and
-    // no further udev event fires once the firmware has run. Probe
+    // though the kernel logs the real address moments later. This
+    // one-shot enumeration snapshot can't wait for that — probe
     // sysfs directly when the cached attribute is missing or all
-    // zeros so the registry holds the post-firmware-load address.
+    // zeros so it holds the post-firmware-load address when
+    // possible. `translate_event`'s `change`-event handling below
+    // covers the live hotplug path: if firmware finishes loading
+    // after this snapshot already latched a zeroed address, the
+    // resulting `change` uevent re-runs this same probe.
+    //
+    // This whole sysfs path is best-effort and secondary. Some
+    // Bluetooth transports (UART/serdev-attached controllers — no
+    // USB HCI device — common on SBCs with an onboard combo module)
+    // never populate `/sys/class/bluetooth/<hci>/address` at all, not
+    // just late; there's no kernel-side signal to wait for on that
+    // hardware. `nexus-bluetooth`'s reconcile loop
+    // (`BluezClient::refresh_adapter`, DD-004 §7.3) polls BlueZ's own
+    // `Adapter1.Address` and is the authoritative source that
+    // actually covers that case — it corrects whatever this probe
+    // produced, including a `[0; 6]` it never gets to fix itself.
     let bt_address = device
         .attribute_value("address")
         .and_then(|s| s.to_str())
@@ -119,8 +134,25 @@ fn bluetooth_from_device(device: &Device) -> Option<BluetoothAdapter> {
 /// event fired (BCM / Marvell firmware-loaded controllers). All-zero
 /// reads from sysfs itself are also rejected — those mean the
 /// firmware genuinely hasn't assigned an address yet, in which case
-/// returning `None` lets the caller stamp `[0; 6]` and a later udev
-/// `change` event (or daemon restart) can re-probe.
+/// returning `None` lets the caller stamp `[0; 6]`. That placeholder
+/// doesn't necessarily stick: on hardware with a real sysfs `address`
+/// attribute, the controller's firmware load fires a `change` uevent
+/// once it finishes, `translate_event` re-probes on it, and
+/// `apply_bluetooth_add` (in `nexus-interface-monitor::monitor`)
+/// treats a changed address on an already-registered adapter as a
+/// correction rather than a fresh discovery — see
+/// `NexusEvent::MacChanged`.
+///
+/// Some transports never reach that point at all: UART/serdev-
+/// attached controllers (no USB HCI device) have no
+/// `/sys/class/bluetooth/<hci>/address` file to begin with — this
+/// function returns `None` unconditionally on that hardware, `[0; 6]`
+/// is what gets stamped at discovery, and no `change` uevent ever
+/// arrives to fix it. `nexus-bluetooth`'s reconcile loop
+/// (`BluezClient::refresh_adapter`, DD-004 §7.3) is what actually
+/// corrects the address in that case, reading it from BlueZ's own
+/// `Adapter1.Address` instead of sysfs — that path is authoritative;
+/// this one is a best-effort assist for hardware where it works.
 fn read_bluetooth_sysfs_address(hci_name: &str) -> Option<[u8; 6]> {
     read_bluetooth_sysfs_address_in("/sys/class/bluetooth", hci_name)
 }
@@ -319,6 +351,17 @@ fn translate_event(event: &udev::Event) -> Option<UdevAction> {
     let action = event.event_type();
     match (subsystem.as_str(), action) {
         ("bluetooth", udev::EventType::Add) => {
+            let adapter = bluetooth_from_device(&device)?;
+            Some(UdevAction::BluetoothAdd(adapter))
+        }
+        ("bluetooth", udev::EventType::Change) => {
+            // Fires when firmware finishes loading the real BD_ADDR
+            // after the initial `Add` already raced it (see
+            // `bluetooth_from_device`'s doc comment). Re-probe and
+            // route through the same action as `Add` —
+            // `apply_bluetooth_add` already knows how to treat "same
+            // ifindex, different address" as a correction rather
+            // than a fresh discovery.
             let adapter = bluetooth_from_device(&device)?;
             Some(UdevAction::BluetoothAdd(adapter))
         }

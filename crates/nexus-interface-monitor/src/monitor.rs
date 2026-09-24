@@ -10,7 +10,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nexus_core::{InterfaceInfo, InterfaceKind, NexusEvent, OperState, PhyCapabilities};
+use nexus_core::{InterfaceInfo, InterfaceKind, MacAddr, NexusEvent, OperState, PhyCapabilities};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -838,10 +838,55 @@ fn apply_bluetooth_add(
     adapter: BluetoothAdapter,
 ) {
     let ifindex = bt_ifindex(adapter.hci_index);
-    if registry.contains(ifindex) {
+    let mac = adapter.bt_address.unwrap_or([0; 6]);
+    if let Some(existing) = registry.get_mut(ifindex) {
+        if existing.mac == mac {
+            // Duplicate `Add`, or a `Change` event that didn't
+            // actually move the needle (firmware still hasn't set a
+            // real address, or this is a replay) — nothing to do.
+            return;
+        }
+        // A `None` reading here means firmware still hasn't set a
+        // real BD_ADDR, or `bluetooth_from_device` transiently failed
+        // to read one (sysfs/udev-db hiccup, mid-reset controller,
+        // etc.) — never treat that as a legitimate address change and
+        // regress a known-good cached address back to zero. Only ever
+        // move *towards* a real address, mirroring the same guard
+        // `nexus_bluetooth::backend::refresh_adapter_properties`
+        // applies on the BlueZ-D-Bus polling side.
+        let Some(mac) = adapter.bt_address else {
+            return;
+        };
+        // The controller's real BD_ADDR showed up after udev's
+        // initial `Add` raced firmware load (see
+        // `bluetooth_from_device`'s doc comment in `udev.rs`).
+        // Same identity (ifindex/ifname), one field corrected —
+        // update in place and emit a targeted delta event, the same
+        // pattern used for `CarrierChanged`/`OperstateChanged`
+        // above, rather than a full remove+rediscover. A full
+        // rediscovery would also reset the D-Bus layer's
+        // `BluetoothAdapterState` (Powered/Discovering/State) cache
+        // back to its defaults for no reason.
+        tracing::info!(
+            ifname = %existing.ifname,
+            old_mac = %MacAddr(existing.mac),
+            new_mac = %MacAddr(mac),
+            "bluetooth adapter address corrected post-discovery",
+        );
+        existing.mac = mac;
+        if let InterfaceKind::Bluetooth { bt_address, .. } = &mut existing.kind {
+            *bt_address = MacAddr(mac);
+        }
+        m::record_event(m::kind_label(&existing.kind), m::event_label::MAC_CHANGED);
+        send_event(
+            event_tx,
+            NexusEvent::MacChanged {
+                ifindex,
+                mac: MacAddr(mac),
+            },
+        );
         return;
     }
-    let mac = adapter.bt_address.unwrap_or([0; 6]);
     let info = InterfaceInfo {
         ifindex,
         ifname: adapter.hci_name.clone(),
@@ -852,7 +897,7 @@ fn apply_bluetooth_add(
         kind: InterfaceKind::Bluetooth {
             hci_name: adapter.hci_name,
             hci_index: adapter.hci_index,
-            bt_address: nexus_core::MacAddr(mac),
+            bt_address: MacAddr(mac),
             bluez_path: adapter.bluez_path,
         },
         discovered_at: std::time::Instant::now(),
@@ -1168,6 +1213,123 @@ mod tests {
             events[0],
             NexusEvent::InterfaceRemoved { ifindex: 2 },
         ));
+    }
+
+    fn bt_adapter(bt_address: Option<[u8; 6]>) -> BluetoothAdapter {
+        BluetoothAdapter {
+            hci_name: "hci0".to_owned(),
+            hci_index: 0,
+            bt_address,
+            bluez_path: "/org/bluez/hci0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn bluetooth_first_discovery_emits_interface_discovered() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut registry = Registry::new();
+
+        apply_bluetooth_add(&mut registry, &tx, bt_adapter(Some([0xAA; 6])));
+
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            NexusEvent::InterfaceDiscovered(info) => {
+                assert_eq!(info.mac, [0xAA; 6]);
+            }
+            other => panic!("expected InterfaceDiscovered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bluetooth_address_correction_emits_mac_changed_not_rediscovery() {
+        // Firmware hadn't set the BD_ADDR yet at the initial `Add` —
+        // the adapter registered with a zeroed placeholder.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut registry = Registry::new();
+        apply_bluetooth_add(&mut registry, &tx, bt_adapter(Some([0; 6])));
+        drain_events(&mut rx);
+
+        // A `change` uevent fires once firmware finishes loading;
+        // `translate_event` re-probes and routes it through the same
+        // action.
+        apply_bluetooth_add(&mut registry, &tx, bt_adapter(Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66])));
+
+        let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 1, "expected exactly one MacChanged, got {events:?}");
+        match &events[0] {
+            NexusEvent::MacChanged { ifindex, mac } => {
+                assert_eq!(*ifindex, bt_ifindex(0));
+                assert_eq!(mac.0, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+            }
+            other => panic!("expected MacChanged, got {other:?}"),
+        }
+        // Registry reflects the corrected address, in both the
+        // top-level `mac` field and the Bluetooth-specific kind.
+        let updated = registry.get(bt_ifindex(0)).unwrap();
+        assert_eq!(updated.mac, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        match &updated.kind {
+            InterfaceKind::Bluetooth { bt_address, .. } => {
+                assert_eq!(bt_address.0, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+            }
+            other => panic!("expected Bluetooth kind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bluetooth_duplicate_add_with_unchanged_address_is_noop() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut registry = Registry::new();
+        apply_bluetooth_add(&mut registry, &tx, bt_adapter(Some([0xAA; 6])));
+        drain_events(&mut rx);
+
+        // A replayed `Add`, or a `Change` event that didn't move the
+        // needle — same address as already registered.
+        apply_bluetooth_add(&mut registry, &tx, bt_adapter(Some([0xAA; 6])));
+
+        assert!(drain_events(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn bluetooth_still_zero_address_stays_a_noop() {
+        // Firmware still hasn't assigned a BD_ADDR — `bt_address` is
+        // `None` (both udev's cached attribute and the sysfs
+        // fallback rejected all-zero). Repeated `Add`/`Change`
+        // events shouldn't spam MacChanged while the real address
+        // remains unknown.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut registry = Registry::new();
+        apply_bluetooth_add(&mut registry, &tx, bt_adapter(None));
+        drain_events(&mut rx);
+
+        apply_bluetooth_add(&mut registry, &tx, bt_adapter(None));
+
+        assert!(drain_events(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn bluetooth_transient_zero_reading_never_regresses_known_good_address() {
+        // A real address is already cached (from an earlier
+        // correction). A later `Change` event where
+        // `bluetooth_from_device` transiently fails to read a BD_ADDR
+        // (sysfs/udev-db hiccup, mid-reset controller, etc.) reports
+        // `bt_address: None` — this must never be treated as "the
+        // address changed to zero" and overwrite the known-good one,
+        // mirroring the guard in
+        // `nexus_bluetooth::backend::refresh_adapter_properties`.
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut registry = Registry::new();
+        apply_bluetooth_add(&mut registry, &tx, bt_adapter(Some([0xAA; 6])));
+        drain_events(&mut rx);
+
+        apply_bluetooth_add(&mut registry, &tx, bt_adapter(None));
+
+        assert!(
+            drain_events(&mut rx).is_empty(),
+            "a transient None reading must not emit MacChanged"
+        );
+        let updated = registry.get(bt_ifindex(0)).unwrap();
+        assert_eq!(updated.mac, [0xAA; 6], "cached address must stay intact");
     }
 
     #[test]

@@ -398,7 +398,12 @@ A device's `transport` is exposed in `BtDeviceInfo` and in the D-Bus `fi.nexus.B
 ///
 /// Progress is reported asynchronously via the Nexus event bus. The
 /// backend subscribes to NexusEvent::Bt* variants to drive state
-/// machines; it does not poll the trait in steady state.
+/// machines. The one exception is `refresh_adapter`: the reconcile
+/// tick (§7.3) polls it once per adapter per second as a self-healing
+/// backstop against a missed `InterfacesAdded`/`PropertiesChanged`
+/// signal, and as the *only* way to learn Address on hardware with no
+/// kernel sysfs address attribute (UART/serdev-attached controllers)
+/// — everything else stays event-driven.
 #[async_trait]
 pub trait BluezClient: Send + Sync {
     /// Establish or re-establish the connection to BlueZ. Idempotent.
@@ -418,6 +423,18 @@ pub trait BluezClient: Send + Sync {
     /// BlueZ. Used by the reconcile supervisor (§7.2) to decide
     /// whether to retry connect(). Should return quickly.
     fn is_connected(&self) -> bool;
+
+    /// Re-read Powered/Discovering/Address for `adapter` directly,
+    /// bypassing the signal stream. Returns (powered, discovering,
+    /// address). Used by the reconcile supervisor (§7.3) as a
+    /// self-healing backstop against a missed
+    /// InterfacesAdded/PropertiesChanged signal, and — for Address —
+    /// as the authoritative source outright: BlueZ's own
+    /// Adapter1.Address is correct even on hardware where the kernel
+    /// never exposes a sysfs address at all (UART/serdev-attached
+    /// controllers), which the udev-based discovery path in
+    /// nexus-interface-monitor can't cover no matter how it's probed.
+    async fn refresh_adapter(&self, adapter: &str) -> Result<(bool, bool, MacAddr)>;
 
     /// Set the adapter's Powered property.
     async fn set_powered(&self, adapter: &str, on: bool) -> Result<()>;
@@ -1512,7 +1529,10 @@ If the operator never answers, the Agent method times out after `pairing_timeout
 
 ### 7.3 Supervisor and Supporting Helpers
 
-The reconcile tick handles BlueZ reconnection and outage notification:
+The reconcile tick handles BlueZ reconnection and outage notification. While connected, it also re-reads each known adapter's `Powered`/`Discovering`/`Address` properties directly:
+
+- `Powered`/`Discovering` re-emit as `BtAdapterChanged` unconditionally (a repeat of the cached value is a harmless no-op downstream) — a self-healing backstop for the case where the initial `ObjectManager` snapshot or a `PropertiesChanged` signal was missed (e.g. a boot-time race between `nexusd` and `bluetoothd` starting in the same instant), so the cache converges within one reconcile interval instead of requiring a restart.
+- `Address` is diffed against the cached value first, and a real difference emits `NexusEvent::MacChanged` — the same correction path the udev `change`-event handling in `nexus-interface-monitor` already feeds. This is where BlueZ's `Adapter1.Address` earns "authoritative": on UART/serdev-attached controllers the kernel never exposes a sysfs address at all, so this reconcile-driven read is the *only* path that ever corrects it, not just a race backstop.
 
 ```rust
 /// Periodic tick at 1 Hz. Polls BlueZ connectivity and handles the
@@ -1531,6 +1551,7 @@ async fn reconcile(&mut self) {
         self.first_bluez_outage_at = None;
         self.outage_notified = false;
         self.reconnect_attempts = 0;
+        self.refresh_adapter_properties().await;  // self-healing backstop, §7.3
         return;
     }
 

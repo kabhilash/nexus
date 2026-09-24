@@ -12,7 +12,7 @@
 //! can land backends incrementally without breaking compilation.
 
 use async_trait::async_trait;
-use nexus_core::MacAddr;
+use nexus_core::{MacAddr, PairingAnswer, PairingJobId};
 use ulid::Ulid;
 
 use crate::errors::{DbusError, Result};
@@ -203,6 +203,35 @@ pub trait BackendOps: Send + Sync {
         Err(DbusError::Unsupported("bt_set_trusted".into()))
     }
 
+    /// `fi.nexus.Bluetooth.Pair(device)` / `fi.nexus.BluetoothDevice.Pair()`.
+    /// Routes to `nexus_bluetooth::BtCommand::Pair`. Returns the
+    /// pairing job id that correlates the `PairingPrompt` /
+    /// `PairingComplete` signals fired on the adapter object
+    /// (DD-006 §6.4).
+    async fn bt_pair(&self, _device_path: &str) -> Result<PairingJobId> {
+        Err(DbusError::Unsupported("bt_pair".into()))
+    }
+
+    /// `fi.nexus.Bluetooth.CancelPairing(device)` /
+    /// `fi.nexus.BluetoothDevice.CancelPairing()`. Routes to
+    /// `nexus_bluetooth::BtCommand::CancelPairing`.
+    async fn bt_cancel_pairing(&self, _device_path: &str) -> Result<()> {
+        Err(DbusError::Unsupported("bt_cancel_pairing".into()))
+    }
+
+    /// `fi.nexus.Bluetooth.AnswerPairingPrompt(job_id, answer)`.
+    /// Routes to `nexus_bluetooth::BtCommand::AnswerPairingPrompt`,
+    /// which validates `answer`'s shape against the pending prompt's
+    /// kind (DD-006 §6.4's per-kind variant map) before resolving
+    /// the Agent's pending oneshot.
+    async fn bt_answer_pairing_prompt(
+        &self,
+        _job_id: PairingJobId,
+        _answer: PairingAnswer,
+    ) -> Result<()> {
+        Err(DbusError::Unsupported("bt_answer_pairing_prompt".into()))
+    }
+
     // ---- Manager-level (DD-006 §5) ----
     async fn set_power_state(&self, _state: PowerState) -> Result<()> {
         Err(DbusError::Unsupported("set_power_state".into()))
@@ -267,6 +296,12 @@ pub enum RecordedCall {
         device_path: String,
     },
     BtSetTrusted { device_path: String, on: bool },
+    BtPair { device_path: String },
+    BtCancelPairing { device_path: String },
+    BtAnswerPairingPrompt {
+        job_id: PairingJobId,
+        answer: PairingAnswer,
+    },
     WifiSetRoamingMode { ifname: String, mode: RoamingMode },
     WifiProvideCredential {
         ifname: String,
@@ -444,6 +479,35 @@ impl BackendOps for RecordingOps {
             device_path: device_path.to_owned(),
             on,
         });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn bt_pair(&self, device_path: &str) -> Result<PairingJobId> {
+        self.record(RecordedCall::BtPair {
+            device_path: device_path.to_owned(),
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(PairingJobId(Ulid::new()))
+    }
+    async fn bt_cancel_pairing(&self, device_path: &str) -> Result<()> {
+        self.record(RecordedCall::BtCancelPairing {
+            device_path: device_path.to_owned(),
+        });
+        if let Some(e) = self.consume_error() {
+            return Err(e);
+        }
+        Ok(())
+    }
+    async fn bt_answer_pairing_prompt(
+        &self,
+        job_id: PairingJobId,
+        answer: PairingAnswer,
+    ) -> Result<()> {
+        self.record(RecordedCall::BtAnswerPairingPrompt { job_id, answer });
         if let Some(e) = self.consume_error() {
             return Err(e);
         }

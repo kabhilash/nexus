@@ -202,6 +202,13 @@ enum NexusEvent {
     InterfaceRemoved { ifindex: u32 },
     CarrierChanged { ifindex: u32, up: bool },
     OperstateChanged { ifindex: u32, state: OperState },
+    // Same identity, one field corrected in place — currently only
+    // fired for a Bluetooth adapter whose BD_ADDR was still zeroed
+    // at discovery time, either because firmware set the real
+    // address after udev's initial `Add` event, or because the
+    // transport (UART/serdev) has no kernel sysfs address at all and
+    // BlueZ's own Adapter1.Address is the only authoritative source.
+    MacChanged { ifindex: u32, mac: MacAddr },
 
     // From Ethernet Backend
     EthAuthStateChanged { ifindex: u32, state: AuthState },
@@ -233,6 +240,10 @@ enum NexusEvent {
     BtDeviceDiscovered(BtDeviceInfo),
     BtDeviceConnected { adapter: String, address: MacAddr },
     BtDeviceDisconnected { adapter: String, address: MacAddr },
+    // Dropped from the backend's registry (discovery-TTL GC only;
+    // paired devices are kept indefinitely and removed via Forget
+    // instead, which doesn't fire this).
+    BtDeviceRemoved { adapter: String, address: MacAddr },
 
     /// A pairing operation has started. Emitted by the Bluetooth
     /// Backend when Pair() is called. The PairingJobId correlates

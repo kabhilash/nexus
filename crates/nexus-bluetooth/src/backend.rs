@@ -314,6 +314,9 @@ impl BluetoothBackend {
             NexusEvent::InterfaceRemoved { ifindex } if self.adapters.contains_key(&ifindex) => {
                 self.on_interface_removed(ifindex);
             }
+            NexusEvent::MacChanged { ifindex, mac } if self.adapters.contains_key(&ifindex) => {
+                self.on_adapter_mac_changed(ifindex, mac);
+            }
             NexusEvent::BluezConnected => {
                 m::set_bluez_connected(true);
                 info!("bluez connected; awaiting object-manager republish");
@@ -363,6 +366,25 @@ impl BluetoothBackend {
         info!(ifindex, %hci_name, %bluez_path, "bt adapter discovered");
         let entry = BtAdapterEntry::new(info, bluez_path);
         self.adapters.insert(ifindex, entry);
+    }
+
+    /// Keep the adapter's cached address in sync with a correction
+    /// from either source: the udev `change`-event path in
+    /// `nexus-interface-monitor` (for hardware that does expose a
+    /// kernel sysfs address), or this backend's own
+    /// `refresh_adapter_properties` reconcile backstop (authoritative
+    /// for hardware that doesn't, e.g. UART/serdev-attached
+    /// controllers). Mirrors `on_interface_discovered`'s job of
+    /// keeping `BtAdapterEntry::info` aligned with the canonical
+    /// Interface Monitor registry.
+    fn on_adapter_mac_changed(&mut self, ifindex: u32, mac: MacAddr) {
+        let Some(entry) = self.adapters.get_mut(&ifindex) else {
+            return;
+        };
+        entry.info.mac = mac.0;
+        if let InterfaceKind::Bluetooth { bt_address, .. } = &mut entry.info.kind {
+            *bt_address = mac;
+        }
     }
 
     fn on_interface_removed(&mut self, ifindex: u32) {
@@ -978,6 +1000,7 @@ impl BluetoothBackend {
             self.reconnect_attempts = 0;
             self.enforce_discovery_timeout().await;
             self.gc_stale_devices();
+            self.refresh_adapter_properties().await;
             return;
         }
         let backoff = std::cmp::min(
@@ -1011,6 +1034,76 @@ impl BluetoothBackend {
         }
     }
 
+    /// Self-healing backstop against a missed `InterfacesAdded` /
+    /// `PropertiesChanged` signal (DD-004 §7.3). A boot-time race
+    /// between `nexusd` and `bluetoothd` can mean the initial
+    /// `ObjectManager` snapshot for an adapter never lands, leaving
+    /// this backend's *and* the D-Bus layer's `Powered`/`State`
+    /// caches stuck at their zeroed defaults indefinitely. Re-reading
+    /// each known adapter's properties directly and re-emitting
+    /// `BtAdapterChanged` — the exact same event the signal-driven
+    /// path sends — lets every subscriber on the bus (including this
+    /// backend's own `handle_event`) self-correct within one
+    /// reconcile interval instead of requiring a restart.
+    /// Re-sending an unchanged `(powered, discovering)` tuple is a
+    /// harmless no-op for every handler, so there's no need to diff
+    /// against the cached value before sending.
+    ///
+    /// `refresh_adapter` also returns BlueZ's own `Address` —
+    /// authoritative, and the *only* reliable source for controllers
+    /// that never expose a kernel sysfs address at all (UART/serdev-
+    /// attached parts, as opposed to USB HCI devices). Unlike
+    /// `powered`/`discovering`, an address correction is (in
+    /// practice) a rare, one-time event, so this diffs against the
+    /// cached value before emitting `NexusEvent::MacChanged` — the
+    /// same correction path `nexus-interface-monitor::udev`'s
+    /// `change`-event handling already feeds — to avoid re-sending
+    /// it every tick forever once corrected.
+    async fn refresh_adapter_properties(&self) {
+        let adapters: Vec<(u32, String)> = self
+            .adapters
+            .iter()
+            .map(|(&ifindex, a)| (ifindex, a.bluez_path.clone()))
+            .collect();
+        for (ifindex, path) in adapters {
+            match self.bluez.refresh_adapter(&path).await {
+                Ok((powered, discovering, address)) => {
+                    let _ = self.event_tx.send(NexusEvent::BtAdapterChanged {
+                        adapter: path.clone(),
+                        powered,
+                        discovering,
+                    });
+                    // A zero reading from BlueZ means "not assigned
+                    // yet" (or, for the mock, "not configured for
+                    // this test") — never a real correction target.
+                    // Only ever move *towards* a real address, same
+                    // as the udev/sysfs side's `filter(|mac| *mac !=
+                    // [0u8; 6])`; never regress a known-good cached
+                    // address back to zero because of a transient or
+                    // unconfigured read.
+                    let needs_correction = address.0 != [0; 6]
+                        && self
+                            .adapters
+                            .get(&ifindex)
+                            .is_some_and(|entry| entry.info.mac != address.0);
+                    if needs_correction {
+                        info!(
+                            adapter = %path,
+                            new_mac = %address,
+                            "bluetooth adapter address corrected from BlueZ D-Bus",
+                        );
+                        let _ = self
+                            .event_tx
+                            .send(NexusEvent::MacChanged { ifindex, mac: address });
+                    }
+                }
+                Err(e) => {
+                    warn!(adapter = %path, error = %e, "adapter property refresh failed");
+                }
+            }
+        }
+    }
+
     async fn enforce_discovery_timeout(&mut self) {
         if self.config.discovery_timeout_s == 0 {
             return;
@@ -1040,7 +1133,11 @@ impl BluetoothBackend {
     /// Drop unpaired, unbonded, unconnected device entries that
     /// haven't been observed for the configured TTL. Keeps the
     /// metric cardinality bounded in high-BLE-advertising
-    /// environments (DD-004 §13.2).
+    /// environments (DD-004 §13.2). Emits `NexusEvent::BtDeviceRemoved`
+    /// for each eviction so the D-Bus layer's `KnownDevices`/per-device
+    /// object lifecycle stays in sync — without this, a device that's
+    /// dropped from `self.adapters[].devices` here would linger in
+    /// `nexus-dbus`'s cache (and on the bus) forever.
     fn gc_stale_devices(&mut self) {
         let ttl = self.config.discovery_device_ttl_s;
         if ttl == 0 {
@@ -1048,7 +1145,9 @@ impl BluetoothBackend {
         }
         let cutoff = Duration::from_secs(ttl as u64);
         let now = Instant::now();
+        let mut removed: Vec<(String, MacAddr)> = Vec::new();
         for entry in self.adapters.values_mut() {
+            let bluez_path = entry.bluez_path.clone();
             entry.devices.retain(|_, dev| {
                 if dev.info.paired
                     || dev.info.bonded
@@ -1060,8 +1159,22 @@ impl BluetoothBackend {
                 {
                     return true;
                 }
-                now.saturating_duration_since(dev.last_seen) < cutoff
+                let expired = now.saturating_duration_since(dev.last_seen) >= cutoff;
+                if expired {
+                    removed.push((bluez_path.clone(), dev.info.address));
+                }
+                !expired
             });
+        }
+        for (adapter, address) in removed {
+            info!(
+                adapter = %adapter,
+                address = %address.to_bluez(),
+                "bluetooth device evicted after discovery TTL",
+            );
+            let _ = self
+                .event_tx
+                .send(NexusEvent::BtDeviceRemoved { adapter, address });
         }
     }
 

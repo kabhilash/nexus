@@ -54,7 +54,7 @@ impl ObjectManager {
                 InterfaceKindData::Wifi(c) => {
                     ifaces.insert(iface::WIFI.to_owned(), wifi_props(c));
                     // Per-BSS scan-result objects.
-                    for (bssid, _bss) in c.scan_cache.iter() {
+                    for bssid in c.scan_cache.keys() {
                         let spath = scan_result_path(ifname, bssid);
                         if let Ok(p) = ObjectPath::try_from(spath) {
                             let mut sr_ifaces: IfaceMap = HashMap::new();

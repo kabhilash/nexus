@@ -16,6 +16,16 @@
 //! The pump reads raw `MessageStream` frames so its decode logic
 //! has no zbus-proxy-macro dependency — that keeps the decode
 //! helpers unit-testable from a mock.
+//!
+//! **Match rules.** `InterfacesAdded` / `InterfacesRemoved` /
+//! `PropertiesChanged` are broadcast signals (`destination` unset).
+//! Per D-Bus semantics the message bus only routes a broadcast to a
+//! connection that has an active `org.freedesktop.DBus.AddMatch`
+//! rule for it — a plain `MessageStream::from(connection)` reader
+//! (no match rule of its own) receives *nothing* for them, no matter
+//! how long it polls. `spawn_object_manager_pump` registers the two
+//! rules this pump needs, scoped to `sender="org.bluez"`, before
+//! constructing that reader; see [`bluez_signal_match_rule`].
 
 use std::collections::HashMap;
 
@@ -35,6 +45,49 @@ pub struct PumpHandle {
     pub _join: JoinHandle<()>,
 }
 
+/// Build a `type='signal',sender='org.bluez'` match rule for
+/// `interface` (and `member`, when given). `sender` is a well-known
+/// name here, not BlueZ's unique connection name — the message bus
+/// resolves that to whoever currently owns it, so this keeps
+/// matching correctly across a BlueZ restart without needing to be
+/// re-registered.
+fn bluez_signal_match_rule(
+    interface: &'static str,
+    member: Option<&'static str>,
+) -> Result<zbus::MatchRule<'static>> {
+    let mut builder = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.bluez")
+        .map_err(|e| BtError::Bluez(format!("match rule sender: {e}")))?
+        .interface(interface)
+        .map_err(|e| BtError::Bluez(format!("match rule interface {interface}: {e}")))?;
+    if let Some(member) = member {
+        builder = builder
+            .member(member)
+            .map_err(|e| BtError::Bluez(format!("match rule member {member}: {e}")))?;
+    }
+    Ok(builder.build())
+}
+
+/// Register the `AddMatch` rules the pump needs to actually receive
+/// BlueZ's broadcast signals — see this module's doc comment for why
+/// that's not optional. Best done once, on the fresh connection,
+/// before anything starts reading from it.
+async fn subscribe_bluez_signals(connection: &zbus::Connection) -> Result<()> {
+    let dbus = zbus::fdo::DBusProxy::new(connection)
+        .await
+        .map_err(|e| BtError::Bluez(format!("DBusProxy: {e}")))?;
+    for rule in [
+        bluez_signal_match_rule("org.freedesktop.DBus.ObjectManager", None)?,
+        bluez_signal_match_rule("org.freedesktop.DBus.Properties", Some("PropertiesChanged"))?,
+    ] {
+        dbus.add_match_rule(rule)
+            .await
+            .map_err(|e| BtError::Bluez(format!("AddMatch: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Spawn the pump. Runs the initial snapshot synthesis before
 /// returning, so the first batch of `BtAdapterChanged` /
 /// `BtDeviceDiscovered` events is already queued on the broadcast
@@ -45,6 +98,8 @@ pub async fn spawn_object_manager_pump(
     event_tx: broadcast::Sender<NexusEvent>,
     cancel: CancellationToken,
 ) -> Result<PumpHandle> {
+    subscribe_bluez_signals(&connection).await?;
+
     let initial = om
         .get_managed_objects()
         .await

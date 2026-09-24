@@ -60,10 +60,6 @@ pub enum BtError {
     #[error("operation on powered-off adapter: {0}")]
     AdapterNotPowered(String),
 
-    /// Pairing is deferred to phase 5.
-    #[error("pairing is not yet implemented in this build")]
-    PairingNotImplemented,
-
     /// Profile Store surfaced a problem.
     #[error("profile store error: {0}")]
     ProfileStore(String),

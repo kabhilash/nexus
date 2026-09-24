@@ -76,7 +76,7 @@ pub fn compute_registry_diff(
 ) -> Vec<DiffEvent> {
     let mut out = Vec::new();
 
-    for (ifindex, _) in before.iter() {
+    for ifindex in before.keys() {
         if !after.contains_key(ifindex) {
             out.push(DiffEvent::Removed { ifindex: *ifindex });
         }

@@ -12,6 +12,7 @@ pub mod proxies;
 pub mod zbus_client;
 
 use async_trait::async_trait;
+use nexus_core::MacAddr;
 
 use crate::errors::Result;
 use crate::types::DiscoveryFilter;
@@ -43,6 +44,30 @@ pub trait BluezClient: Send + Sync {
     /// BlueZ. Used by the reconcile supervisor (DD-004 §7.3) to
     /// decide whether to retry `connect()`.
     fn is_connected(&self) -> bool;
+
+    /// Re-read `Powered`/`Discovering`/`Address` for `adapter`
+    /// directly, bypassing the signal stream. Returns `(powered,
+    /// discovering, address)`. Used by the reconcile supervisor
+    /// (DD-004 §7.3) as a self-healing backstop:
+    ///
+    /// - `powered`/`discovering` catch up a missed initial
+    ///   `ObjectManager` snapshot or `PropertiesChanged` signal
+    ///   (e.g. a boot-time race between `nexusd` and `bluetoothd`),
+    ///   without requiring a daemon restart.
+    /// - `address` is BlueZ's own view of the adapter's BD_ADDR.
+    ///   It's the *authoritative* source — more reliable than the
+    ///   kernel sysfs attribute `nexus-interface-monitor::udev`
+    ///   reads at discovery time, which some transports (UART/
+    ///   serdev-attached controllers — no USB HCI device node) never
+    ///   populate at all, not just late. The reconcile loop diffs
+    ///   this against the cached address and emits
+    ///   `NexusEvent::MacChanged` on a real difference, the same
+    ///   correction path the udev side already uses — but only ever
+    ///   moves *towards* a real address: an all-zero reading (BlueZ
+    ///   hasn't assigned one yet, or a test mock left it
+    ///   unconfigured) never overwrites an already-known-good cached
+    ///   address.
+    async fn refresh_adapter(&self, adapter: &str) -> Result<(bool, bool, MacAddr)>;
 
     /// Set the adapter's `Powered` property.
     async fn set_powered(&self, adapter: &str, on: bool) -> Result<()>;
