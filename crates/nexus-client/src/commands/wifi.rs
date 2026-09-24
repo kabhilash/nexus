@@ -52,6 +52,47 @@ pub async fn scan(
     render(&results, format, ctx, w).map_err(io_err)
 }
 
+/// Security-type tags `Manager.AddWifiProfile` can build without
+/// extra Enterprise fields (EAP method, certs, identity — see
+/// `parse_security` in nexus-dbus). `wifi connect`'s auto-detect path
+/// only ever offers one of these.
+const AUTO_DETECTABLE_SECURITY_TYPES: [&str; 5] =
+    ["open", "owe", "wpa2_personal", "wpa3_personal", "wpa2_wpa3_personal"];
+
+fn security_type_needs_passphrase(security_type: &str) -> bool {
+    !matches!(security_type, "open" | "owe")
+}
+
+/// Scan for `ssid` on `target` and return the security type the AP
+/// actually advertises (DD-008 §6.2 step 2). Without this, a new
+/// profile can't tell WPA2-Personal from WPA3-Personal apart, and
+/// building the wrong one means wpa_supplicant negotiates the wrong
+/// key management (e.g. `WPA-PSK` against an SAE-only AP).
+async fn detect_security_type(
+    ops: &dyn ManagerOps,
+    target: &str,
+    ssid: &str,
+) -> Result<String, NexusctlError> {
+    let results = ops.wifi_scan(target).await?;
+    let offered = results
+        .iter()
+        .find(|r| r.ssid == ssid)
+        .map(|r| r.security.clone())
+        .ok_or_else(|| NexusctlError::NotFound {
+            reference: ssid.to_owned(),
+        })?;
+    offered
+        .iter()
+        .find(|s| AUTO_DETECTABLE_SECURITY_TYPES.contains(&s.as_str()))
+        .cloned()
+        .ok_or_else(|| NexusctlError::InvalidArgument {
+            message: format!(
+                "{ssid} advertises {offered:?}, which `wifi connect` can't configure \
+                 automatically; use `nexusctl profile add-wifi` with explicit security fields"
+            ),
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn connect(
     ops: &dyn ManagerOps,
@@ -70,16 +111,23 @@ pub async fn connect(
     let profile_path = match ops.find_wifi_profile(ssid.as_bytes()).await {
         Ok(p) => p,
         Err(NexusctlError::NotFound { .. }) => {
-            // No stored profile — resolve a PSK: `--psk`, then
-            // `NEXUSCTL_PSK`, then an interactive TTY prompt. The
-            // interactive fallback lives in
-            // `crate::interactive::passphrase`; it returns
+            // No stored profile — scan to identify the AP's actual
+            // security type before building one (DD-008 §6.2 step 2).
+            let security_type = detect_security_type(ops, &target, ssid).await?;
+            // Open/OWE need no credentials; everything else resolves
+            // a passphrase from `--psk`, then `NEXUSCTL_PSK`, then an
+            // interactive TTY prompt. The interactive fallback lives
+            // in `crate::interactive::passphrase`; it returns
             // `NotInteractive` (exit 5) when stdin isn't a TTY.
-            let resolved = crate::interactive::passphrase::resolve_psk(psk).await?;
+            let passphrase = if security_type_needs_passphrase(&security_type) {
+                Some(crate::interactive::passphrase::resolve_psk(psk).await?)
+            } else {
+                None
+            };
             let settings = WifiProfileSettings {
                 ssid: ssid.as_bytes().to_vec(),
-                security_type: "wpa2_personal".into(),
-                passphrase: Some(resolved),
+                security_type,
+                passphrase,
                 label: None,
                 priority: None,
                 auto_connect: Some(true),

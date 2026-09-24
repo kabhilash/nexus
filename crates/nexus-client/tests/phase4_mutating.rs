@@ -98,6 +98,7 @@ struct Recorder {
     rotate_job_id: String,
     lease_token: String,
     reload_report: ReloadConfigReport,
+    last_wifi_profile_settings: Mutex<Option<WifiProfileSettings>>,
 }
 
 impl Recorder {
@@ -112,6 +113,13 @@ impl Recorder {
     }
     fn mutation_error(&self) -> Option<NexusctlError> {
         self.fail_every_mutation_with.clone()
+    }
+    fn last_add_security_type(&self) -> Option<String> {
+        self.last_wifi_profile_settings
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.security_type.clone())
     }
 }
 
@@ -224,6 +232,7 @@ impl ManagerOps for Recorder {
         settings: WifiProfileSettings,
     ) -> Result<String, NexusctlError> {
         self.record(Call::AddWifi(settings.ssid.clone()));
+        *self.last_wifi_profile_settings.lock().unwrap() = Some(settings);
         if let Some(e) = self.mutation_error() {
             return Err(e);
         }
@@ -358,6 +367,14 @@ async fn wifi_scan_dispatches_to_ops_and_renders() {
 async fn wifi_connect_with_new_profile_creates_and_connects() {
     let mut rec = Recorder::default();
     rec.wifi_list = vec![iface_row("wlan0", "wifi")];
+    rec.scan_results = vec![WifiScanResult {
+        ssid: "corp".into(),
+        bssid: "aa:bb:cc:dd:ee:ff".into(),
+        frequency_mhz: 5180,
+        signal_dbm: -52,
+        security: vec!["wpa2_personal".into()],
+        age_ms: 100,
+    }];
     let rec = Arc::new(rec);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -375,17 +392,87 @@ async fn wifi_connect_with_new_profile_creates_and_connects() {
     .await
     .unwrap();
     let calls = rec.calls();
-    // find_wifi_profile (fails with NotFound) → add_wifi_profile →
+    // find_wifi_profile (fails with NotFound) → wifi_scan (to detect
+    // the AP's security type) → add_wifi_profile →
     // wifi_connect_profile on wlan0.
     assert_eq!(calls[0], Call::FindWifiProfile(b"corp".to_vec()));
-    assert_eq!(calls[1], Call::AddWifi(b"corp".to_vec()));
-    match &calls[2] {
+    assert_eq!(calls[1], Call::WifiScan("wlan0".into()));
+    assert_eq!(calls[2], Call::AddWifi(b"corp".to_vec()));
+    match &calls[3] {
         Call::WifiConnectProfile { ifname, profile } => {
             assert_eq!(ifname, "wlan0");
             assert!(profile.contains("/profile/wifi/"));
         }
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn wifi_connect_to_new_wpa3_network_uses_sae_not_wpa2() {
+    // Regression test: a new profile for an SAE-only AP must be
+    // built as `wpa3_personal`, not the old hardcoded
+    // `wpa2_personal` default — see AddWifi's captured settings.
+    let mut rec = Recorder::default();
+    rec.wifi_list = vec![iface_row("wlan0", "wifi")];
+    rec.scan_results = vec![WifiScanResult {
+        ssid: "home-wpa3".into(),
+        bssid: "11:22:33:44:55:66".into(),
+        frequency_mhz: 5180,
+        signal_dbm: -40,
+        security: vec!["wpa3_personal".into()],
+        age_ms: 50,
+    }];
+    let rec = Arc::new(rec);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    commands::wifi::connect(
+        rec.as_ref(),
+        "home-wpa3",
+        None,
+        Some("hunter2"),
+        true,
+        &mut stderr,
+        OutputFormat::Human,
+        &RenderContext::default(),
+        &mut stdout,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rec.last_add_security_type(), Some("wpa3_personal".into()));
+}
+
+#[tokio::test]
+async fn wifi_connect_to_new_open_network_skips_passphrase_prompt() {
+    // Open/OWE networks need no credentials — connecting to one
+    // without `--psk` must not fall into the interactive/TTY
+    // passphrase path at all.
+    let mut rec = Recorder::default();
+    rec.wifi_list = vec![iface_row("wlan0", "wifi")];
+    rec.scan_results = vec![WifiScanResult {
+        ssid: "cafe-open".into(),
+        bssid: "aa:aa:aa:aa:aa:aa".into(),
+        frequency_mhz: 2412,
+        signal_dbm: -70,
+        security: vec!["open".into()],
+        age_ms: 20,
+    }];
+    let rec = Arc::new(rec);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    commands::wifi::connect(
+        rec.as_ref(),
+        "cafe-open",
+        None,
+        None,
+        true,
+        &mut stderr,
+        OutputFormat::Human,
+        &RenderContext::default(),
+        &mut stdout,
+    )
+    .await
+    .unwrap();
+    assert_eq!(rec.last_add_security_type(), Some("open".into()));
 }
 
 #[tokio::test]
@@ -402,6 +489,14 @@ async fn wifi_connect_without_psk_and_no_profile_escalates_to_not_interactive() 
     }
     let mut rec = Recorder::default();
     rec.wifi_list = vec![iface_row("wlan0", "wifi")];
+    rec.scan_results = vec![WifiScanResult {
+        ssid: "home".into(),
+        bssid: "aa:bb:cc:dd:ee:ff".into(),
+        frequency_mhz: 2437,
+        signal_dbm: -60,
+        security: vec!["wpa2_personal".into()],
+        age_ms: 100,
+    }];
     let rec = Arc::new(rec);
     let mut stderr = Vec::new();
     let mut stdout = Vec::new();
@@ -435,6 +530,14 @@ async fn wifi_connect_without_psk_uses_nexusctl_psk_env() {
     }
     let mut rec = Recorder::default();
     rec.wifi_list = vec![iface_row("wlan0", "wifi")];
+    rec.scan_results = vec![WifiScanResult {
+        ssid: "home".into(),
+        bssid: "aa:bb:cc:dd:ee:ff".into(),
+        frequency_mhz: 2437,
+        signal_dbm: -60,
+        security: vec!["wpa2_personal".into()],
+        age_ms: 100,
+    }];
     let rec = Arc::new(rec);
     let mut stderr = Vec::new();
     let mut stdout = Vec::new();
